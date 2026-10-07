@@ -20,8 +20,9 @@
 use crate::activation::Activation;
 use crate::buffer::{Buffer, Stack, Storage};
 use crate::init::Initializer;
-use crate::layer::{Layer, Mode, ParamError};
+use crate::layer::{Layer, Mode};
 use crate::optim::{Optimizer, ParamKind};
+use crate::params::{LayerKind, LayerSig, ParamError, Params};
 use crate::rng::Rng;
 
 /// Dense-Layer mit Const-Generic-Dimensionen auf dem Stack.
@@ -178,6 +179,31 @@ impl<A: Activation> DenseLayer<crate::buffer::Heap, A> {
     }
 }
 
+impl<S: Storage, A: Activation> Params for DenseLayer<S, A> {
+    fn param_count(&self) -> usize {
+        self.shape.in_dim() * self.shape.out_dim() + self.shape.out_dim()
+    }
+
+    fn visit_params<F: FnMut(&[f32])>(&self, f: &mut F) {
+        f(self.w.as_slice());
+        f(self.b.as_slice());
+    }
+
+    fn visit_params_mut<F: FnMut(&mut [f32])>(&mut self, f: &mut F) {
+        f(self.w.as_mut_slice());
+        f(self.b.as_mut_slice());
+    }
+
+    fn visit_signatures<F: FnMut(LayerSig)>(&self, f: &mut F) {
+        f(LayerSig {
+            kind: LayerKind::Dense,
+            in_dim: self.shape.in_dim() as u32,
+            out_dim: self.shape.out_dim() as u32,
+            activation: self.act.signature(),
+        });
+    }
+}
+
 impl<S: Storage, A: Activation> Layer for DenseLayer<S, A> {
     type Input = S::Input;
     type Output = S::Output;
@@ -189,10 +215,6 @@ impl<S: Storage, A: Activation> Layer for DenseLayer<S, A> {
     fn out_dim(&self) -> usize {
         self.shape.out_dim()
     }
-    fn param_count(&self) -> usize {
-        self.shape.in_dim() * self.shape.out_dim() + self.shape.out_dim()
-    }
-
     fn init<I: Initializer, R: Rng + ?Sized>(&mut self, init: &I, rng: &mut R) {
         let (fan_in, fan_out) = (self.shape.in_dim(), self.shape.out_dim());
         init.fill(self.w.as_mut_slice(), fan_in, fan_out, rng);
@@ -267,16 +289,6 @@ impl<S: Storage, A: Activation> Layer for DenseLayer<S, A> {
     fn scale_grads(&mut self, factor: f32) {
         self.gw.as_mut_slice().iter_mut().for_each(|g| *g *= factor);
         self.gb.as_mut_slice().iter_mut().for_each(|g| *g *= factor);
-    }
-
-    fn visit_params<F: FnMut(&[f32])>(&self, f: &mut F) {
-        f(self.w.as_slice());
-        f(self.b.as_slice());
-    }
-
-    fn visit_params_mut<F: FnMut(&mut [f32])>(&mut self, f: &mut F) {
-        f(self.w.as_mut_slice());
-        f(self.b.as_mut_slice());
     }
 
     fn visit_grads<F: FnMut(&[f32])>(&self, f: &mut F) {

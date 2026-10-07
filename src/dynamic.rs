@@ -13,6 +13,7 @@ use crate::dropout::HeapDropout;
 use crate::init::Initializer;
 use crate::layer::{Layer, Mode};
 use crate::optim::Optimizer;
+use crate::params::{LayerSig, Params};
 use crate::rng::Rng;
 
 /// Ein Layer der dynamischen Topologie.
@@ -36,6 +37,21 @@ macro_rules! dispatch {
     };
 }
 
+impl Params for DynLayer {
+    fn param_count(&self) -> usize {
+        dispatch!(self, l => l.param_count())
+    }
+    fn visit_params<F: FnMut(&[f32])>(&self, f: &mut F) {
+        dispatch!(self, l => l.visit_params(f))
+    }
+    fn visit_params_mut<F: FnMut(&mut [f32])>(&mut self, f: &mut F) {
+        dispatch!(self, l => l.visit_params_mut(f))
+    }
+    fn visit_signatures<F: FnMut(LayerSig)>(&self, f: &mut F) {
+        dispatch!(self, l => l.visit_signatures(f))
+    }
+}
+
 impl Layer for DynLayer {
     type Input = Vec<f32>;
     type Output = Vec<f32>;
@@ -46,9 +62,6 @@ impl Layer for DynLayer {
     }
     fn out_dim(&self) -> usize {
         dispatch!(self, l => l.out_dim())
-    }
-    fn param_count(&self) -> usize {
-        dispatch!(self, l => l.param_count())
     }
     fn init<I: Initializer, R: Rng + ?Sized>(&mut self, init: &I, rng: &mut R) {
         dispatch!(self, l => l.init(init, rng))
@@ -64,12 +77,6 @@ impl Layer for DynLayer {
     }
     fn grad_input(&self) -> &[f32] {
         dispatch!(self, l => l.grad_input())
-    }
-    fn visit_params<F: FnMut(&[f32])>(&self, f: &mut F) {
-        dispatch!(self, l => l.visit_params(f))
-    }
-    fn visit_params_mut<F: FnMut(&mut [f32])>(&mut self, f: &mut F) {
-        dispatch!(self, l => l.visit_params_mut(f))
     }
     fn visit_grads<F: FnMut(&[f32])>(&self, f: &mut F) {
         dispatch!(self, l => l.visit_grads(f))
@@ -155,6 +162,27 @@ impl Sequential {
     }
 }
 
+impl Params for Sequential {
+    fn param_count(&self) -> usize {
+        self.layers.iter().map(|l| l.param_count()).sum()
+    }
+    fn visit_params<F: FnMut(&[f32])>(&self, f: &mut F) {
+        for l in &self.layers {
+            l.visit_params(f);
+        }
+    }
+    fn visit_params_mut<F: FnMut(&mut [f32])>(&mut self, f: &mut F) {
+        for l in &mut self.layers {
+            l.visit_params_mut(f);
+        }
+    }
+    fn visit_signatures<F: FnMut(LayerSig)>(&self, f: &mut F) {
+        for l in &self.layers {
+            l.visit_signatures(f);
+        }
+    }
+}
+
 impl Layer for Sequential {
     type Input = Vec<f32>;
     type Output = Vec<f32>;
@@ -166,10 +194,6 @@ impl Layer for Sequential {
     fn out_dim(&self) -> usize {
         self.layers.last().map_or(self.in_dim, |l| l.out_dim())
     }
-    fn param_count(&self) -> usize {
-        self.layers.iter().map(|l| l.param_count()).sum()
-    }
-
     fn init<I: Initializer, R: Rng + ?Sized>(&mut self, init: &I, rng: &mut R) {
         for l in &mut self.layers {
             l.init(init, rng);
@@ -218,16 +242,6 @@ impl Layer for Sequential {
         self.layers[0].grad_input()
     }
 
-    fn visit_params<F: FnMut(&[f32])>(&self, f: &mut F) {
-        for l in &self.layers {
-            l.visit_params(f);
-        }
-    }
-    fn visit_params_mut<F: FnMut(&mut [f32])>(&mut self, f: &mut F) {
-        for l in &mut self.layers {
-            l.visit_params_mut(f);
-        }
-    }
     fn visit_grads<F: FnMut(&[f32])>(&self, f: &mut F) {
         for l in &self.layers {
             l.visit_grads(f);

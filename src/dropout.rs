@@ -12,6 +12,7 @@ use crate::buffer::Buffer;
 use crate::init::Initializer;
 use crate::layer::{Layer, Mode};
 use crate::optim::Optimizer;
+use crate::params::{LayerSig, Params};
 use crate::rng::{Pcg32, Rng};
 
 /// Dropout über `N` Features, alles auf dem Stack.
@@ -83,6 +84,16 @@ impl DropoutLayer<alloc::vec::Vec<f32>> {
     }
 }
 
+/// Dropout hat keine Parameter: weder Export noch Fingerprint enthalten ihn.
+impl<V: Buffer> Params for DropoutLayer<V> {
+    fn param_count(&self) -> usize {
+        0
+    }
+    fn visit_params<F: FnMut(&[f32])>(&self, _f: &mut F) {}
+    fn visit_params_mut<F: FnMut(&mut [f32])>(&mut self, _f: &mut F) {}
+    fn visit_signatures<F: FnMut(LayerSig)>(&self, _f: &mut F) {}
+}
+
 impl<V: Buffer> Layer for DropoutLayer<V> {
     type Input = V;
     type Output = V;
@@ -94,10 +105,6 @@ impl<V: Buffer> Layer for DropoutLayer<V> {
     fn out_dim(&self) -> usize {
         self.out.as_slice().len()
     }
-    fn param_count(&self) -> usize {
-        0
-    }
-
     fn init<I: Initializer, R: Rng + ?Sized>(&mut self, _init: &I, _rng: &mut R) {}
 
     fn forward(&mut self, input: &[f32], mode: Mode) -> &[f32] {
@@ -147,8 +154,6 @@ impl<V: Buffer> Layer for DropoutLayer<V> {
         self.grad_in.as_slice()
     }
 
-    fn visit_params<F: FnMut(&[f32])>(&self, _f: &mut F) {}
-    fn visit_params_mut<F: FnMut(&mut [f32])>(&mut self, _f: &mut F) {}
     fn visit_grads<F: FnMut(&[f32])>(&self, _f: &mut F) {}
 
     fn zero_grad(&mut self) {}

@@ -237,3 +237,34 @@ fn every_activation_optimizer_loss_and_schedule_never_touches_the_heap() {
     std::hint::black_box(sink);
     assert_eq!(used, 0, "{used} Heap-Allokationen");
 }
+
+#[test]
+fn model_save_load_inspect_and_fingerprint_never_touch_the_heap() {
+    use neuron::model::{crc32, inspect, model_len};
+    let before = allocs();
+
+    let mut net = Dense::<2, 4, _>::new(Gelu)
+        .then(Dropout::<4>::new(0.1, 1))
+        .then(Dense::<4, 1, _>::new(Linear));
+    net.init(&XavierUniform, &mut Pcg32::seeded(3));
+    let mut bytes = [0u8; model_len(2 * 4 + 4 + 4 + 1)];
+    let written = net.save_model(&mut bytes).unwrap();
+
+    let mut other = Dense::<2, 4, _>::new(Gelu)
+        .then(Dropout::<4>::new(0.1, 2))
+        .then(Dense::<4, 1, _>::new(Linear));
+    other.load_model(&bytes[..written]).unwrap();
+    let header = inspect(&bytes).unwrap();
+    let wrong = other.load_model(&bytes[..10]);
+
+    let used = allocs() - before;
+    assert!(
+        wrong.is_err(),
+        "abgeschnittenes Modell muss abgelehnt werden"
+    );
+    std::hint::black_box((header, crc32(&bytes), other.fingerprint()));
+    assert_eq!(
+        used, 0,
+        "{used} Heap-Allokationen in Modell-Speichern/-Laden"
+    );
+}

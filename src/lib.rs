@@ -68,7 +68,9 @@ pub mod dropout;
 pub mod init;
 pub mod layer;
 pub mod loss;
+pub mod model;
 pub mod optim;
+pub mod params;
 pub mod rng;
 pub mod schedule;
 pub mod trainer;
@@ -86,14 +88,16 @@ pub use buffer::{Buffer, Stack, Storage};
 pub use dense::{Dense, DenseLayer};
 pub use dropout::{Dropout, DropoutLayer};
 pub use init::{Constant, HeNormal, HeUniform, Initializer, XavierNormal, XavierUniform};
-pub use layer::{Chain, Layer, Mode, ParamError};
+pub use layer::{Chain, Layer, Mode};
 pub use loss::{
     BinaryCrossEntropy, BinaryCrossEntropyWithLogits, Huber, Loss, Mae, Mse, SoftmaxCrossEntropy,
 };
 pub use math::{argmax, sigmoid, softmax_inplace};
+pub use model::{crc32, Crc32, ModelError, ModelHeader};
 pub use optim::{
     Adagrad, Adam, AdamW, Momentum, Optimizer, ParamKind, RmsProp, RmsPropMomentum, Sgd,
 };
+pub use params::{LayerKind, LayerSig, ParamError, Params};
 pub use rng::{Pcg32, Rng};
 pub use schedule::{ConstantLr, CosineAnnealing, ExponentialDecay, LrSchedule, StepDecay, Warmup};
 pub use trainer::Trainer;
@@ -113,10 +117,10 @@ pub mod prelude {
         argmax, sigmoid, softmax_inplace, Activation, ActivationKind, Adagrad, Adam, AdamW,
         BinaryCrossEntropy, BinaryCrossEntropyWithLogits, Buffer, Chain, Constant, ConstantLr,
         CosineAnnealing, Dense, Dropout, Elu, ExponentialDecay, Gelu, HeNormal, HeUniform, Huber,
-        Initializer, Layer, LeakyRelu, Linear, Loss, LrSchedule, Mae, Mish, Mode, Momentum, Mse,
-        Optimizer, ParamError, ParamKind, Pcg32, Relu, RmsProp, RmsPropMomentum, Rng, Sgd, Sigmoid,
-        SoftmaxCrossEntropy, Softplus, StepDecay, Swish, Tanh, Trainer, Warmup, XavierNormal,
-        XavierUniform,
+        Initializer, Layer, LeakyRelu, Linear, Loss, LrSchedule, Mae, Mish, Mode, ModelError,
+        Momentum, Mse, Optimizer, ParamError, ParamKind, Params, Pcg32, Relu, RmsProp,
+        RmsPropMomentum, Rng, Sgd, Sigmoid, SoftmaxCrossEntropy, Softplus, StepDecay, Swish, Tanh,
+        Trainer, Warmup, XavierNormal, XavierUniform,
     };
 
     #[cfg(feature = "alloc")]

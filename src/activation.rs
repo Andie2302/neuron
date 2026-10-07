@@ -11,6 +11,7 @@
 //! liefern dort die korrekten Grenzwerte statt `NaN` oder `inf`.
 
 use crate::math;
+use crate::model::Crc32;
 
 /// Elementweise Aktivierungsfunktion mit Ableitung für den Backward-Pass.
 pub trait Activation {
@@ -24,6 +25,27 @@ pub trait Activation {
     /// das nicht stabil möglich ist (z. B. [`Gelu`] bei `x = 0`), ignorieren `y`
     /// und rechnen aus `x`.
     fn derivative(&self, x: f32, y: f32) -> f32;
+
+    /// Stabile 32-Bit-Kennung der Funktion samt ihrer Parameter.
+    ///
+    /// Sie fließt in den Architektur-Fingerprint des
+    /// [Modellformats](crate::model) ein, damit Gewichte nicht versehentlich in
+    /// ein Netz mit anderer Aktivierung geladen werden. Die eingebauten Funktionen
+    /// und [`ActivationKind`] liefern dieselben Werte (ein mit `Tanh` trainiertes
+    /// Netz passt also zu `ActivationKind::Tanh`); die Werte sind Teil des
+    /// Dateiformats. Eigene Aktivierungen behalten den Standard `0` und
+    /// unterscheiden sich dann im Fingerprint nicht voneinander.
+    fn signature(&self) -> u32 {
+        0
+    }
+}
+
+/// Kennung einer Aktivierung mit einem `f32`-Parameter (z. B. `alpha`).
+fn signature_with(id: u8, param: f32) -> u32 {
+    let mut crc = Crc32::new();
+    crc.update(&[id]);
+    crc.update(&param.to_bits().to_le_bytes());
+    crc.finish()
 }
 
 /// Identität `f(x) = x` (z. B. Regressions-Ausgabeschicht).
@@ -31,6 +53,10 @@ pub trait Activation {
 pub struct Linear;
 
 impl Activation for Linear {
+    fn signature(&self) -> u32 {
+        1
+    }
+
     #[inline]
     fn apply(&self, x: f32) -> f32 {
         x
@@ -46,6 +72,10 @@ impl Activation for Linear {
 pub struct Relu;
 
 impl Activation for Relu {
+    fn signature(&self) -> u32 {
+        2
+    }
+
     #[inline]
     fn apply(&self, x: f32) -> f32 {
         if x > 0.0 {
@@ -78,6 +108,10 @@ impl Default for LeakyRelu {
 }
 
 impl Activation for LeakyRelu {
+    fn signature(&self) -> u32 {
+        signature_with(3, self.alpha)
+    }
+
     #[inline]
     fn apply(&self, x: f32) -> f32 {
         if x > 0.0 {
@@ -101,6 +135,10 @@ impl Activation for LeakyRelu {
 pub struct Sigmoid;
 
 impl Activation for Sigmoid {
+    fn signature(&self) -> u32 {
+        4
+    }
+
     #[inline]
     fn apply(&self, x: f32) -> f32 {
         // Für x << 0 läuft exp(-x) gegen +inf, 1/inf = 0 – kein NaN.
@@ -117,6 +155,10 @@ impl Activation for Sigmoid {
 pub struct Tanh;
 
 impl Activation for Tanh {
+    fn signature(&self) -> u32 {
+        5
+    }
+
     #[inline]
     fn apply(&self, x: f32) -> f32 {
         math::tanh(x)
@@ -156,6 +198,10 @@ fn gelu_inner(x: f32) -> f32 {
 pub struct Gelu;
 
 impl Activation for Gelu {
+    fn signature(&self) -> u32 {
+        6
+    }
+
     #[inline]
     fn apply(&self, x: f32) -> f32 {
         0.5 * x * (1.0 + math::tanh(gelu_inner(x)))
@@ -190,6 +236,10 @@ impl Activation for Gelu {
 pub struct Swish;
 
 impl Activation for Swish {
+    fn signature(&self) -> u32 {
+        7
+    }
+
     #[inline]
     fn apply(&self, x: f32) -> f32 {
         x * Sigmoid.apply(x)
@@ -218,6 +268,10 @@ impl Default for Elu {
 }
 
 impl Activation for Elu {
+    fn signature(&self) -> u32 {
+        signature_with(8, self.alpha)
+    }
+
     #[inline]
     fn apply(&self, x: f32) -> f32 {
         if x > 0.0 {
@@ -249,6 +303,10 @@ fn softplus(x: f32) -> f32 {
 pub struct Softplus;
 
 impl Activation for Softplus {
+    fn signature(&self) -> u32 {
+        9
+    }
+
     #[inline]
     fn apply(&self, x: f32) -> f32 {
         softplus(x)
@@ -266,6 +324,10 @@ impl Activation for Softplus {
 pub struct Mish;
 
 impl Activation for Mish {
+    fn signature(&self) -> u32 {
+        10
+    }
+
     #[inline]
     fn apply(&self, x: f32) -> f32 {
         x * math::tanh(softplus(x))
@@ -304,6 +366,21 @@ pub enum ActivationKind {
 }
 
 impl Activation for ActivationKind {
+    fn signature(&self) -> u32 {
+        match *self {
+            ActivationKind::Linear => Linear.signature(),
+            ActivationKind::Relu => Relu.signature(),
+            ActivationKind::LeakyRelu(alpha) => LeakyRelu { alpha }.signature(),
+            ActivationKind::Sigmoid => Sigmoid.signature(),
+            ActivationKind::Tanh => Tanh.signature(),
+            ActivationKind::Gelu => Gelu.signature(),
+            ActivationKind::Swish => Swish.signature(),
+            ActivationKind::Elu(alpha) => Elu { alpha }.signature(),
+            ActivationKind::Softplus => Softplus.signature(),
+            ActivationKind::Mish => Mish.signature(),
+        }
+    }
+
     #[inline]
     fn apply(&self, x: f32) -> f32 {
         match *self {
@@ -437,6 +514,53 @@ mod tests {
             assert_eq!(ActivationKind::Mish.apply(x), Mish.apply(x));
             assert_eq!(ActivationKind::Mish.derivative(x, y), Mish.derivative(x, y));
         }
+    }
+
+    #[test]
+    fn signatures_are_distinct_stable_and_match_the_enum() {
+        let all: [(u32, u32); 10] = [
+            (Linear.signature(), ActivationKind::Linear.signature()),
+            (Relu.signature(), ActivationKind::Relu.signature()),
+            (
+                LeakyRelu { alpha: 0.2 }.signature(),
+                ActivationKind::LeakyRelu(0.2).signature(),
+            ),
+            (Sigmoid.signature(), ActivationKind::Sigmoid.signature()),
+            (Tanh.signature(), ActivationKind::Tanh.signature()),
+            (Gelu.signature(), ActivationKind::Gelu.signature()),
+            (Swish.signature(), ActivationKind::Swish.signature()),
+            (
+                Elu { alpha: 0.7 }.signature(),
+                ActivationKind::Elu(0.7).signature(),
+            ),
+            (Softplus.signature(), ActivationKind::Softplus.signature()),
+            (Mish.signature(), ActivationKind::Mish.signature()),
+        ];
+        for (i, (stat, kind)) in all.iter().enumerate() {
+            assert_eq!(
+                stat, kind,
+                "statisch und Enum müssen übereinstimmen (Index {i})"
+            );
+            assert_ne!(
+                *stat, 0,
+                "eingebaute Aktivierungen haben eine Kennung (Index {i})"
+            );
+            for (j, (other, _)) in all.iter().enumerate().skip(i + 1) {
+                assert_ne!(stat, other, "Kennungen {i} und {j} kollidieren");
+            }
+        }
+        // Parameter fließen ein; die Werte sind Teil des Dateiformats.
+        assert_ne!(
+            LeakyRelu { alpha: 0.1 }.signature(),
+            LeakyRelu { alpha: 0.2 }.signature()
+        );
+        assert_ne!(
+            Elu { alpha: 1.0 }.signature(),
+            Elu { alpha: 0.5 }.signature()
+        );
+        assert_eq!(Linear.signature(), 1);
+        assert_eq!(Tanh.signature(), 5);
+        assert_eq!(Mish.signature(), 10);
     }
 
     #[test]
