@@ -810,6 +810,65 @@ mod tests {
     }
 
     #[test]
+    fn nesterov_with_weight_decay_known_steps() {
+        // lr 0.1, β 0.5, wd 1, p₀ = 2, g = 0:  g' = g + wd·p,  v = β v + g',  Schritt g' + β v.
+        let opt = Momentum::new(0.1, 0.5)
+            .with_weight_decay(1.0)
+            .with_nesterov(true);
+        let mut v = opt.init_state::<[f32; 1]>(1);
+        let mut p = [2.0];
+        opt.update(&mut v, &mut p, &[0.0]); // g' = 2,   v = 2,   Schritt 2 + 1    = 3    -> p = 1.7
+        assert!(
+            (v[0] - 2.0).abs() < 1e-6 && (p[0] - 1.7).abs() < 1e-6,
+            "{v:?} {p:?}"
+        );
+        opt.update(&mut v, &mut p, &[0.0]); // g' = 1.7, v = 2.7, Schritt 1.7 + 1.35 = 3.05 -> p = 1.395
+        assert!(
+            (v[0] - 2.7).abs() < 1e-6 && (p[0] - 1.395).abs() < 1e-6,
+            "{v:?} {p:?}"
+        );
+        // Mit echtem Gradienten: weder die Vorausschau noch der Zerfall dürfen den Gradienten verlieren.
+        let mut v = opt.init_state::<[f32; 1]>(1);
+        let mut p = [2.0];
+        opt.update(&mut v, &mut p, &[1.0]); // g' = 3, v = 3, Schritt 3 + 1.5 = 4.5 -> p = 1.55
+        assert!((p[0] - 1.55).abs() < 1e-6, "{p:?}");
+    }
+
+    #[test]
+    fn eps_is_added_outside_the_square_root() {
+        // α = 0 ⇒ v = g² = 4, √v = 2. Mit eps = 1 lautet der Nenner 2 + 1 = 3 (und nicht √(4 + 1)).
+        let rms = RmsProp::new(1.0).with_alpha(0.0).with_eps(1.0);
+        let mut st = rms.init_state::<[f32; 1]>(1);
+        let mut p = [0.0];
+        rms.update(&mut st, &mut p, &[2.0]);
+        assert!((p[0] + 2.0 / 3.0).abs() < 1e-6, "RMSprop: {p:?}");
+
+        let ada = Adagrad { lr: 1.0, eps: 1.0 };
+        let mut g2 = ada.init_state::<[f32; 1]>(1);
+        let mut q = [0.0];
+        ada.update(&mut g2, &mut q, &[2.0]);
+        assert!((q[0] + 2.0 / 3.0).abs() < 1e-6, "Adagrad: {q:?}");
+    }
+
+    #[test]
+    fn documented_defaults_are_pinned() {
+        let adam = Adam::new(0.1);
+        assert_eq!((adam.beta1, adam.beta2, adam.eps), (0.9, 0.999, 1e-8));
+        let w = AdamW::new(0.1);
+        assert_eq!(
+            (w.beta1, w.beta2, w.eps, w.weight_decay),
+            (0.9, 0.999, 1e-8, 0.01)
+        );
+        let w = AdamW::new(0.1).with_betas(0.8, 0.9);
+        assert_eq!((w.beta1, w.beta2), (0.8, 0.9));
+        let r = RmsProp::new(0.1);
+        assert_eq!((r.alpha, r.eps, r.momentum), (0.99, 1e-8, 0.0));
+        assert_eq!(Adagrad::new(0.1).eps, 1e-10);
+        let m = Momentum::new(0.1, 0.9);
+        assert!(!m.nesterov && m.weight_decay == 0.0);
+    }
+
+    #[test]
     fn learning_rate_accessors() {
         fn roundtrip<O: Optimizer>(mut o: O, initial: f32) {
             assert_eq!(o.learning_rate(), initial);

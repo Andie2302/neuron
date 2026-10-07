@@ -29,7 +29,7 @@ let p = trainer.predict(&[1.0, 0.0])[0];   // ≈ 0.999
 
 Vollständig: [`examples/xor.rs`](examples/xor.rs). Das gesamte Training
 (Gewichte, Gradienten, Adam-Zustand, Zwischenwerte) liegt in einem
-`Trainer`-Wert von **372 Byte** auf dem Stack.
+`Trainer`-Wert von **380 Byte** auf dem Stack (das Beispiel druckt den Wert).
 
 ## Trait-Abstraktionen
 
@@ -52,8 +52,8 @@ Dropout hat einen expliziten Schalter: jeder `forward`-Aufruf bekommt einen
 
 **GELU / Swish.** `Gelu` ist die tanh-Näherung `0.5·x·(1 + tanh(√(2/π)(x + 0.044715·x³)))`
 (Abweichung zur exakten `x·Φ(x)` unter `1e-3`, per Test gegen `erf` belegt). Das tanh-Argument
-wird auf `±20` begrenzt – dort ist `tanh` in `f32` ohnehin exakt `±1` –, damit `x³` für riesige
-`|x|` nicht zu `inf`/`NaN` wird. `Swish` ist `x·σ(x)`. Seine Ableitung wird als
+wird nicht begrenzt: für riesige `|x|` läuft `x³` zwar auf `inf`, aber `tanh(±inf) = ±1` liefert
+die richtigen Grenzwerte; in der Ableitung verhindert ein Guard `0·inf = NaN`. `Swish` ist `x·σ(x)`. Seine Ableitung wird als
 `σ(x)·(1 + x·(1 − σ(x)))` berechnet: das ist algebraisch identisch zur Lehrbuchform
 `y + σ(x)(1 − y)`, vermeidet aber deren Auslöschung für große `x` (bei `x = 1e8` ergäbe die
 Lehrbuchform `0` statt `1`; ein Test belegt das). Zusätzlich: `Elu`, `Softplus`, `Mish`.
@@ -68,8 +68,14 @@ zentriert). Der Momentum-Puffer existiert auch bei `momentum = 0`, weil der Zust
 Compilezeit feststeht – der Zustand ist dann doppelt so groß wie nötig.
 
 **Gradient-Clipping und Lernraten-Pläne.** `Trainer::set_grad_clip_norm(Some(max))` skaliert die
-gemittelten Gradienten aller Layer gemeinsam auf höchstens die Norm `max` (Richtung bleibt).
-`LrSchedule`-Typen sind zustandslos; angewendet werden sie über `Trainer::set_learning_rate`.
+über den Batch gemittelten Gradienten aller Layer gemeinsam auf höchstens die Norm `max` (erst
+`1/n`, dann Clipping; die Richtung bleibt). Die Norm wird überlauffrei als `max|g| · √Σ(g/max|g|)²`
+berechnet – die naive Summe `Σ g²` liefe in `f32` schon ab `|g| ≈ 1,8e19` über und hätte das
+Clipping dort in einen stillen Nicht-Schritt verwandelt. Ist ein Gradient `inf` oder `NaN`, entfällt
+bei aktivem Clipping der **gesamte** Schritt: Gradienten werden verworfen, Parameter und
+Optimizer-Zustand (z. B. Adams Schrittzähler) bleiben unverändert. Die Gradienten-Tensoren liefert
+`Layer::visit_grads`. `LrSchedule`-Typen sind zustandslos; angewendet werden sie über
+`Trainer::set_learning_rate`.
 
 **Softmax und Argmax bei der Inferenz.** `math::softmax_inplace(&mut [f32])` zieht vor dem `exp`
 das Maximum ab (Logits wie `1000.0` laufen nicht über), allokiert nichts und definiert die
@@ -150,10 +156,10 @@ Für große Netze liegt der `Trainer` entweder in einem `static`/`static mut`
 | Aussage | Test |
 |---|---|
 | Backprop ist korrekt (Gewichte, Biases, Eingabe) | `tests/gradcheck.rs` (numerische Gradienten, auch durch `Chain`) |
-| Der Standardpfad allokiert **nie** | `tests/no_alloc.rs` (zählender `#[global_allocator]`, 0 Allokationen über Aufbau, Init, Training mit allen Optimizern/Aktivierungen/Verlusten, Clipping, Schedules, Softmax, Export/Import, Inferenz) |
+| Der Standardpfad allokiert **nie** | `tests/no_alloc.rs` (zählender `#[global_allocator]`, 0 Allokationen über Aufbau, Init, Training mit jedem Optimizer, jeder Aktivierung (statisch und jede `ActivationKind`-Variante), jedem Verlust, Clipping, jedem Lernraten-Plan, Softmax, Export/Import, Inferenz) |
 | Lernt XOR/Regression | `tests/xor.rs` (Adam+BCE, Momentum+MSE, ReLU+He, Softmax-CE, lineare Regression) |
 | Neue Aktivierungen: Ableitung stimmt | Unit-Tests (Finite Differences, Referenzwerte, Extremwerte) und `tests/gradcheck_activations.rs` (durch echte Layer; per Mutationstest auf Empfindlichkeit geprüft) |
-| Neue Optimizer/Clipping/Schedules/Huber | Unit-Tests (bekannte Schritte, AdamW ≡ Adam bei `wd = 0`) und `tests/training_extensions.rs` (XOR je Aktivierung × Optimizer über 4 Seeds, Ridge-Lösung für L2, Ausreißer-Robustheit) |
+| Neue Optimizer/Clipping/Schedules/Huber | Unit-Tests (bekannte Schritte, AdamW ≡ Adam bei `wd = 0`) und `tests/training_extensions.rs` (XOR für sechs ausgewählte Kombinationen aus Aktivierung und Optimizer, je 4 Seeds; Ridge-Lösung für L2; Clipping über Batch-Mittel, mehrere Layer und Überlauf; Ausreißer-Robustheit) |
 | Import/Export | `tests/params_io.rs` (Layout, atomare Fehler, Roundtrip, handgeschriebene `const`-Gewichte, Stack ↔ Heap) |
 | Stack ≡ Heap | `tests/dynamic.rs` (bitgleiche Verluste/Vorhersagen) |
 | Dimensionsfehler = Compilerfehler | `compile_fail`-Doctest in `src/lib.rs` |

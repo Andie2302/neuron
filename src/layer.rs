@@ -103,9 +103,12 @@ pub trait Layer {
     /// Wie [`visit_params`](Self::visit_params), aber schreibend.
     fn visit_params_mut<F: FnMut(&mut [f32])>(&mut self, f: &mut F);
 
-    /// Summe der Quadrate aller akkumulierten Parameter-Gradienten
-    /// (für Gradient-Clipping nach Norm).
-    fn grad_sq_norm(&self) -> f32;
+    /// Ruft `f` der Reihe nach mit jedem akkumulierten Gradienten-Tensor auf
+    /// (gleiche Reihenfolge wie [`visit_params`](Self::visit_params)).
+    ///
+    /// Grundlage der Gradientennorm für das Clipping: [`Trainer`](crate::trainer::Trainer)
+    /// berechnet sie daraus überlauffrei.
+    fn visit_grads<F: FnMut(&[f32])>(&self, f: &mut F);
 
     /// Kopiert alle Parameter in Export-Reihenfolge nach `dst`.
     ///
@@ -261,8 +264,9 @@ impl<A: Layer, B: Layer<Input = A::Output>> Layer for Chain<A, B> {
         self.first.visit_params_mut(f);
         self.second.visit_params_mut(f);
     }
-    fn grad_sq_norm(&self) -> f32 {
-        self.first.grad_sq_norm() + self.second.grad_sq_norm()
+    fn visit_grads<F: FnMut(&[f32])>(&self, f: &mut F) {
+        self.first.visit_grads(f);
+        self.second.visit_grads(f);
     }
 
     fn init_opt_state<O: Optimizer>(&self, opt: &O) -> Self::OptState<O> {

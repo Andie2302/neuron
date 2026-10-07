@@ -74,7 +74,7 @@ fn xor_with_softplus_and_rmsprop() {
     );
 }
 
-/// ‖w‖ der Gewichte eines `Dense<2, 1>` nach dem Training auf `y = 2·x0 - x1`.
+/// Trainiert ein `Dense<2, 1>` auf `y = 2·x0 - x1` und liefert `[w0, w1, bias]`.
 fn fit_plane<O: Optimizer>(opt: O, steps: usize) -> [f32; 3] {
     let mut net = Dense::<2, 1, _>::new(Linear);
     net.init(&Constant(0.0), &mut Pcg32::seeded(0));
@@ -194,19 +194,160 @@ fn gradient_clipping_bounds_the_update_and_keeps_its_direction() {
     assert_eq!(loose, unclipped);
 }
 
+/// Schrittlänge `‖after - before‖` über alle Parameter.
+fn step_norm<const N: usize>(before: &[f32; N], after: &[f32; N]) -> f32 {
+    before
+        .iter()
+        .zip(after)
+        .map(|(b, a)| (a - b) * (a - b))
+        .sum::<f32>()
+        .sqrt()
+}
+
 #[test]
-fn clipping_uses_the_batch_mean_not_the_single_sample() {
-    // Zwei Samples mit entgegengesetztem Gradienten: der Mittelwert ist 0,
-    // also darf trotz kleinem Limit nichts skaliert werden / nichts passieren.
-    let mut net = Dense::<1, 1, _>::new(Linear);
-    net.init(&Constant(0.0), &mut Pcg32::seeded(0));
-    let mut t = Trainer::new(net, Mse, Sgd::new(1.0)).with_grad_clip_norm(1e-3);
-    t.accumulate(&[1.0], &[10.0]);
-    t.accumulate(&[1.0], &[-10.0]);
-    t.apply(2);
-    let mut p = [0.0f32; 2];
-    t.network().copy_params_to_slice(&mut p).unwrap();
-    assert_eq!(p, [0.0, 0.0]);
+fn clipping_acts_on_the_batch_mean_after_the_one_over_n_scaling() {
+    // Dense<1,1>, w = b = 0, Sgd(1.0). Gradient je Sample: -2·t·(1, 1).
+    //   t = 3: (-6, -6), Norm 8.49      t = 1: (-2, -2), Norm 2.83
+    //   Summe (-8, -8)  ->  Mittel (-4, -4), Norm 5.66
+    // Grenze c = 3. Nur "erst mitteln, dann clippen" liefert einen Schritt der Länge 3:
+    //   ohne Clipping:           5.66
+    //   je Sample clippen:       (3 + 2.83) / 2 = 2.91
+    //   clippen vor dem 1/n:     3 / 2 = 1.5
+    let run = |clip: Option<f32>| {
+        let mut net = Dense::<1, 1, _>::new(Linear);
+        net.init(&Constant(0.0), &mut Pcg32::seeded(0));
+        let mut t = Trainer::new(net, Mse, Sgd::new(1.0));
+        t.set_grad_clip_norm(clip);
+        t.accumulate(&[1.0], &[3.0]);
+        t.accumulate(&[1.0], &[1.0]);
+        t.apply(2);
+        let mut p = [0.0f32; 2];
+        t.network().copy_params_to_slice(&mut p).unwrap();
+        step_norm(&[0.0, 0.0], &p)
+    };
+    assert!(
+        (run(None) - 4.0 * 2.0f32.sqrt()).abs() < 1e-4,
+        "ohne Clipping: {}",
+        run(None)
+    );
+    let clipped = run(Some(3.0));
+    assert!(
+        (clipped - 3.0).abs() < 1e-4,
+        "geclippter Schritt {clipped}, erwartet 3"
+    );
+}
+
+#[test]
+fn clipping_covers_every_layer_of_a_deep_network() {
+    // Chain<Chain<Dense, Dropout>, Dense>: die Norm muss Gewichte *und* Biases
+    // *aller* Layer umfassen. Zählte sie nur einen Teil, wäre der Schritt kürzer.
+    type Deep = Chain<Chain<Dense<2, 3, Tanh>, Dropout<3>>, Dense<3, 1, Linear>>;
+    const P: usize = (2 * 3 + 3) + (3 + 1);
+    let mut net: Deep = Dense::<2, 3, _>::new(Tanh)
+        .then(Dropout::<3>::new(0.0, 1))
+        .then(Dense::<3, 1, _>::new(Linear));
+    net.init(&XavierUniform, &mut Pcg32::seeded(9));
+    let mut t = Trainer::new(net, Mse, Sgd::new(1.0));
+    t.accumulate(&[0.5, -1.0], &[2.0]);
+
+    // Unabhängige Referenz aus den Dense-Accessoren.
+    let n = t.network();
+    let (l1, l2) = (n.first().first(), n.second());
+    let sq = |s: &[f32]| s.iter().map(|g| g * g).sum::<f32>();
+    let reference = (sq(l1.weight_grads().as_flattened())
+        + sq(l1.bias_grads())
+        + sq(l2.weight_grads().as_flattened())
+        + sq(l2.bias_grads()))
+    .sqrt();
+    assert!(reference > 0.1);
+    assert!(
+        (t.grad_norm() - reference).abs() < 1e-5 * reference,
+        "{} vs {reference}",
+        t.grad_norm()
+    );
+
+    let mut before = [0.0f32; P];
+    t.network().copy_params_to_slice(&mut before).unwrap();
+    t.set_grad_clip_norm(Some(0.25 * reference));
+    t.apply(1);
+    let mut after = [0.0f32; P];
+    t.network().copy_params_to_slice(&mut after).unwrap();
+    let step = step_norm(&before, &after);
+    assert!(
+        (step - 0.25 * reference).abs() < 1e-4 * reference,
+        "Schritt {step}, erwartet {}",
+        0.25 * reference
+    );
+}
+
+#[test]
+fn clipping_survives_gradients_whose_squares_overflow_f32() {
+    // Die Quadrate laufen ab |g| ≈ 1.8e19 über, die Gradienten selbst sind noch endlich.
+    // Erwartet wird trotzdem ein Schritt der Länge 1.
+    for x in [1e9f32, 1e10, 1e15, 1e19] {
+        let mut net = Dense::<2, 1, _>::new(Linear);
+        net.init(&Constant(0.5), &mut Pcg32::seeded(0));
+        let mut t = Trainer::new(net, Mse, Sgd::new(1.0)).with_grad_clip_norm(1.0);
+        t.accumulate(&[x, x], &[0.0]);
+        assert!(t.grad_norm() > 1e9, "Norm {}", t.grad_norm());
+        t.apply(1);
+        let mut p = [0.0f32; 3];
+        t.network().copy_params_to_slice(&mut p).unwrap();
+        let step = step_norm(&[0.5, 0.5, 0.0], &p);
+        assert!(
+            (step - 1.0).abs() < 1e-3,
+            "x = {x}: Schritt {step}, Parameter {p:?}"
+        );
+    }
+}
+
+#[test]
+fn non_finite_gradients_skip_the_whole_step_when_clipping() {
+    // x = 3e19: der Gradient ist schon inf. Der Schritt entfällt komplett:
+    // Parameter bleiben unverändert (kein NaN) und der Optimizer-Zustand läuft nicht weiter.
+    let build = || {
+        let mut net = Dense::<2, 1, _>::new(Linear);
+        net.init(&Constant(0.5), &mut Pcg32::seeded(0));
+        Trainer::new(net, Mse, Adam::new(0.1)).with_grad_clip_norm(1.0)
+    };
+    let mut poisoned = build();
+    poisoned.accumulate(&[3e19, 3e19], &[0.0]);
+    assert!(!poisoned.grad_norm().is_finite());
+    poisoned.apply(1);
+    let mut p = [0.0f32; 3];
+    poisoned.network().copy_params_to_slice(&mut p).unwrap();
+    assert_eq!(
+        p,
+        [0.5, 0.5, 0.0],
+        "übersprungener Schritt darf nichts ändern"
+    );
+    assert_eq!(
+        poisoned.grad_norm(),
+        0.0,
+        "verworfene Gradienten müssen zurückgesetzt sein"
+    );
+
+    // Danach läuft Training normal – und zwar bitgleich zu einem Trainer, der den
+    // vergifteten Schritt nie gesehen hat (Adams Zähler und Momente blieben unberührt).
+    let mut fresh = build();
+    for t in [&mut poisoned, &mut fresh] {
+        t.accumulate(&[1.0, 2.0], &[3.0]);
+        t.apply(1);
+    }
+    let (mut a, mut b) = ([0.0f32; 3], [0.0f32; 3]);
+    poisoned.network().copy_params_to_slice(&mut a).unwrap();
+    fresh.network().copy_params_to_slice(&mut b).unwrap();
+    assert_eq!(a, b);
+
+    let mut nan = build();
+    nan.accumulate(&[f32::NAN, 1.0], &[0.0]);
+    nan.apply(1);
+    nan.network().copy_params_to_slice(&mut p).unwrap();
+    assert_eq!(
+        p,
+        [0.5, 0.5, 0.0],
+        "NaN-Gradient: Schritt entfällt ebenfalls"
+    );
 }
 
 #[test]

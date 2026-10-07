@@ -62,10 +62,17 @@ impl<L: Layer, Ls: Loss, O: Optimizer> Trainer<L, Ls, O> {
     /// Schaltet Gradient-Clipping nach globaler L2-Norm ein (`Some(max_norm)`)
     /// oder aus (`None`).
     ///
-    /// In [`apply`](Self::apply) werden die gemittelten Gradienten aller Layer
-    /// gemeinsam so skaliert, dass ihre Norm höchstens `max_norm` beträgt. Die
-    /// Richtung bleibt erhalten. Das stabilisiert das Training bei großen
-    /// Lernraten oder Ausreißern.
+    /// In [`apply`](Self::apply) werden die über den Batch **gemittelten**
+    /// Gradienten aller Layer gemeinsam so skaliert, dass ihre Norm höchstens
+    /// `max_norm` beträgt (erst `1/n`, dann Clipping). Die Richtung bleibt
+    /// erhalten. Das stabilisiert das Training bei großen Lernraten oder
+    /// Ausreißern. Die Norm wird überlauffrei berechnet, das Clipping wirkt also
+    /// auch bei sehr großen, aber endlichen Gradienten.
+    ///
+    /// **Nicht endliche Gradienten** (`inf` oder `NaN`): Solange Clipping aktiv
+    /// ist, entfällt der gesamte Schritt. Die Gradienten werden verworfen,
+    /// Parameter *und* Optimizer-Zustand (z. B. Adams Schrittzähler und Momente)
+    /// bleiben unverändert. Ohne Clipping werden sie unverändert weitergereicht.
     ///
     /// # Panics
     /// Wenn `max_norm` nicht endlich und `> 0` ist.
@@ -85,9 +92,51 @@ impl<L: Layer, Ls: Loss, O: Optimizer> Trainer<L, Ls, O> {
         self
     }
 
+    /// Zerlegt die globale L2-Norm der akkumulierten Gradienten überlauffrei in
+    /// `(m, s)` mit `norm = m · s`, wobei `m = max |g|` und `s = √Σ (g/m)²`
+    /// (`1 <= s <= √n`).
+    ///
+    /// Die naive Summe `Σ g²` läuft für `|g| > 1,8e19` in `f32` über, obwohl die
+    /// Gradienten selbst noch endlich sind. Sonderfälle: kein Gradient ungleich
+    /// `0` gibt `(0, 0)`; enthält ein Gradient `NaN`, ist `m = NaN`; ein
+    /// unendlicher Gradient ergibt `m = inf`.
+    fn grad_norm_parts(&self) -> (f32, f32) {
+        let mut max = 0.0f32;
+        let mut has_nan = false;
+        self.net.visit_grads(&mut |g: &[f32]| {
+            for &v in g {
+                if v.is_nan() {
+                    has_nan = true;
+                } else {
+                    max = max.max(math::abs(v));
+                }
+            }
+        });
+        if has_nan {
+            return (f32::NAN, 1.0);
+        }
+        if max == 0.0 {
+            return (0.0, 0.0);
+        }
+        if max == f32::INFINITY {
+            return (max, 1.0);
+        }
+        let mut sum = 0.0f32;
+        self.net.visit_grads(&mut |g: &[f32]| {
+            for &v in g {
+                let scaled = v / max;
+                sum += scaled * scaled;
+            }
+        });
+        (max, math::sqrt(sum))
+    }
+
     /// Globale L2-Norm der aktuell akkumulierten Gradienten.
+    ///
+    /// Liegt die Norm außerhalb des `f32`-Bereichs, ist das Ergebnis `inf`.
     pub fn grad_norm(&self) -> f32 {
-        math::sqrt(self.net.grad_sq_norm())
+        let (m, s) = self.grad_norm_parts();
+        m * s
     }
 
     /// Forward im [`Mode::Inference`].
@@ -122,11 +171,18 @@ impl<L: Layer, Ls: Loss, O: Optimizer> Trainer<L, Ls, O> {
         }
         self.net.scale_grads(1.0 / samples as f32);
         if let Some(max_norm) = self.clip_norm {
-            let norm = self.grad_norm();
-            // `norm > max_norm` ist auch für inf wahr (Skalierung auf 0 = Schritt
-            // überspringen); NaN wird nicht abgefangen, sondern sichtbar.
-            if norm > max_norm {
-                self.net.scale_grads(max_norm / norm);
+            let (m, s) = self.grad_norm_parts();
+            if !m.is_finite() {
+                // inf/NaN: kein Schritt. Weder Parameter noch Optimizer-Zustand
+                // (begin_step zählt sonst z. B. Adams t weiter) dürfen sich ändern.
+                self.net.zero_grad();
+                return;
+            }
+            // norm = m·s > max_norm  <=>  s > max_norm / m. Beide Seiten bleiben endlich;
+            // die Norm selbst wird nie gebildet (m·s kann den f32-Bereich verlassen).
+            let limit = max_norm / m;
+            if s > limit {
+                self.net.scale_grads(limit / s);
             }
         }
         self.opt.begin_step();

@@ -134,12 +134,12 @@ const GELU_CUBIC: f32 = 0.044_715;
 
 /// Argument `u = √(2/π) · (x + 0.044715 x³)` des tanh in der GELU-Näherung.
 ///
-/// `tanh(±20)` ist in `f32` bereits exakt `±1`. Das Begrenzen ändert also kein
-/// Ergebnis, verhindert aber, dass `x³` für sehr große `|x|` zu `±inf` wird
-/// und im Weiteren `NaN` entsteht.
+/// Für `|x| > ~7e12` läuft `x³` in `f32` auf `±inf`, `u` wird ebenfalls `±inf`
+/// und `tanh(±inf) = ±1` liefert in [`Gelu::apply`] die richtigen Grenzwerte.
+/// Eine eigene Begrenzung ist dafür nicht nötig.
 #[inline]
 fn gelu_inner(x: f32) -> f32 {
-    (SQRT_2_OVER_PI * (x + GELU_CUBIC * x * x * x)).clamp(-20.0, 20.0)
+    SQRT_2_OVER_PI * (x + GELU_CUBIC * x * x * x)
 }
 
 /// GELU (Gaussian Error Linear Unit) in der tanh-Näherung:
@@ -166,7 +166,9 @@ impl Activation for Gelu {
         let t = math::tanh(gelu_inner(x));
         let sech2 = 1.0 - t * t;
         // In der Sättigung (sech2 == 0) verschwindet der zweite Summand. Ihn
-        // dort nicht auszuwerten vermeidet 0 · inf = NaN für riesige |x|.
+        // dort nicht auszuwerten ist nötig: für |x| > ~1,8e19 ist x·x = inf und
+        // 0 · inf wäre NaN. Dieser Guard – nicht eine Begrenzung von `u` – schützt
+        // die Ableitung.
         let slope = if sech2 > 0.0 {
             0.5 * x * sech2 * SQRT_2_OVER_PI * (1.0 + 3.0 * GELU_CUBIC * x * x)
         } else {
@@ -494,7 +496,8 @@ mod tests {
 
     #[test]
     fn gelu_is_finite_for_extreme_inputs() {
-        // x³ läuft für |x| > ~7e12 auf inf; ohne Begrenzung entstünde NaN.
+        // x³ läuft für |x| > ~7e12 auf inf (tanh(±inf) = ±1 hält `apply` endlich),
+        // x² für |x| > ~1,8e19 (der `sech2 > 0`-Guard verhindert 0·inf in `derivative`).
         for x in [
             1e3,
             -1e3,

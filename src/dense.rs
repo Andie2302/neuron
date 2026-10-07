@@ -279,9 +279,9 @@ impl<S: Storage, A: Activation> Layer for DenseLayer<S, A> {
         f(self.b.as_mut_slice());
     }
 
-    fn grad_sq_norm(&self) -> f32 {
-        let sum_sq = |g: &[f32]| g.iter().map(|x| x * x).sum::<f32>();
-        sum_sq(self.gw.as_slice()) + sum_sq(self.gb.as_slice())
+    fn visit_grads<F: FnMut(&[f32])>(&self, f: &mut F) {
+        f(self.gw.as_slice());
+        f(self.gb.as_slice());
     }
 
     fn init_opt_state<O: Optimizer>(&self, opt: &O) -> Self::OptState<O> {

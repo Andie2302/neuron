@@ -71,8 +71,8 @@ impl Layer for DynLayer {
     fn visit_params_mut<F: FnMut(&mut [f32])>(&mut self, f: &mut F) {
         dispatch!(self, l => l.visit_params_mut(f))
     }
-    fn grad_sq_norm(&self) -> f32 {
-        dispatch!(self, l => l.grad_sq_norm())
+    fn visit_grads<F: FnMut(&[f32])>(&self, f: &mut F) {
+        dispatch!(self, l => l.visit_grads(f))
     }
     fn zero_grad(&mut self) {
         dispatch!(self, l => l.zero_grad())
@@ -228,8 +228,10 @@ impl Layer for Sequential {
             l.visit_params_mut(f);
         }
     }
-    fn grad_sq_norm(&self) -> f32 {
-        self.layers.iter().map(Layer::grad_sq_norm).sum()
+    fn visit_grads<F: FnMut(&[f32])>(&self, f: &mut F) {
+        for l in &self.layers {
+            l.visit_grads(f);
+        }
     }
 
     fn zero_grad(&mut self) {

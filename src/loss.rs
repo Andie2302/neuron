@@ -81,6 +81,22 @@ pub struct Huber {
     pub delta: f32,
 }
 
+impl Huber {
+    /// Huber-Verlust mit Übergang bei `delta`.
+    ///
+    /// # Panics
+    /// Wenn `delta` nicht endlich und `> 0` ist. (Das Feld ist öffentlich; ein
+    /// ungültiger Wert per Struktur-Literal ließe `gradient` später in
+    /// `clamp` mit einer wenig aussagekräftigen Meldung abbrechen.)
+    pub fn new(delta: f32) -> Self {
+        assert!(
+            delta.is_finite() && delta > 0.0,
+            "delta muss endlich und > 0 sein"
+        );
+        Huber { delta }
+    }
+}
+
 impl Default for Huber {
     fn default() -> Self {
         Huber { delta: 1.0 }
@@ -269,6 +285,29 @@ mod tests {
         let mut g = [0.0];
         Huber { delta: 2.0 }.gradient(&p, &t, &mut g);
         assert_eq!(g, [2.0]);
+    }
+
+    #[test]
+    fn huber_new_accepts_a_valid_delta() {
+        assert_eq!(Huber::new(2.5).delta, 2.5);
+    }
+
+    #[test]
+    #[should_panic(expected = "delta")]
+    fn huber_new_rejects_zero() {
+        let _ = Huber::new(0.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "delta")]
+    fn huber_new_rejects_negative() {
+        let _ = Huber::new(-1.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "delta")]
+    fn huber_new_rejects_nan() {
+        let _ = Huber::new(f32::NAN);
     }
 
     #[test]

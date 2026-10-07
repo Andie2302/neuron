@@ -141,3 +141,98 @@ fn new_features_never_touch_the_heap() {
     std::hint::black_box(sink);
     assert_eq!(used, 0, "{used} Heap-Allokationen in den neuen Funktionen");
 }
+
+/// Trainiert kurz ein kleines Netz mit dem gegebenen Optimizer (LeakyRelu, statisch).
+fn train_briefly<O: Optimizer>(opt: O) -> f32 {
+    let mut net = Dense::<2, 4, _>::new(LeakyRelu::default()).then(Dense::<4, 1, _>::new(Linear));
+    net.init(&XavierUniform, &mut Pcg32::seeded(3));
+    let mut t = Trainer::new(net, Mse, opt);
+    let mut sum = 0.0;
+    for i in 0..20 {
+        sum += t.train_step(&XS[i % 4], &YS[i % 4]);
+    }
+    sum + t.predict(&XS[0])[0]
+}
+
+/// Trainiert kurz mit dem gegebenen Verlust (Softmax-Cross-Entropy braucht Ziele, die
+/// zu einer Verteilung summieren – hier genügt eine feste, gültige Zielverteilung).
+fn train_with_loss<Ls: Loss>(loss: Ls) -> f32 {
+    let mut net = Dense::<2, 3, _>::new(Tanh).then(Dense::<3, 2, _>::new(Linear));
+    net.init(&XavierUniform, &mut Pcg32::seeded(4));
+    let mut t = Trainer::new(net, loss, Adam::new(0.01));
+    let target = [0.25, 0.75];
+    let mut sum = 0.0;
+    for i in 0..20 {
+        sum += t.train_step(&XS[i % 4], &target);
+    }
+    sum
+}
+
+#[test]
+fn every_activation_optimizer_loss_and_schedule_never_touches_the_heap() {
+    let before = allocs();
+    let mut sink = 0.0f32;
+
+    // Jede Variante von `ActivationKind` (Laufzeitwahl) in einem eigenen Netz.
+    let kinds = [
+        ActivationKind::Linear,
+        ActivationKind::Relu,
+        ActivationKind::LeakyRelu(0.1),
+        ActivationKind::Sigmoid,
+        ActivationKind::Tanh,
+        ActivationKind::Gelu,
+        ActivationKind::Swish,
+        ActivationKind::Elu(1.0),
+        ActivationKind::Softplus,
+        ActivationKind::Mish,
+    ];
+    for kind in kinds {
+        let mut net =
+            Dense::<2, 3, _>::new(kind).then(Dense::<3, 1, _>::new(ActivationKind::Linear));
+        net.init(&XavierUniform, &mut Pcg32::seeded(1));
+        let mut t = Trainer::new(net, Mse, Sgd::new(0.01).with_weight_decay(0.001));
+        for i in 0..20 {
+            sink += t.train_step(&XS[i % 4], &YS[i % 4]);
+        }
+        sink += t.predict(&XS[0])[0];
+    }
+
+    // Jeder Optimizer (inklusive Weight Decay, Nesterov und Momentum bei RMSprop).
+    sink += train_briefly(Sgd::new(0.01));
+    sink += train_briefly(Sgd::new(0.01).with_weight_decay(0.01));
+    sink += train_briefly(Momentum::new(0.01, 0.9));
+    sink += train_briefly(
+        Momentum::new(0.01, 0.9)
+            .with_nesterov(true)
+            .with_weight_decay(0.01),
+    );
+    sink += train_briefly(Adam::new(0.01));
+    sink += train_briefly(AdamW::new(0.01).with_weight_decay(0.05));
+    sink += train_briefly(RmsProp::new(0.01));
+    sink += train_briefly(RmsProp::new(0.01).with_momentum(0.9));
+    sink += train_briefly(Adagrad::new(0.1));
+
+    // Jeder Verlust.
+    sink += train_with_loss(Mse);
+    sink += train_with_loss(Mae);
+    sink += train_with_loss(Huber::new(0.5));
+    sink += train_with_loss(BinaryCrossEntropy::default());
+    sink += train_with_loss(SoftmaxCrossEntropy);
+
+    // Jeder Lernraten-Plan.
+    for step in 0..50u32 {
+        sink += ConstantLr(0.1).lr(step);
+        sink += StepDecay::new(0.1, 0.5, 10).lr(step);
+        sink += ExponentialDecay {
+            base: 0.1,
+            gamma: 0.95,
+        }
+        .lr(step);
+        sink += CosineAnnealing::new(0.1, 0.001, 40).lr(step);
+        sink += Warmup::new(5, ConstantLr(0.1)).lr(step);
+    }
+
+    let used = allocs() - before;
+    std::hint::black_box(sink);
+    assert_eq!(used, 0, "{used} Heap-Allokationen");
+}
