@@ -1,0 +1,19 @@
+[package]
+name = "neuron"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Konfigurierbares neuronales Netz: no_std, ohne alloc, Speicher ueber Const Generics"
+
+[features]
+default = []
+# Opt-In: dynamisch dimensionierte Puffer/Layer auf Basis von `alloc::vec::Vec`.
+alloc = []
+
+[dependencies]
+# Einzige Abhaengigkeit: Mathe (exp, ln, tanh, ...) fuer no_std.
+libm = { version = "0.2", default-features = false }
+
+[[example]]
+name = "dynamic_xor"
+required-features = ["alloc"]
