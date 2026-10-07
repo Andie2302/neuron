@@ -10,17 +10,18 @@ fn xor_batch() -> impl Iterator<Item = (&'static [f32], &'static [f32])> {
     XS.iter().zip(&YS).map(|(x, y)| (&x[..], &y[..]))
 }
 
-/// Trainiert `2 → 8 → 1` auf XOR und liefert den größten Vorhersagefehler.
+/// Trainiert `2 → 8 → 1` auf XOR (Linear-Ausgang + Logit-BCE) und liefert den größten
+/// Vorhersagefehler der Wahrscheinlichkeiten `σ(Logit)`.
 fn xor_worst_error<A: Activation, O: Optimizer>(act: A, opt: O, epochs: usize, seed: u64) -> f32 {
-    let mut net = Dense::<2, 8, _>::new(act).then(Dense::<8, 1, _>::new(Sigmoid));
+    let mut net = Dense::<2, 8, _>::new(act).then(Dense::<8, 1, _>::new(Linear));
     net.init(&XavierUniform, &mut Pcg32::seeded(seed));
-    let mut t = Trainer::new(net, BinaryCrossEntropy::default(), opt);
+    let mut t = Trainer::new(net, BinaryCrossEntropyWithLogits::new(), opt);
     for _ in 0..epochs {
         t.train_batch(xor_batch());
     }
     XS.iter()
         .zip(&YS)
-        .map(|(x, y)| (t.predict(x)[0] - y[0]).abs())
+        .map(|(x, y)| (sigmoid(t.predict(x)[0]) - y[0]).abs())
         .fold(0.0, f32::max)
 }
 
@@ -78,7 +79,7 @@ fn xor_with_softplus_and_rmsprop() {
 fn fit_plane<O: Optimizer>(opt: O, steps: usize) -> [f32; 3] {
     let mut net = Dense::<2, 1, _>::new(Linear);
     net.init(&Constant(0.0), &mut Pcg32::seeded(0));
-    let mut t = Trainer::new(net, Mse, opt);
+    let mut t = Trainer::new(net, Mse::new(), opt);
     let mut samples = [([0.0f32; 2], [0.0f32; 1]); 25];
     for (i, s) in samples.iter_mut().enumerate() {
         let x = [(i % 5) as f32 * 0.5 - 1.0, (i / 5) as f32 * 0.5 - 1.0];
@@ -159,7 +160,7 @@ fn gradient_clipping_bounds_the_update_and_keeps_its_direction() {
     let run = |clip: Option<f32>| {
         let mut net = Dense::<2, 1, _>::new(Linear);
         net.init(&Constant(0.0), &mut Pcg32::seeded(0));
-        let mut t = Trainer::new(net, Mse, Sgd::new(1.0));
+        let mut t = Trainer::new(net, Mse::new(), Sgd::new(1.0));
         t.set_grad_clip_norm(clip);
         // Riesiger Fehler: Gradient = -200·(x0, x1, 1)
         t.accumulate(&[1.0, 1.0], &[100.0]);
@@ -216,7 +217,7 @@ fn clipping_acts_on_the_batch_mean_after_the_one_over_n_scaling() {
     let run = |clip: Option<f32>| {
         let mut net = Dense::<1, 1, _>::new(Linear);
         net.init(&Constant(0.0), &mut Pcg32::seeded(0));
-        let mut t = Trainer::new(net, Mse, Sgd::new(1.0));
+        let mut t = Trainer::new(net, Mse::new(), Sgd::new(1.0));
         t.set_grad_clip_norm(clip);
         t.accumulate(&[1.0], &[3.0]);
         t.accumulate(&[1.0], &[1.0]);
@@ -247,7 +248,7 @@ fn clipping_covers_every_layer_of_a_deep_network() {
         .then(Dropout::<3>::new(0.0, 1))
         .then(Dense::<3, 1, _>::new(Linear));
     net.init(&XavierUniform, &mut Pcg32::seeded(9));
-    let mut t = Trainer::new(net, Mse, Sgd::new(1.0));
+    let mut t = Trainer::new(net, Mse::new(), Sgd::new(1.0));
     t.accumulate(&[0.5, -1.0], &[2.0]);
 
     // Unabhängige Referenz aus den Dense-Accessoren.
@@ -287,7 +288,7 @@ fn clipping_survives_gradients_whose_squares_overflow_f32() {
     for x in [1e9f32, 1e10, 1e15, 1e19] {
         let mut net = Dense::<2, 1, _>::new(Linear);
         net.init(&Constant(0.5), &mut Pcg32::seeded(0));
-        let mut t = Trainer::new(net, Mse, Sgd::new(1.0)).with_grad_clip_norm(1.0);
+        let mut t = Trainer::new(net, Mse::new(), Sgd::new(1.0)).with_grad_clip_norm(1.0);
         t.accumulate(&[x, x], &[0.0]);
         assert!(t.grad_norm() > 1e9, "Norm {}", t.grad_norm());
         t.apply(1);
@@ -308,7 +309,7 @@ fn non_finite_gradients_skip_the_whole_step_when_clipping() {
     let build = || {
         let mut net = Dense::<2, 1, _>::new(Linear);
         net.init(&Constant(0.5), &mut Pcg32::seeded(0));
-        Trainer::new(net, Mse, Adam::new(0.1)).with_grad_clip_norm(1.0)
+        Trainer::new(net, Mse::new(), Adam::new(0.1)).with_grad_clip_norm(1.0)
     };
     let mut poisoned = build();
     poisoned.accumulate(&[3e19, 3e19], &[0.0]);
@@ -354,18 +355,18 @@ fn non_finite_gradients_skip_the_whole_step_when_clipping() {
 #[should_panic(expected = "max_norm")]
 fn clipping_rejects_a_non_positive_limit() {
     let net = Dense::<1, 1, _>::new(Linear);
-    let mut t = Trainer::new(net, Mse, Sgd::new(0.1));
+    let mut t = Trainer::new(net, Mse::new(), Sgd::new(0.1));
     t.set_grad_clip_norm(Some(0.0));
 }
 
 #[test]
 fn schedule_drives_the_trainer_learning_rate() {
     let schedule = Warmup::new(20, CosineAnnealing::new(0.05, 0.001, 600));
-    let mut net = Dense::<2, 8, _>::new(Gelu).then(Dense::<8, 1, _>::new(Sigmoid));
+    let mut net = Dense::<2, 8, _>::new(Gelu).then(Dense::<8, 1, _>::new(Linear));
     net.init(&XavierUniform, &mut Pcg32::seeded(2));
     let mut t = Trainer::new(
         net,
-        BinaryCrossEntropy::default(),
+        BinaryCrossEntropyWithLogits::new(),
         AdamW::new(schedule.lr(0)),
     );
     assert_eq!(t.learning_rate(), schedule.lr(0));
@@ -383,7 +384,7 @@ fn schedule_drives_the_trainer_learning_rate() {
         t.learning_rate()
     );
     for (x, y) in XS.iter().zip(&YS) {
-        assert!((t.predict(x)[0] - y[0]).abs() < 0.15);
+        assert!((sigmoid(t.predict(x)[0]) - y[0]).abs() < 0.15);
     }
 }
 
@@ -392,7 +393,7 @@ fn softmax_turns_logits_into_probabilities_at_inference() {
     let ys: [[f32; 2]; 4] = [[1.0, 0.0], [0.0, 1.0], [0.0, 1.0], [1.0, 0.0]];
     let mut net = Dense::<2, 6, _>::new(Gelu).then(Dense::<6, 2, _>::new(Linear));
     net.init(&XavierUniform, &mut Pcg32::seeded(5));
-    let mut t = Trainer::new(net, SoftmaxCrossEntropy, AdamW::new(0.05));
+    let mut t = Trainer::new(net, SoftmaxCrossEntropy::new(), AdamW::new(0.05));
     for _ in 0..800 {
         t.train_batch(XS.iter().zip(&ys).map(|(x, y)| (&x[..], &y[..])));
     }
@@ -433,9 +434,9 @@ fn huber_and_mae_resist_an_outlier_that_drags_mse_away() {
         (t.network().weights_as_slice()[0] - 2.0).abs()
     }
 
-    let mse = slope_error(Mse, &samples, 0.05);
+    let mse = slope_error(Mse::new(), &samples, 0.05);
     let huber = slope_error(Huber::default(), &samples, 0.05);
-    let mae = slope_error(Mae, &samples, 0.01);
+    let mae = slope_error(Mae::new(), &samples, 0.01);
     assert!(
         mse > 5.0,
         "MSE sollte vom Ausreißer weit weggezogen werden: {mse}"
@@ -445,14 +446,49 @@ fn huber_and_mae_resist_an_outlier_that_drags_mse_away() {
     assert!(huber < mse / 10.0 && mae < mse / 10.0);
 }
 
+/// Bildet die entfernte Variante `BinaryCrossEntropy` (Kreuzentropie auf Wahrscheinlichkeiten
+/// einer Sigmoid-Ausgabe) nach und dient nur dazu, das Einfrieren bei gesättigter
+/// Fehlvorhersage zu belegen. `p` wird auf `[1e-7, 1 - 1e-7]` geklemmt.
+struct ProbabilityBce;
+
+impl ProbabilityBce {
+    const EPS: f32 = 1e-7;
+
+    fn clamp(p: f32) -> f32 {
+        p.clamp(Self::EPS, 1.0 - Self::EPS)
+    }
+}
+
+impl Loss for ProbabilityBce {
+    fn value(&self, pred: &[f32], target: &[f32]) -> f32 {
+        let sum: f32 = pred
+            .iter()
+            .zip(target)
+            .map(|(&p, &t)| {
+                let p = Self::clamp(p);
+                -(t * p.ln() + (1.0 - t) * (1.0 - p).ln())
+            })
+            .sum();
+        sum / pred.len() as f32
+    }
+
+    fn gradient(&self, pred: &[f32], target: &[f32], grad: &mut [f32]) {
+        let n = pred.len() as f32;
+        for ((g, &p), &t) in grad.iter_mut().zip(pred).zip(target) {
+            let p = Self::clamp(p);
+            *g = (p - t) / (p * (1.0 - p)) / n;
+        }
+    }
+}
+
 /// Das Netz startet völlig falsch und gesättigt: Logit 30, Ziel 0.
 #[test]
 fn saturated_wrong_output_freezes_with_probability_bce_but_recovers_with_logits_bce() {
-    // Alt: Sigmoid-Ausgang + BCE auf Wahrscheinlichkeiten. σ(30) = 1.0 exakt in f32,
-    // σ' = 0, der Gradient verschwindet – das Netz bleibt für immer so falsch.
+    // Wahrscheinlichkeits-BCE (test-lokaler Nachbau) auf Sigmoid-Ausgang: σ(30) = 1.0 exakt in
+    // f32, σ' = 0, der Gradient verschwindet – das Netz bleibt für immer so falsch.
     let mut frozen_net = Dense::<1, 1, _>::new(Sigmoid);
     *frozen_net.weights_mut() = [[30.0]];
-    let mut frozen = Trainer::new(frozen_net, BinaryCrossEntropy::default(), Sgd::new(0.5));
+    let mut frozen = Trainer::new(frozen_net, ProbabilityBce, Sgd::new(0.5));
     let initial_loss = frozen.evaluate(&[1.0], &[0.0]);
     for _ in 0..100 {
         frozen.train_step(&[1.0], &[0.0]);
@@ -469,10 +505,10 @@ fn saturated_wrong_output_freezes_with_probability_bce_but_recovers_with_logits_
     );
     assert!(initial_loss > 10.0, "Ausgangsverlust {initial_loss}");
 
-    // Neu: Linear-Ausgang + fusionierter Logit-Verlust. Gradient σ(z) - t = 1 bleibt voll erhalten.
+    // Dagegen: Linear-Ausgang + fusionierter Logit-Verlust. Gradient σ(z) - t = 1 bleibt voll erhalten.
     let mut net = Dense::<1, 1, _>::new(Linear);
     *net.weights_mut() = [[30.0]];
-    let mut fixed = Trainer::new(net, BinaryCrossEntropyWithLogits, Sgd::new(0.5));
+    let mut fixed = Trainer::new(net, BinaryCrossEntropyWithLogits::new(), Sgd::new(0.5));
     for _ in 0..100 {
         fixed.train_step(&[1.0], &[0.0]);
     }
@@ -492,7 +528,7 @@ fn xor_with_logits_loss_and_sigmoid_only_at_inference() {
     for seed in [1u64, 2, 3, 4] {
         let mut net = Dense::<2, 8, _>::new(Gelu).then(Dense::<8, 1, _>::new(Linear));
         net.init(&XavierUniform, &mut Pcg32::seeded(seed));
-        let mut t = Trainer::new(net, BinaryCrossEntropyWithLogits, AdamW::new(0.03));
+        let mut t = Trainer::new(net, BinaryCrossEntropyWithLogits::new(), AdamW::new(0.03));
         for _ in 0..1200 {
             t.train_batch(xor_batch());
         }
@@ -509,7 +545,7 @@ fn xor_with_logits_loss_and_sigmoid_only_at_inference() {
 fn fit_constant_target<O: Optimizer>(opt: O, steps: usize) -> (f32, f32) {
     let mut net = Dense::<1, 1, _>::new(Linear);
     net.init(&Constant(1.0), &mut Pcg32::seeded(0));
-    let mut t = Trainer::new(net, Mse, opt);
+    let mut t = Trainer::new(net, Mse::new(), opt);
     for _ in 0..steps {
         t.train_step(&[0.0], &[5.0]);
     }
@@ -555,7 +591,7 @@ fn hard_sigmoid_recovers_its_own_parameters() {
     let mut net = Dense::<1, 1, _>::new(HardSigmoid);
     *net.weights_mut() = [[1.0]];
     *net.bias_mut() = [-0.5];
-    let mut t = Trainer::new(net, Mse, Adam::new(0.05));
+    let mut t = Trainer::new(net, Mse::new(), Adam::new(0.05));
     let mut samples = [([0.0f32; 1], [0.0f32; 1]); 25];
     for (i, s) in samples.iter_mut().enumerate() {
         let x = -3.0 + 0.25 * i as f32;

@@ -3,10 +3,155 @@
 //! Konvention: [`Loss::value`] liefert einen Skalar pro Sample,
 //! [`Loss::gradient`] schreibt `dL/dpred` in einen vom Aufrufer gestellten
 //! Puffer – es wird nichts allokiert.
+//!
+//! ## Einheitliche Konstruktoren
+//!
+//! **Jeder** Verlust wird mit `X::new(..)` erzeugt und hat ein [`Default`] mit den üblichen
+//! Standardwerten:
+//!
+//! * **Parameterlose** Verluste ([`Mse`], [`Mae`], [`LogCosh`], [`Hinge`], [`SquaredHinge`],
+//!   [`BinaryCrossEntropyWithLogits`], [`SoftmaxCrossEntropy`]) sind `#[non_exhaustive]`-Einheits-
+//!   Structs mit einer `const fn new()`. Außerhalb des Crates gibt es nur diesen einen Weg
+//!   (`Mse::new()`); ein später hinzukommender Parameter bricht dann keinen Aufrufer.
+//! * Verluste **mit Parametern** ([`Huber`], [`WeightedBinaryCrossEntropyWithLogits`],
+//!   [`FocalLossWithLogits`], [`LabelSmoothingCrossEntropy`]) prüfen ihre Werte in `new` (ungültige
+//!   Werte lösen einen `panic!` mit klarer Meldung aus) und halten die Felder **privat**; gelesen
+//!   werden sie über gleichnamige Getter. So lassen sich die Invarianten nicht per
+//!   Struktur-Literal umgehen. Optionale Parameter setzt ein validierter `with_*`-Builder.
+//!
+//! ```
+//! use neuron::prelude::*;
+//!
+//! let robust = Huber::new(0.5);
+//! assert_eq!(robust.delta(), 0.5);
+//! let focal = FocalLossWithLogits::new(2.0).with_alpha(0.25);
+//! assert_eq!((focal.gamma(), focal.alpha()), (2.0, Some(0.25)));
+//! let plain = Mse::new(); // oder `Mse::default()`
+//! assert_eq!(plain.value(&[1.0, 3.0], &[0.0, 1.0]), 2.5);
+//! ```
+//!
+//! ## Warum es keinen Verlust auf Wahrscheinlichkeiten gibt
+//!
+//! Die binäre Kreuzentropie gibt es nur als [`BinaryCrossEntropyWithLogits`]: Sie rechnet auf
+//! den rohen Logits einer `Linear`-Ausgabe. Ein Verlust auf den Wahrscheinlichkeiten einer
+//! `Sigmoid`-Ausgabe friert in `f32` ein (`σ(z)` ist für `z ≳ 17` exakt `1.0`, die
+//! Sigmoid-Ableitung dann exakt `0`), auch bei völlig falscher Vorhersage. Details und der
+//! Test dazu stehen bei [`BinaryCrossEntropyWithLogits`].
 
 use crate::math;
 
 /// Austauschbare Verlustfunktion.
+///
+/// Ein Verlust bewertet die Vorhersage `pred` (die Ausgabe des Netzes) für **ein Sample** gegen
+/// das Ziel `target`. Der [`Trainer`](crate::trainer::Trainer) braucht zwei Dinge davon:
+/// [`value`](Self::value) für den Verlustwert (Rückgabe von `train_step`, `evaluate` und
+/// `evaluate_batch`) und [`gradient`](Self::gradient) für `dL/dpred`, den Startwert des
+/// Backward-Passes durch das Netz. Der Vertrag:
+///
+/// * `pred`, `target` und `grad` sind gleich lang (die Ausgangsdimension des Netzes). `value` ist
+///   ein Skalar je Sample; die eingebauten Verluste mitteln dazu über die `n` Ausgabeelemente.
+/// * `gradient` ist die Ableitung **genau dessen, was `value` zurückgibt**, einschließlich des
+///   Faktors `1/n` eines Mittelwerts. Weichen beide voneinander ab, lernt das Netz in eine falsche
+///   Richtung, ohne dass etwas meldet, warum. Die Probe ist der Vergleich mit zentralen
+///   Differenzen (im Beispiel unten).
+/// * `gradient` **überschreibt** `grad` vollständig: Der Trainer verwendet den Puffer für jedes
+///   Sample wieder.
+/// * Beide Methoden nehmen `&self` und allokieren nichts. Der Verlust darf Hyperparameter tragen,
+///   aber keinen veränderlichen Zustand. Das Mitteln über die Samples eines Mini-Batches
+///   übernimmt der Trainer, nicht der Verlust.
+///
+/// # Beispiel: ein eigener Verlust
+///
+/// `AsymmetricMse` ist ein quadratischer Fehler mit zwei Gewichten: Eine zu niedrige Vorhersage
+/// (`p < t`) zählt `under`-fach, eine zu hohe `over`-fach. Mit `under > over` zieht er die
+/// Vorhersage nach oben (Expektil-Regression). Das Beispiel prüft den Gradienten gegen zentrale
+/// Differenzen und trainiert dieselbe Regression mit [`Mse`] und mit dem eigenen Verlust:
+///
+/// ```
+/// use neuron::prelude::*;
+///
+/// struct AsymmetricMse {
+///     under: f32,
+///     over: f32,
+/// }
+///
+/// impl AsymmetricMse {
+///     fn weight(&self, p: f32, t: f32) -> f32 {
+///         if p < t {
+///             self.under
+///         } else {
+///             self.over
+///         }
+///     }
+/// }
+///
+/// impl Loss for AsymmetricMse {
+///     fn value(&self, pred: &[f32], target: &[f32]) -> f32 {
+///         let sum: f32 = pred
+///             .iter()
+///             .zip(target)
+///             .map(|(&p, &t)| self.weight(p, t) * (p - t) * (p - t))
+///             .sum();
+///         sum / pred.len() as f32 // Mittel über die Ausgabeelemente
+///     }
+///
+///     fn gradient(&self, pred: &[f32], target: &[f32], grad: &mut [f32]) {
+///         let n = pred.len() as f32;
+///         for ((g, &p), &t) in grad.iter_mut().zip(pred).zip(target) {
+///             // d/dp [w (p - t)² / n]; geschrieben wird mit `=`, nicht mit `+=`.
+///             *g = 2.0 * self.weight(p, t) * (p - t) / n;
+///         }
+///     }
+/// }
+///
+/// // 1. Gradientencheck (zentrale Differenz). Bei p == t springt die Krümmung (von `under` auf
+/// //    `over`); die Punkte liegen deshalb mit Abstand zum Ziel, damit die Differenz nicht über
+/// //    den Sprung hinweg rechnet.
+/// let loss = AsymmetricMse { under: 4.0, over: 1.0 };
+/// let pred = [0.5f32, 2.0, -1.0];
+/// let target = [1.0f32, 1.0, 0.0];
+/// assert_eq!(loss.value(&pred, &target), (4.0 * 0.25 + 1.0 + 4.0 * 1.0) / 3.0);
+///
+/// let mut analytic = [0.0f32; 3];
+/// loss.gradient(&pred, &target, &mut analytic);
+/// for i in 0..3 {
+///     let h = 1e-2;
+///     let (mut up, mut down) = (pred, pred);
+///     up[i] += h;
+///     down[i] -= h;
+///     let numeric = (loss.value(&up, &target) - loss.value(&down, &target)) / (2.0 * h);
+///     assert!((numeric - analytic[i]).abs() < 1e-3, "p{i}: {numeric} vs {}", analytic[i]);
+/// }
+///
+/// // 2. Training: Punkte um y = 2x + 1 mit gleichverteiltem Rauschen in ±0,5.
+/// let mut rng = Pcg32::seeded(8);
+/// let xs: [[f32; 1]; 64] = core::array::from_fn(|i| [i as f32 / 32.0 - 1.0]);
+/// let ys = xs.map(|[x]| [2.0 * x + 1.0 + rng.uniform(-0.5, 0.5)]);
+///
+/// // Dieselbe Regression mit beliebigem Verlust; Ergebnis: (Gewicht, Bias).
+/// fn fit<Ls: Loss>(loss: Ls, xs: &[[f32; 1]], ys: &[[f32; 1]]) -> (f32, f32) {
+///     let mut trainer = Trainer::new(Dense::<1, 1, _>::new(Linear), loss, Adam::new(0.05));
+///     for _ in 0..400 {
+///         trainer.train_batch(xs.iter().zip(ys).map(|(x, y)| (&x[..], &y[..])));
+///     }
+///     let mut p = [0.0f32; 2];
+///     trainer.network().copy_params_to_slice(&mut p).unwrap();
+///     (p[0], p[1])
+/// }
+///
+/// // Der Standardverlust trifft die Gerade; die Rauschmitte liegt bei 0.
+/// let (w_mse, b_mse) = fit(Mse::new(), &xs, &ys);
+/// assert!((w_mse - 2.0).abs() < 0.3 && (b_mse - 1.0).abs() < 0.15);
+///
+/// // Der eigene Verlust bestraft zu niedrige Vorhersagen vierfach: Die Gerade wandert nach oben.
+/// let (w_asym, b_asym) = fit(AsymmetricMse { under: 4.0, over: 1.0 }, &xs, &ys);
+/// assert!((w_asym - 2.0).abs() < 0.3);
+/// assert!(b_asym > b_mse + 0.05, "Bias {b_asym} gegenüber {b_mse}");
+///
+/// // Entsprechend liegen weniger Punkte über der Geraden (die Vorhersage ist zu niedrig).
+/// let above = |w: f32, b: f32| xs.iter().zip(&ys).filter(|(x, y)| w * x[0] + b < y[0]).count();
+/// assert!(above(w_asym, b_asym) + 4 < above(w_mse, b_mse));
+/// ```
 pub trait Loss {
     /// Verlust für eine Vorhersage `pred` und das Ziel `target`.
     fn value(&self, pred: &[f32], target: &[f32]) -> f32;
@@ -15,8 +160,18 @@ pub trait Loss {
     fn gradient(&self, pred: &[f32], target: &[f32], grad: &mut [f32]);
 }
 
+/// Prüft, dass `value` endlich und `> 0` ist (einheitliche Meldung aller Verluste).
+#[track_caller]
+fn assert_positive_finite(value: f32, name: &str) {
+    assert!(
+        value.is_finite() && value > 0.0,
+        "{name} muss endlich und > 0 sein"
+    );
+}
+
 /// Mittlerer quadratischer Fehler: `L = 1/n Σ (p - t)²`.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Mse;
 
 impl Loss for Mse {
@@ -43,7 +198,8 @@ impl Loss for Mse {
 ///
 /// Robuster gegen Ausreißer als [`Mse`]. Der Gradient ist `sign(p - t) / n`
 /// (an der Knickstelle `p == t` gilt `0`).
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Mae;
 
 impl Loss for Mae {
@@ -75,25 +231,25 @@ impl Loss for Mae {
 /// `delta (|d| - ½ delta)`; `L` ist der Mittelwert über alle Elemente.
 /// Verbindet die glatte Optimierung von [`Mse`] mit der Ausreißer-Robustheit
 /// von [`Mae`].
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Huber {
-    /// Übergang zwischen quadratischem und linearem Bereich (Standard `1.0`).
-    pub delta: f32,
+    /// Übergang zwischen quadratischem und linearem Bereich.
+    delta: f32,
 }
 
 impl Huber {
     /// Huber-Verlust mit Übergang bei `delta`.
     ///
     /// # Panics
-    /// Wenn `delta` nicht endlich und `> 0` ist. (Das Feld ist öffentlich; ein
-    /// ungültiger Wert per Struktur-Literal ließe `gradient` später in
-    /// `clamp` mit einer wenig aussagekräftigen Meldung abbrechen.)
+    /// Wenn `delta` nicht endlich und `> 0` ist.
     pub fn new(delta: f32) -> Self {
-        assert!(
-            delta.is_finite() && delta > 0.0,
-            "delta muss endlich und > 0 sein"
-        );
+        assert_positive_finite(delta, "delta");
         Huber { delta }
+    }
+
+    /// Übergang zwischen quadratischem und linearem Bereich (Standard `1.0`).
+    pub fn delta(&self) -> f32 {
+        self.delta
     }
 }
 
@@ -131,53 +287,6 @@ impl Loss for Huber {
     }
 }
 
-/// Binäre Kreuzentropie auf **Wahrscheinlichkeiten** (Ausgabe einer
-/// [`Sigmoid`](crate::activation::Sigmoid)-Schicht):
-/// `L = -1/n Σ [t ln p + (1-t) ln(1-p)]`.
-///
-/// Die Vorhersage wird auf `[eps, 1 - eps]` begrenzt, damit `ln` endlich bleibt.
-///
-/// **Achtung, Sättigung:** In `f32` wird `σ(z)` für `z ≳ 17` exakt `1.0`. Dann ist
-/// die Sigmoid-Ableitung `y (1 - y)` exakt `0`, und der Gradient verschwindet –
-/// selbst wenn die Vorhersage völlig falsch ist (Ziel `0`, Ausgabe `1.0`). Das Netz
-/// bleibt dort für immer hängen. Für das Training ist deshalb
-/// [`BinaryCrossEntropyWithLogits`] auf einer `Linear`-Ausgabe vorzuziehen.
-#[derive(Clone, Copy, Debug)]
-pub struct BinaryCrossEntropy {
-    /// Untere/obere Schranke für `p` (Standard `1e-7`).
-    pub eps: f32,
-}
-
-impl Default for BinaryCrossEntropy {
-    fn default() -> Self {
-        BinaryCrossEntropy { eps: 1e-7 }
-    }
-}
-
-impl Loss for BinaryCrossEntropy {
-    fn value(&self, pred: &[f32], target: &[f32]) -> f32 {
-        debug_assert_eq!(pred.len(), target.len());
-        let sum: f32 = pred
-            .iter()
-            .zip(target)
-            .map(|(&p, &t)| {
-                let p = p.clamp(self.eps, 1.0 - self.eps);
-                -(t * math::ln(p) + (1.0 - t) * math::ln(1.0 - p))
-            })
-            .sum();
-        sum / pred.len() as f32
-    }
-
-    fn gradient(&self, pred: &[f32], target: &[f32], grad: &mut [f32]) {
-        debug_assert!(pred.len() == target.len() && pred.len() == grad.len());
-        let n = pred.len() as f32;
-        for ((g, &p), &t) in grad.iter_mut().zip(pred).zip(target) {
-            let p = p.clamp(self.eps, 1.0 - self.eps);
-            *g = (p - t) / (p * (1.0 - p)) / n;
-        }
-    }
-}
-
 /// Binäre Kreuzentropie auf **Logits**, Sigmoid und Verlust fusioniert
 /// (letzte Schicht: [`Linear`](crate::activation::Linear)).
 ///
@@ -191,10 +300,31 @@ impl Loss for BinaryCrossEntropy {
 ///
 /// Die Ableitung von Sigmoid und Logarithmus kürzt sich analytisch heraus. Der
 /// Gradient bleibt dadurch auch für stark gesättigte Ausgaben `|z| ≫ 17`
-/// vollständig erhalten, wo [`BinaryCrossEntropy`] auf Wahrscheinlichkeiten
-/// einfriert. Bei der Inferenz macht [`math::sigmoid`]
+/// vollständig erhalten. Bei der Inferenz macht [`math::sigmoid`]
 /// aus den Logits Wahrscheinlichkeiten.
-#[derive(Clone, Copy, Debug, Default)]
+///
+/// **Warum nur diese Variante?** Ein Verlust auf den Wahrscheinlichkeiten einer
+/// [`Sigmoid`](crate::activation::Sigmoid)-Ausgabe (`L = -1/n Σ [t ln p + (1-t) ln(1-p)]`)
+/// friert in `f32` ein: `σ(z)` wird für `z ≳ 17` exakt `1.0`, die Sigmoid-Ableitung
+/// `y (1 - y)` ist dann exakt `0`, und der Gradient verschwindet – selbst bei völlig falscher
+/// Vorhersage (Ziel `0`, Ausgabe `1.0`). Das Netz bliebe dort für immer hängen. Deshalb
+/// existiert dieser Verlust nur auf Logits: letzte Schicht [`Linear`](crate::activation::Linear),
+/// `sigmoid` erst bei der Inferenz.
+///
+/// ```
+/// use neuron::prelude::*;
+///
+/// // Ein Logit-Ausgang; Sigmoid erst bei der Inferenz.
+/// let mut net = Dense::<2, 4, _>::new(Tanh).then(Dense::<4, 1, _>::new(Linear));
+/// net.init(&XavierUniform, &mut Pcg32::seeded(1));
+/// let mut trainer = Trainer::new(net, BinaryCrossEntropyWithLogits::new(), Adam::new(0.05));
+/// let loss = trainer.train_step(&[1.0, 0.0], &[1.0]);
+/// assert!(loss.is_finite());
+/// let probability = sigmoid(trainer.predict(&[1.0, 0.0])[0]);
+/// assert!((0.0..=1.0).contains(&probability));
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct BinaryCrossEntropyWithLogits;
 
 impl Loss for BinaryCrossEntropyWithLogits {
@@ -222,7 +352,8 @@ impl Loss for BinaryCrossEntropyWithLogits {
 ///
 /// `L = -Σ t_i · log_softmax(l)_i`, Gradient `softmax(l) · Σt - t`.
 /// Numerisch stabil über Abzug des Maximums; benötigt keinen Hilfspuffer.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SoftmaxCrossEntropy;
 
 /// `(max, ln Σ exp(l - max))` – die Konstanten des stabilen Log-Softmax.
@@ -252,6 +383,30 @@ impl Loss for SoftmaxCrossEntropy {
         }
     }
 }
+
+/// Erzeugt für parameterlose Verluste die einheitliche `const fn new()`.
+macro_rules! unit_loss {
+    ($($name:ident),+ $(,)?) => {
+        $(
+            impl $name {
+                /// Der (parameterlose) Verlust. Gleichwertig zu [`Default::default`].
+                pub const fn new() -> Self {
+                    $name
+                }
+            }
+        )+
+    };
+}
+
+unit_loss!(
+    Mse,
+    Mae,
+    LogCosh,
+    Hinge,
+    SquaredHinge,
+    BinaryCrossEntropyWithLogits,
+    SoftmaxCrossEntropy,
+);
 
 /// `max(x, 0)`, bei dem `NaN` nicht verschwindet (`f32::max` würde `NaN` verschlucken und
 /// eine kaputte Vorhersage als „kein Verlust" ausgeben).
@@ -287,7 +442,8 @@ fn ln_cosh(d: f32) -> f32 {
 /// Ausreißer kann das Training nicht mit einem riesigen Gradienten aus der Bahn werfen.
 ///
 /// Die Auswertung ist überlauffrei (auch für `|d| ≈ f32::MAX`) und für winzige `d` genau.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct LogCosh;
 
 impl Loss for LogCosh {
@@ -314,7 +470,8 @@ impl Loss for LogCosh {
 /// und trägt keinen Gradienten bei; deshalb konzentriert sich das Training auf die schwierigen
 /// Samples. Der Gradient ist `-t / n` für `t·p < 1`, sonst `0` (am Knick `t·p = 1` ebenfalls `0`).
 /// `NaN` in der Vorhersage bleibt `NaN` (Wert und Gradient).
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Hinge;
 
 impl Loss for Hinge {
@@ -349,7 +506,8 @@ impl Loss for Hinge {
 /// Gleiche Konvention wie [`Hinge`] (Ziele `-1`/`+1`, rohe Vorhersage), aber glatt am Rand
 /// `t·p = 1` und mit einem Gradienten `-2 t · max(0, 1 - t·p) / n`, der mit der Verletzung
 /// wächst. Bestraft grobe Fehlklassifikationen stärker als [`Hinge`].
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SquaredHinge;
 
 impl Loss for SquaredHinge {
@@ -390,10 +548,10 @@ impl Loss for SquaredHinge {
 /// gesättigten Logits voll erhalten. (Für `w > 1` und `|z|` nahe `f32::MAX` kann der
 /// *Verlustwert* selbst den `f32`-Bereich verlassen – er ist dann `w`-mal größer als der
 /// ungewichtete.)
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WeightedBinaryCrossEntropyWithLogits {
-    /// Gewicht der positiven Klasse (Standard `1.0`).
-    pub pos_weight: f32,
+    /// Gewicht der positiven Klasse.
+    pos_weight: f32,
 }
 
 impl WeightedBinaryCrossEntropyWithLogits {
@@ -402,11 +560,13 @@ impl WeightedBinaryCrossEntropyWithLogits {
     /// # Panics
     /// Wenn `pos_weight` nicht endlich und `> 0` ist.
     pub fn new(pos_weight: f32) -> Self {
-        assert!(
-            pos_weight.is_finite() && pos_weight > 0.0,
-            "pos_weight muss endlich und > 0 sein"
-        );
+        assert_positive_finite(pos_weight, "pos_weight");
         WeightedBinaryCrossEntropyWithLogits { pos_weight }
+    }
+
+    /// Gewicht der positiven Klasse (Standard `1.0`).
+    pub fn pos_weight(&self) -> f32 {
+        self.pos_weight
     }
 }
 
@@ -459,12 +619,12 @@ impl Loss for WeightedBinaryCrossEntropyWithLogits {
 /// Der Gradient `α_t · q^γ · (γ · r · BCE + σ(z) - t) / n` mit `r = (1 - 2t)·σ(z)(1 - σ(z)) / q`
 /// ist so umgeformt, dass er für `q → 0` und gesättigte Logits endlich bleibt (kein `0·∞`).
 /// Verlust und Gradient sind Mittelwerte über alle Elemente.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FocalLossWithLogits {
-    /// Fokussierungsparameter `γ >= 0` (Standard `2.0`; `0` = keine Fokussierung).
-    pub gamma: f32,
+    /// Fokussierungsparameter `γ >= 0`.
+    gamma: f32,
     /// Gewicht `α ∈ [0, 1]` der positiven Klasse (`None` = kein Klassengewicht).
-    pub alpha: Option<f32>,
+    alpha: Option<f32>,
 }
 
 impl FocalLossWithLogits {
@@ -488,6 +648,16 @@ impl FocalLossWithLogits {
         assert!((0.0..=1.0).contains(&alpha), "alpha muss in [0, 1] liegen");
         self.alpha = Some(alpha);
         self
+    }
+
+    /// Fokussierungsparameter `γ` (Standard `2.0`; `0` = keine Fokussierung).
+    pub fn gamma(&self) -> f32 {
+        self.gamma
+    }
+
+    /// Gewicht `α` der positiven Klasse (`None` = kein Klassengewicht, der Standard).
+    pub fn alpha(&self) -> Option<f32> {
+        self.alpha
     }
 
     /// `α_t` für das Ziel `t`.
@@ -561,10 +731,10 @@ impl Loss for FocalLossWithLogits {
 /// zu treiben: die Logits bleiben beschränkt (der Verlust hat ein Minimum bei endlichem
 /// Abstand), was Überanpassung und übertriebene Sicherheit dämpft. Numerisch stabil über
 /// Abzug des Maximums; benötigt keinen Hilfspuffer.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LabelSmoothingCrossEntropy {
-    /// Stärke `ε ∈ [0, 1)` der Aufweichung (Standard `0.1`).
-    pub smoothing: f32,
+    /// Stärke `ε ∈ [0, 1)` der Aufweichung.
+    smoothing: f32,
 }
 
 impl LabelSmoothingCrossEntropy {
@@ -578,6 +748,11 @@ impl LabelSmoothingCrossEntropy {
             "smoothing muss in [0, 1) liegen"
         );
         LabelSmoothingCrossEntropy { smoothing }
+    }
+
+    /// Stärke `ε` der Aufweichung (Standard `0.1`).
+    pub fn smoothing(&self) -> f32 {
+        self.smoothing
     }
 
     /// Aufgeweichtes Ziel für Klasse mit Ziel `t`; `uniform = ε·T/K`.
@@ -620,6 +795,25 @@ impl Loss for LabelSmoothingCrossEntropy {
 mod tests {
     use super::*;
 
+    /// Referenz: binäre Kreuzentropie auf **Wahrscheinlichkeiten**, so wie die entfernte Variante
+    /// `BinaryCrossEntropy` sie berechnete (`p` auf `[eps, 1 - eps]` begrenzt). Sie existiert nur
+    /// noch hier, um die fusionierte Logit-Form gegen die Kettenregel zu prüfen und das
+    /// Einfrieren bei Sättigung zu zeigen – als Verlust steht sie nicht mehr zur Verfügung.
+    mod probability_reference {
+        const EPS: f32 = 1e-7;
+
+        pub fn value(p: f32, t: f32) -> f32 {
+            let p = p.clamp(EPS, 1.0 - EPS);
+            -(t * crate::math::ln(p) + (1.0 - t) * crate::math::ln(1.0 - p))
+        }
+
+        /// `dL/dp`.
+        pub fn gradient(p: f32, t: f32) -> f32 {
+            let p = p.clamp(EPS, 1.0 - EPS);
+            (p - t) / (p * (1.0 - p))
+        }
+    }
+
     fn numeric_grad<L: Loss>(loss: &L, pred: &[f32], target: &[f32], out: &mut [f32]) {
         let eps = 1e-2;
         let mut p = [0.0f32; 4];
@@ -651,28 +845,26 @@ mod tests {
 
     #[test]
     fn mse_known_value() {
-        assert_eq!(Mse.value(&[1.0, 3.0], &[0.0, 1.0]), (1.0 + 4.0) / 2.0);
+        assert_eq!(
+            Mse::new().value(&[1.0, 3.0], &[0.0, 1.0]),
+            (1.0 + 4.0) / 2.0
+        );
     }
 
     #[test]
     fn gradients_match_finite_differences() {
-        check(Mse, &[0.2, 0.9, -0.4], &[0.0, 1.0, 0.5]);
+        check(Mse::new(), &[0.2, 0.9, -0.4], &[0.0, 1.0, 0.5]);
         // Abseits der Knicke von MAE (d = 0) und Huber (|d| = delta).
-        check(Mae, &[0.2, 0.9, -0.4], &[0.0, 1.0, 0.5]);
-        check(Huber { delta: 0.5 }, &[0.2, 0.9, -0.4], &[0.0, 1.0, 0.5]);
+        check(Mae::new(), &[0.2, 0.9, -0.4], &[0.0, 1.0, 0.5]);
+        check(Huber::new(0.5), &[0.2, 0.9, -0.4], &[0.0, 1.0, 0.5]);
         check(Huber::default(), &[2.5, 0.9, -0.4], &[0.0, 1.0, 0.5]);
         check(
-            BinaryCrossEntropy::default(),
-            &[0.3, 0.8, 0.6],
-            &[0.0, 1.0, 1.0],
-        );
-        check(
-            BinaryCrossEntropyWithLogits,
+            BinaryCrossEntropyWithLogits::new(),
             &[-2.0, 0.7, 3.0],
             &[0.0, 1.0, 0.4],
         );
         check(
-            SoftmaxCrossEntropy,
+            SoftmaxCrossEntropy::new(),
             &[0.5, -1.0, 2.0, 0.1],
             &[0.0, 0.0, 1.0, 0.0],
         );
@@ -680,7 +872,10 @@ mod tests {
 
     #[test]
     fn mae_and_huber_known_values() {
-        assert_eq!(Mae.value(&[1.0, -3.0], &[0.0, 1.0]), (1.0 + 4.0) / 2.0);
+        assert_eq!(
+            Mae::new().value(&[1.0, -3.0], &[0.0, 1.0]),
+            (1.0 + 4.0) / 2.0
+        );
         // |d| = 0.5 ≤ δ: ½·0.25 = 0.125; |d| = 3 > δ = 1: 1·(3 - 0.5) = 2.5
         let h = Huber::default().value(&[0.5, 4.0], &[0.0, 1.0]);
         assert!((h - (0.125 + 2.5) / 2.0).abs() < 1e-6, "h = {h}");
@@ -690,19 +885,19 @@ mod tests {
     fn huber_interpolates_between_mse_and_mae() {
         let (p, t) = ([0.3f32], [0.0f32]);
         // Im quadratischen Bereich: Huber = ½·MSE.
-        assert!((Huber::default().value(&p, &t) - 0.5 * Mse.value(&p, &t)).abs() < 1e-7);
+        assert!((Huber::default().value(&p, &t) - 0.5 * Mse::new().value(&p, &t)).abs() < 1e-7);
         // Weit draußen wächst Huber linear, MSE quadratisch.
         let (p, t) = ([100.0f32], [0.0f32]);
-        assert!(Huber::default().value(&p, &t) < 0.02 * Mse.value(&p, &t));
+        assert!(Huber::default().value(&p, &t) < 0.02 * Mse::new().value(&p, &t));
         // Der Gradient ist durch delta begrenzt.
         let mut g = [0.0];
-        Huber { delta: 2.0 }.gradient(&p, &t, &mut g);
+        Huber::new(2.0).gradient(&p, &t, &mut g);
         assert_eq!(g, [2.0]);
     }
 
     #[test]
     fn huber_new_accepts_a_valid_delta() {
-        assert_eq!(Huber::new(2.5).delta, 2.5);
+        assert_eq!(Huber::new(2.5).delta(), 2.5);
     }
 
     #[test]
@@ -726,7 +921,7 @@ mod tests {
     #[test]
     fn mae_gradient_is_zero_at_the_kink() {
         let mut g = [9.0; 2];
-        Mae.gradient(&[1.0, 2.0], &[1.0, 5.0], &mut g);
+        Mae::new().gradient(&[1.0, 2.0], &[1.0, 5.0], &mut g);
         assert_eq!(g, [0.0, -0.5]);
     }
 
@@ -734,37 +929,35 @@ mod tests {
     fn bce_with_logits_known_values() {
         // z = 0: σ = 0.5 -> L = ln 2, unabhängig vom Ziel.
         for t in [0.0, 0.5, 1.0] {
-            let v = BinaryCrossEntropyWithLogits.value(&[0.0], &[t]);
+            let v = BinaryCrossEntropyWithLogits::new().value(&[0.0], &[t]);
             assert!((v - core::f32::consts::LN_2).abs() < 1e-6, "t = {t}: {v}");
         }
         // z = 2, t = 1: -ln σ(2) = ln(1 + e^-2) = 0.126928
-        let v = BinaryCrossEntropyWithLogits.value(&[2.0], &[1.0]);
+        let v = BinaryCrossEntropyWithLogits::new().value(&[2.0], &[1.0]);
         assert!((v - 0.126_928).abs() < 1e-5, "{v}");
         // Gradient σ(z) - t
         let mut g = [0.0];
-        BinaryCrossEntropyWithLogits.gradient(&[0.0], &[1.0], &mut g);
+        BinaryCrossEntropyWithLogits::new().gradient(&[0.0], &[1.0], &mut g);
         assert!((g[0] + 0.5).abs() < 1e-6);
     }
 
     #[test]
-    fn bce_with_logits_agrees_with_bce_on_probabilities() {
-        // Für mäßige Logits ist die fusionierte Form dieselbe Funktion:
-        //  Wert gleich, und dL/dz = dL/dp · σ'(z) = σ(z) - t.
+    fn bce_with_logits_agrees_with_the_chain_rule_on_probabilities() {
+        // Für mäßige Logits ist die fusionierte Form dieselbe Funktion wie die Kreuzentropie auf
+        // den Wahrscheinlichkeiten: Wert gleich, und dL/dz = dL/dp · σ'(z) = σ(z) - t.
         for &z in &[-4.0f32, -1.5, -0.2, 0.3, 1.0, 3.5] {
             for &t in &[0.0f32, 0.3, 1.0] {
                 let p = math::sigmoid(z);
-                let fused = BinaryCrossEntropyWithLogits.value(&[z], &[t]);
-                let plain = BinaryCrossEntropy::default().value(&[p], &[t]);
+                let fused = BinaryCrossEntropyWithLogits::new().value(&[z], &[t]);
+                let plain = probability_reference::value(p, t);
                 assert!(
                     (fused - plain).abs() < 1e-5,
                     "z = {z}, t = {t}: {fused} vs {plain}"
                 );
 
-                let mut g_prob = [0.0];
-                BinaryCrossEntropy::default().gradient(&[p], &[t], &mut g_prob);
                 let mut g_fused = [0.0];
-                BinaryCrossEntropyWithLogits.gradient(&[z], &[t], &mut g_fused);
-                let chained = g_prob[0] * p * (1.0 - p);
+                BinaryCrossEntropyWithLogits::new().gradient(&[z], &[t], &mut g_fused);
+                let chained = probability_reference::gradient(p, t) * p * (1.0 - p);
                 assert!((g_fused[0] - chained).abs() < 1e-5, "z = {z}, t = {t}");
             }
         }
@@ -772,19 +965,19 @@ mod tests {
 
     #[test]
     fn bce_with_logits_keeps_the_gradient_when_saturated() {
-        // Genau der Fall, in dem BCE auf Wahrscheinlichkeiten einfriert:
-        // Logit 30, Ziel 0: σ(30) ist in f32 exakt 1.0.
+        // Genau der Fall, in dem die Kreuzentropie auf Wahrscheinlichkeiten einfriert (und der
+        // der Grund ist, dass es sie als Verlust nicht mehr gibt): Logit 30, Ziel 0, σ(30) ist
+        // in f32 exakt 1.0.
         let p = math::sigmoid(30.0);
         assert_eq!(p, 1.0);
-        let mut grad_p = [9.0];
-        BinaryCrossEntropy::default().gradient(&[p], &[0.0], &mut grad_p);
+        let grad_p = probability_reference::gradient(p, 0.0);
         // dL/dz = dL/dp · σ'(z) mit σ'(z) = p(1-p) = 0  ->  verschwindet.
-        assert_eq!(grad_p[0] * p * (1.0 - p), 0.0);
+        assert_eq!(grad_p * p * (1.0 - p), 0.0);
 
         let mut g = [0.0];
-        BinaryCrossEntropyWithLogits.gradient(&[30.0], &[0.0], &mut g);
+        BinaryCrossEntropyWithLogits::new().gradient(&[30.0], &[0.0], &mut g);
         assert_eq!(g[0], 1.0, "voller Gradient trotz Sättigung");
-        let v = BinaryCrossEntropyWithLogits.value(&[30.0], &[0.0]);
+        let v = BinaryCrossEntropyWithLogits::new().value(&[30.0], &[0.0]);
         assert!((v - 30.0).abs() < 1e-4, "Verlust {v}");
     }
 
@@ -792,7 +985,7 @@ mod tests {
     fn bce_with_logits_gradient_is_the_mean_gradient_for_several_outputs() {
         let (z, t) = ([0.0f32, 2.0, -1.0], [1.0f32, 0.0, 0.5]);
         let mut g = [0.0; 3];
-        BinaryCrossEntropyWithLogits.gradient(&z, &t, &mut g);
+        BinaryCrossEntropyWithLogits::new().gradient(&z, &t, &mut g);
         for i in 0..3 {
             let expected = (math::sigmoid(z[i]) - t[i]) / 3.0;
             assert!(
@@ -803,7 +996,7 @@ mod tests {
         }
         // Ein Ausgang: genau σ(z) - t.
         let mut one = [0.0];
-        BinaryCrossEntropyWithLogits.gradient(&[2.0], &[0.0], &mut one);
+        BinaryCrossEntropyWithLogits::new().gradient(&[2.0], &[0.0], &mut one);
         assert!((one[0] - math::sigmoid(2.0)).abs() < 1e-7);
     }
 
@@ -811,9 +1004,9 @@ mod tests {
     fn bce_with_logits_is_finite_for_extreme_logits() {
         for &z in &[1e3f32, -1e3, 1e30, -1e30, f32::MAX, -f32::MAX] {
             for &t in &[0.0f32, 0.5, 1.0] {
-                let v = BinaryCrossEntropyWithLogits.value(&[z], &[t]);
+                let v = BinaryCrossEntropyWithLogits::new().value(&[z], &[t]);
                 let mut g = [0.0];
-                BinaryCrossEntropyWithLogits.gradient(&[z], &[t], &mut g);
+                BinaryCrossEntropyWithLogits::new().gradient(&[z], &[t], &mut g);
                 assert!(
                     v.is_finite() && g[0].is_finite(),
                     "z = {z}, t = {t}: {v}, {g:?}"
@@ -825,18 +1018,17 @@ mod tests {
 
     #[test]
     fn softmax_ce_is_stable_for_large_logits() {
-        let v = SoftmaxCrossEntropy.value(&[1000.0, 0.0], &[1.0, 0.0]);
+        let v = SoftmaxCrossEntropy::new().value(&[1000.0, 0.0], &[1.0, 0.0]);
         assert!(v.is_finite() && v < 1e-6, "v = {v}");
         let mut g = [0.0; 2];
-        SoftmaxCrossEntropy.gradient(&[1000.0, 0.0], &[1.0, 0.0], &mut g);
+        SoftmaxCrossEntropy::new().gradient(&[1000.0, 0.0], &[1.0, 0.0], &mut g);
         assert!(g.iter().all(|x| x.is_finite()));
     }
 
     #[test]
-    fn bce_clamps_saturated_predictions() {
-        let l = BinaryCrossEntropy::default();
-        assert!(l.value(&[0.0], &[1.0]).is_finite());
-        assert!(l.value(&[1.0], &[0.0]).is_finite());
+    fn the_probability_reference_clamps_saturated_predictions() {
+        assert!(probability_reference::value(0.0, 1.0).is_finite());
+        assert!(probability_reference::value(1.0, 0.0).is_finite());
     }
 
     // ---- LogCosh -------------------------------------------------------------------------
@@ -844,25 +1036,25 @@ mod tests {
     #[test]
     fn log_cosh_known_values_and_both_regimes() {
         // d = 1: ln cosh 1 = 0.4337808
-        let v = LogCosh.value(&[1.0], &[0.0]);
+        let v = LogCosh::new().value(&[1.0], &[0.0]);
         assert!((v - 0.433_780_8).abs() < 1e-6, "{v}");
         // Kleine Fehler: ½ d² - d⁴/12 (Reihe), und zwar auch bei winzigem d relativ genau.
         // Die Lehrbuchform |d| + ln(1 + e^-2|d|) - ln 2 liefert in f32 bei d = 1e-3 einen
         // Fehler von 4,6 % und bei d = 1e-4 exakt 0 statt 5e-9.
         for d in [1e-1f32, 1e-2, 1e-3, 1e-4] {
-            let v = LogCosh.value(&[d], &[0.0]);
+            let v = LogCosh::new().value(&[d], &[0.0]);
             let expected = 0.5 * d * d - d * d * d * d / 12.0;
             assert!((v - expected).abs() <= 1e-4 * expected, "d = {d}: {v}");
         }
         // Große Fehler: |d| - ln 2, symmetrisch im Vorzeichen.
-        let big = LogCosh.value(&[50.0], &[0.0]);
+        let big = LogCosh::new().value(&[50.0], &[0.0]);
         assert!(
             (big - (50.0 - core::f32::consts::LN_2)).abs() < 1e-4,
             "{big}"
         );
         assert_eq!(
-            LogCosh.value(&[3.0], &[0.0]),
-            LogCosh.value(&[-3.0], &[0.0])
+            LogCosh::new().value(&[3.0], &[0.0]),
+            LogCosh::new().value(&[-3.0], &[0.0])
         );
     }
 
@@ -885,24 +1077,24 @@ mod tests {
     #[test]
     fn log_cosh_gradient_is_bounded_and_finite_for_extreme_errors() {
         for &d in &[1e3f32, 1e30, f32::MAX, -f32::MAX] {
-            let v = LogCosh.value(&[d], &[0.0]);
+            let v = LogCosh::new().value(&[d], &[0.0]);
             let mut g = [0.0];
-            LogCosh.gradient(&[d], &[0.0], &mut g);
+            LogCosh::new().gradient(&[d], &[0.0], &mut g);
             assert!(v.is_finite() && g[0].is_finite(), "d = {d}: {v}, {g:?}");
             assert_eq!(g[0].abs(), 1.0, "tanh sättigt bei ±1, d = {d}");
         }
         // Zwei Elemente: Gradient ist tanh(d)/n.
         let mut g = [0.0; 2];
-        LogCosh.gradient(&[0.5, -2.0], &[0.0, 0.0], &mut g);
+        LogCosh::new().gradient(&[0.5, -2.0], &[0.0, 0.0], &mut g);
         assert!((g[0] - 0.5f32.tanh() / 2.0).abs() < 1e-7);
         assert!((g[1] + 2.0f32.tanh() / 2.0).abs() < 1e-7);
     }
 
     #[test]
     fn log_cosh_propagates_nan() {
-        assert!(LogCosh.value(&[f32::NAN], &[0.0]).is_nan());
+        assert!(LogCosh::new().value(&[f32::NAN], &[0.0]).is_nan());
         let mut g = [0.0];
-        LogCosh.gradient(&[f32::NAN], &[0.0], &mut g);
+        LogCosh::new().gradient(&[f32::NAN], &[0.0], &mut g);
         assert!(g[0].is_nan());
     }
 
@@ -912,49 +1104,49 @@ mod tests {
     fn hinge_known_values_and_gradient() {
         // p = 0.5, t = +1: Rand 0.5 -> Verlust 0.5. p = -2, t = -1: Rand 2 >= 1 -> 0.
         let (p, t) = ([0.5f32, -2.0], [1.0f32, -1.0]);
-        assert_eq!(Hinge.value(&p, &t), 0.25);
+        assert_eq!(Hinge::new().value(&p, &t), 0.25);
         let mut g = [9.0; 2];
-        Hinge.gradient(&p, &t, &mut g);
+        Hinge::new().gradient(&p, &t, &mut g);
         assert_eq!(g, [-0.5, 0.0]);
 
         // Falsche Seite: p = 0.5, t = -1 -> 1 + 0.5 = 1.5, Gradient +1/n.
-        assert_eq!(Hinge.value(&[0.5], &[-1.0]), 1.5);
+        assert_eq!(Hinge::new().value(&[0.5], &[-1.0]), 1.5);
         let mut g = [0.0];
-        Hinge.gradient(&[0.5], &[-1.0], &mut g);
+        Hinge::new().gradient(&[0.5], &[-1.0], &mut g);
         assert_eq!(g, [1.0]);
     }
 
     #[test]
     fn hinge_has_no_gradient_at_or_beyond_the_margin() {
         let mut g = [9.0; 3];
-        Hinge.gradient(&[1.0, 5.0, -1.0], &[1.0, 1.0, -1.0], &mut g);
+        Hinge::new().gradient(&[1.0, 5.0, -1.0], &[1.0, 1.0, -1.0], &mut g);
         assert_eq!(g, [0.0, 0.0, 0.0], "Rand genau 1 und darüber: kein Beitrag");
         let mut g = [9.0; 3];
-        SquaredHinge.gradient(&[1.0, 5.0, -1.0], &[1.0, 1.0, -1.0], &mut g);
+        SquaredHinge::new().gradient(&[1.0, 5.0, -1.0], &[1.0, 1.0, -1.0], &mut g);
         assert_eq!(g, [0.0, 0.0, 0.0]);
     }
 
     #[test]
     fn squared_hinge_known_values_and_penalises_gross_errors_more() {
         let (p, t) = ([0.5f32, -2.0], [1.0f32, -1.0]);
-        assert_eq!(SquaredHinge.value(&p, &t), 0.125); // (0.5² + 0) / 2
+        assert_eq!(SquaredHinge::new().value(&p, &t), 0.125); // (0.5² + 0) / 2
         let mut g = [9.0; 2];
-        SquaredHinge.gradient(&p, &t, &mut g);
+        SquaredHinge::new().gradient(&p, &t, &mut g);
         assert_eq!(g, [-0.5, 0.0]); // -2·1·0.5 / 2
 
         // Weit auf der falschen Seite: quadratisch statt linear.
         let (p, t) = ([-3.0f32], [1.0f32]); // Verletzung 4
-        assert_eq!(Hinge.value(&p, &t), 4.0);
-        assert_eq!(SquaredHinge.value(&p, &t), 16.0);
+        assert_eq!(Hinge::new().value(&p, &t), 4.0);
+        assert_eq!(SquaredHinge::new().value(&p, &t), 16.0);
         let (mut gh, mut gs) = ([0.0], [0.0]);
-        Hinge.gradient(&p, &t, &mut gh);
-        SquaredHinge.gradient(&p, &t, &mut gs);
+        Hinge::new().gradient(&p, &t, &mut gh);
+        SquaredHinge::new().gradient(&p, &t, &mut gs);
         assert_eq!((gh, gs), ([-1.0], [-8.0]));
     }
 
     #[test]
     fn hinge_losses_do_not_swallow_nan() {
-        for loss in [&Hinge as &dyn Loss, &SquaredHinge] {
+        for loss in [&Hinge::new() as &dyn Loss, &SquaredHinge::new()] {
             assert!(loss.value(&[f32::NAN], &[1.0]).is_nan());
             let mut g = [0.0];
             loss.gradient(&[f32::NAN], &[1.0], &mut g);
@@ -971,12 +1163,12 @@ mod tests {
             for &t in &[0.0f32, 0.3, 1.0] {
                 let (a, b) = (
                     weighted.value(&[z], &[t]),
-                    BinaryCrossEntropyWithLogits.value(&[z], &[t]),
+                    BinaryCrossEntropyWithLogits::new().value(&[z], &[t]),
                 );
                 assert!((a - b).abs() <= 1e-5 * (1.0 + b.abs()), "z = {z}, t = {t}");
                 let (mut ga, mut gb) = ([0.0], [0.0]);
                 weighted.gradient(&[z], &[t], &mut ga);
-                BinaryCrossEntropyWithLogits.gradient(&[z], &[t], &mut gb);
+                BinaryCrossEntropyWithLogits::new().gradient(&[z], &[t], &mut gb);
                 assert!((ga[0] - gb[0]).abs() < 1e-6, "z = {z}, t = {t}");
             }
         }
@@ -986,7 +1178,7 @@ mod tests {
     fn weighted_bce_scales_only_the_positive_term() {
         let w = 4.0;
         let loss = WeightedBinaryCrossEntropyWithLogits::new(w);
-        let plain = BinaryCrossEntropyWithLogits;
+        let plain = BinaryCrossEntropyWithLogits::new();
         for &z in &[-3.0f32, 0.2, 2.5] {
             // t = 1: Verlust und Gradient sind genau w-mal so groß.
             let (a, b) = (loss.value(&[z], &[1.0]), plain.value(&[z], &[1.0]));
@@ -1055,7 +1247,7 @@ mod tests {
             for &t in &[0.0f32, 0.4, 1.0] {
                 let (a, b) = (
                     focal.value(&[z], &[t]),
-                    BinaryCrossEntropyWithLogits.value(&[z], &[t]),
+                    BinaryCrossEntropyWithLogits::new().value(&[z], &[t]),
                 );
                 assert!(
                     (a - b).abs() <= 1e-5 * (1.0 + b),
@@ -1063,7 +1255,7 @@ mod tests {
                 );
                 let (mut ga, mut gb) = ([0.0], [0.0]);
                 focal.gradient(&[z], &[t], &mut ga);
-                BinaryCrossEntropyWithLogits.gradient(&[z], &[t], &mut gb);
+                BinaryCrossEntropyWithLogits::new().gradient(&[z], &[t], &mut gb);
                 assert!((ga[0] - gb[0]).abs() < 1e-6, "z = {z}, t = {t}");
             }
         }
@@ -1091,13 +1283,13 @@ mod tests {
     fn focal_downweights_easy_samples() {
         // Gut klassifiziert (z = 4, t = 1): der Verlust sinkt um den Faktor (1-p)^γ.
         let focal = FocalLossWithLogits::new(2.0);
-        let plain = BinaryCrossEntropyWithLogits.value(&[4.0], &[1.0]);
+        let plain = BinaryCrossEntropyWithLogits::new().value(&[4.0], &[1.0]);
         let focused = focal.value(&[4.0], &[1.0]);
         let q = 1.0 - math::sigmoid(4.0);
         assert!((focused - q * q * plain).abs() < 1e-7, "{focused}");
         assert!(focused < 0.001 * plain);
         // Schwer (z = -4, t = 1): kaum gedämpft.
-        let hard_plain = BinaryCrossEntropyWithLogits.value(&[-4.0], &[1.0]);
+        let hard_plain = BinaryCrossEntropyWithLogits::new().value(&[-4.0], &[1.0]);
         let hard = focal.value(&[-4.0], &[1.0]);
         assert!(hard > 0.9 * hard_plain, "{hard} vs {hard_plain}");
     }
@@ -1105,7 +1297,7 @@ mod tests {
     #[test]
     fn focal_alpha_weights_the_classes() {
         let focal = FocalLossWithLogits::new(0.0).with_alpha(0.25);
-        let plain = BinaryCrossEntropyWithLogits;
+        let plain = BinaryCrossEntropyWithLogits::new();
         let (z, pos, neg) = (0.3f32, 1.0f32, 0.0f32);
         assert!((focal.value(&[z], &[pos]) - 0.25 * plain.value(&[z], &[pos])).abs() < 1e-6);
         assert!((focal.value(&[z], &[neg]) - 0.75 * plain.value(&[z], &[neg])).abs() < 1e-6);
@@ -1149,9 +1341,9 @@ mod tests {
     #[test]
     fn focal_defaults_and_validation() {
         let d = FocalLossWithLogits::default();
-        assert_eq!((d.gamma, d.alpha), (2.0, None));
+        assert_eq!((d.gamma(), d.alpha()), (2.0, None));
         let f = FocalLossWithLogits::new(1.5).with_alpha(0.4);
-        assert_eq!((f.gamma, f.alpha), (1.5, Some(0.4)));
+        assert_eq!((f.gamma(), f.alpha()), (1.5, Some(0.4)));
     }
 
     #[test]
@@ -1175,11 +1367,11 @@ mod tests {
         let plain = LabelSmoothingCrossEntropy::new(0.0);
         assert_eq!(
             plain.value(&logits, &target),
-            SoftmaxCrossEntropy.value(&logits, &target)
+            SoftmaxCrossEntropy::new().value(&logits, &target)
         );
         let (mut a, mut b) = ([0.0; 4], [0.0; 4]);
         plain.gradient(&logits, &target, &mut a);
-        SoftmaxCrossEntropy.gradient(&logits, &target, &mut b);
+        SoftmaxCrossEntropy::new().gradient(&logits, &target, &mut b);
         assert_eq!(a, b);
     }
 
@@ -1213,7 +1405,7 @@ mod tests {
         loss.gradient(&far, &target, &mut g);
         assert!(g[1] > 0.0, "Smoothing bremst zu große Sicherheit: {g:?}");
         let mut plain = [0.0; 3];
-        SoftmaxCrossEntropy.gradient(&far, &target, &mut plain);
+        SoftmaxCrossEntropy::new().gradient(&far, &target, &mut plain);
         assert!(plain[1] <= 0.0, "ohne Smoothing: {plain:?}");
     }
 
@@ -1244,10 +1436,10 @@ mod tests {
 
     #[test]
     fn new_losses_match_finite_differences() {
-        check(LogCosh, &[0.2, 0.9, -1.4], &[0.0, 1.0, 0.5]);
+        check(LogCosh::new(), &[0.2, 0.9, -1.4], &[0.0, 1.0, 0.5]);
         // Hinge: Ränder t·p = 0.3, 1.5, 0.4 – verletzt, nicht verletzt, verletzt, fern vom Knick.
-        check(Hinge, &[0.3, 1.5, -0.4], &[1.0, 1.0, -1.0]);
-        check(SquaredHinge, &[0.3, 1.5, -0.4], &[1.0, 1.0, -1.0]);
+        check(Hinge::new(), &[0.3, 1.5, -0.4], &[1.0, 1.0, -1.0]);
+        check(SquaredHinge::new(), &[0.3, 1.5, -0.4], &[1.0, 1.0, -1.0]);
         for w in [0.4f32, 3.0] {
             check(
                 WeightedBinaryCrossEntropyWithLogits::new(w),

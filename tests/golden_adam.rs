@@ -13,7 +13,7 @@ const YS: [[f32; 1]; 4] = [[0.0], [1.0], [1.0], [0.0]];
 fn trained_hash<O: Optimizer>(opt: O) -> u64 {
     let mut net = Dense::<2, 8, _>::new(Tanh).then(Dense::<8, 1, _>::new(Linear));
     net.init(&XavierUniform, &mut Pcg32::seeded(3));
-    let mut t = Trainer::new(net, BinaryCrossEntropyWithLogits, opt);
+    let mut t = Trainer::new(net, BinaryCrossEntropyWithLogits::new(), opt);
     for _ in 0..200 {
         t.train_batch(XS.iter().zip(&YS).map(|(x, y)| (&x[..], &y[..])));
     }

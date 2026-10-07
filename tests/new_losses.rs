@@ -50,7 +50,7 @@ fn pos_weight_trades_precision_for_recall_on_imbalanced_data() {
     // Mehrheitsklasse hin und übersieht viele Positive.
     let (xs, ys) = imbalanced_1d(1, 40, 360);
     let (plain_recall, plain_precision) =
-        logistic_recall_precision(BinaryCrossEntropyWithLogits, &xs, &ys);
+        logistic_recall_precision(BinaryCrossEntropyWithLogits::new(), &xs, &ys);
     let (weighted_recall, weighted_precision) =
         logistic_recall_precision(WeightedBinaryCrossEntropyWithLogits::new(9.0), &xs, &ys);
     assert!(
@@ -84,7 +84,7 @@ fn pos_weight_of_one_trains_bit_identically_to_the_plain_logit_loss_up_to_roundi
                 t.network().bias_as_slice()[0],
             )
         } else {
-            let mut t = Trainer::new(net, BinaryCrossEntropyWithLogits, Sgd::new(0.1));
+            let mut t = Trainer::new(net, BinaryCrossEntropyWithLogits::new(), Sgd::new(0.1));
             for _ in 0..200 {
                 t.train_batch(batch());
             }
@@ -168,7 +168,7 @@ fn mean_confidence<L: Loss>(loss: L) -> f32 {
 fn label_smoothing_keeps_the_network_from_becoming_overconfident() {
     // Das Minimum der geglätteten Kreuzentropie liegt bei p = 1 - ε + ε/K = 0.9333 (ε = 0.1,
     // K = 3). Ohne Glättung treibt das Training die Sicherheit gegen 1.
-    let plain = mean_confidence(SoftmaxCrossEntropy);
+    let plain = mean_confidence(SoftmaxCrossEntropy::new());
     let smoothed = mean_confidence(LabelSmoothingCrossEntropy::new(0.1));
     assert!(plain > 0.99, "ohne Glättung: {plain}");
     assert!(
@@ -188,7 +188,7 @@ fn squared_hinge_separates_a_linearly_separable_problem_with_a_margin() {
         xs.push([2.0 * label + 0.5 * rng.normal(), 0.5 * rng.normal()]);
         ys.push([label]);
     }
-    for loss in [&SquaredHinge as &dyn Loss, &Hinge] {
+    for loss in [&SquaredHinge::new() as &dyn Loss, &Hinge::new()] {
         let mut net = Dense::<2, 1, _>::new(Linear);
         net.init(&XavierUniform, &mut Pcg32::seeded(2));
         let mut t = Trainer::new(net, DynLoss(loss), Sgd::new(0.05));
@@ -245,8 +245,8 @@ fn fit_line_with_outlier<L: Loss>(loss: L) -> [f32; 2] {
 
 #[test]
 fn log_cosh_resists_an_outlier_that_drags_mse_away() {
-    let mse = fit_line_with_outlier(Mse);
-    let robust = fit_line_with_outlier(LogCosh);
+    let mse = fit_line_with_outlier(Mse::new());
+    let robust = fit_line_with_outlier(LogCosh::new());
     let err = |p: [f32; 2]| (p[0] - 2.0).abs() + (p[1] - 1.0).abs();
     assert!(err(mse) > 5.0, "MSE wird vom Ausreißer gezogen: {mse:?}");
     assert!(

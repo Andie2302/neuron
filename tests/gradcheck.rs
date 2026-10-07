@@ -45,7 +45,7 @@ where
 
 #[test]
 fn weight_and_bias_gradients_match_numeric() {
-    let mut trainer = Trainer::new(build(), Mse, Sgd::new(0.0));
+    let mut trainer = Trainer::new(build(), Mse::new(), Sgd::new(0.0));
     trainer.accumulate(&X, &Y);
 
     // Analytische Gradienten sichern (flache Sicht über Buffer::as_slice).
@@ -79,7 +79,7 @@ fn weight_and_bias_gradients_match_numeric() {
 
 #[test]
 fn input_gradient_matches_numeric() {
-    let mut trainer = Trainer::new(build(), Mse, Sgd::new(0.0));
+    let mut trainer = Trainer::new(build(), Mse::new(), Sgd::new(0.0));
     trainer.accumulate(&X, &Y);
     let analytic = trainer.network().grad_input().to_vec();
     assert_eq!(analytic.len(), 3);
@@ -96,7 +96,7 @@ fn input_gradient_matches_numeric() {
 
 #[test]
 fn gradients_accumulate_until_zeroed() {
-    let mut trainer = Trainer::new(build(), Mse, Sgd::new(0.0));
+    let mut trainer = Trainer::new(build(), Mse::new(), Sgd::new(0.0));
     trainer.accumulate(&X, &Y);
     let once = Buffer::as_slice(trainer.network().first().weight_grads()).to_vec();
     trainer.accumulate(&X, &Y);
@@ -118,7 +118,7 @@ fn dropout_gradient_is_consistent_in_training() {
         .then(Dropout::<6>::new(0.4, 3))
         .then(Dense::<6, 1, _>::new(Linear));
     net.init(&XavierUniform, &mut Pcg32::seeded(5));
-    let mut trainer = Trainer::new(net, Mse, Sgd::new(0.0));
+    let mut trainer = Trainer::new(net, Mse::new(), Sgd::new(0.0));
     trainer.accumulate(&X, &[0.3]);
 
     // Dropout hat keine Parameter, aber der Gradient muss durchfließen:

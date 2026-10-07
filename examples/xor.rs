@@ -20,7 +20,7 @@ fn main() {
     let mut rng = Pcg32::seeded(2024);
     net.init(&XavierUniform, &mut rng);
 
-    let mut trainer = Trainer::new(net, BinaryCrossEntropyWithLogits, Adam::new(0.05));
+    let mut trainer = Trainer::new(net, BinaryCrossEntropyWithLogits::new(), Adam::new(0.05));
 
     println!(
         "Parameter: {}, Trainer-Größe auf dem Stack: {} Byte",

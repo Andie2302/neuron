@@ -48,18 +48,19 @@ fn counting_allocator_actually_counts() {
 
 #[test]
 fn training_and_inference_never_touch_the_heap() {
-    // Aufbau, Init, Training, Dropout, Adam, Momentum, Inferenz – alles in der Messung.
+    // Aufbau, Init, Training, Dropout, Adam (Linear-Ausgang + Logit-Verlust), Momentum,
+    // Inferenz inklusive sigmoid() auf den Logits – alles in der Messung.
     let before = allocs();
 
     let mut net = Dense::<2, 8, _>::new(Tanh)
         .then(Dropout::<8>::new(0.1, 1))
-        .then(Dense::<8, 1, _>::new(Sigmoid));
+        .then(Dense::<8, 1, _>::new(Linear));
     net.init(&XavierUniform, &mut Pcg32::seeded(2024));
-    let mut adam = Trainer::new(net, BinaryCrossEntropy::default(), Adam::new(0.05));
+    let mut adam = Trainer::new(net, BinaryCrossEntropyWithLogits::new(), Adam::new(0.05));
 
     let mut net2 = Dense::<2, 4, _>::new(Relu).then(Dense::<4, 1, _>::new(Linear));
     net2.init(&HeNormal, &mut Pcg32::seeded(1));
-    let mut mom = Trainer::new(net2, Mse, Momentum::new(0.01, 0.9));
+    let mut mom = Trainer::new(net2, Mse::new(), Momentum::new(0.01, 0.9));
 
     let mut sink = 0.0f32;
     for _ in 0..200 {
@@ -69,7 +70,8 @@ fn training_and_inference_never_touch_the_heap() {
         }
     }
     for x in &XS {
-        sink += adam.predict(x)[0] + mom.predict(x)[0];
+        // Der Adam-Trainer liefert rohe Logits; Wahrscheinlichkeiten entstehen erst hier.
+        sink += sigmoid(adam.predict(x)[0]) + mom.predict(x)[0];
     }
 
     let used = allocs() - before;
@@ -90,7 +92,7 @@ fn new_features_never_touch_the_heap() {
     net.init(&XavierUniform, &mut Pcg32::seeded(5));
     let mut t = Trainer::new(
         net,
-        SoftmaxCrossEntropy,
+        SoftmaxCrossEntropy::new(),
         AdamW::new(0.02).with_weight_decay(0.05),
     )
     .with_grad_clip_norm(1.0);
@@ -105,13 +107,13 @@ fn new_features_never_touch_the_heap() {
 
     let mut net3 = Dense::<2, 4, _>::new(Elu::default()).then(Dense::<4, 1, _>::new(Linear));
     net3.init(&XavierNormal, &mut Pcg32::seeded(7));
-    let mut ada = Trainer::new(net3, Mae, Adagrad::new(0.1));
+    let mut ada = Trainer::new(net3, Mae::new(), Adagrad::new(0.1));
 
     let mut net4 = Dense::<2, 4, _>::new(Relu).then(Dense::<4, 1, _>::new(Linear));
     net4.init(&HeUniform, &mut Pcg32::seeded(8));
     let mut nes = Trainer::new(
         net4,
-        Mse,
+        Mse::new(),
         Momentum::new(0.01, 0.9)
             .with_nesterov(true)
             .with_weight_decay(0.001),
@@ -146,7 +148,7 @@ fn new_features_never_touch_the_heap() {
 fn train_briefly<O: Optimizer>(opt: O) -> f32 {
     let mut net = Dense::<2, 4, _>::new(LeakyRelu::default()).then(Dense::<4, 1, _>::new(Linear));
     net.init(&XavierUniform, &mut Pcg32::seeded(3));
-    let mut t = Trainer::new(net, Mse, opt);
+    let mut t = Trainer::new(net, Mse::new(), opt);
     let mut sum = 0.0;
     for i in 0..20 {
         sum += t.train_step(&XS[i % 4], &YS[i % 4]);
@@ -158,7 +160,7 @@ fn train_briefly<O: Optimizer>(opt: O) -> f32 {
 fn train_with_activation<A: Activation + Copy>(act: A) -> f32 {
     let mut net = Dense::<2, 3, _>::new(act).then(Dense::<3, 1, _>::new(Linear));
     net.init(&XavierUniform, &mut Pcg32::seeded(2));
-    let mut t = Trainer::new(net, Mse, Sgd::new(0.01));
+    let mut t = Trainer::new(net, Mse::new(), Sgd::new(0.01));
     let mut sum = 0.0;
     for i in 0..20 {
         sum += t.train_step(&XS[i % 4], &YS[i % 4]);
@@ -207,7 +209,7 @@ fn every_activation_optimizer_loss_and_schedule_never_touches_the_heap() {
         let mut net =
             Dense::<2, 3, _>::new(kind).then(Dense::<3, 1, _>::new(ActivationKind::Linear));
         net.init(&XavierUniform, &mut Pcg32::seeded(1));
-        let mut t = Trainer::new(net, Mse, Sgd::new(0.01).with_weight_decay(0.001));
+        let mut t = Trainer::new(net, Mse::new(), Sgd::new(0.01).with_weight_decay(0.001));
         for i in 0..20 {
             sink += t.train_step(&XS[i % 4], &YS[i % 4]);
         }
@@ -248,12 +250,11 @@ fn every_activation_optimizer_loss_and_schedule_never_touches_the_heap() {
     sink += train_briefly(Lion::new(0.01).with_weight_decay(0.1));
 
     // Jeder Verlust.
-    sink += train_with_loss(Mse);
-    sink += train_with_loss(Mae);
+    sink += train_with_loss(Mse::new());
+    sink += train_with_loss(Mae::new());
     sink += train_with_loss(Huber::new(0.5));
-    sink += train_with_loss(BinaryCrossEntropy::default());
-    sink += train_with_loss(BinaryCrossEntropyWithLogits);
-    sink += train_with_loss(SoftmaxCrossEntropy);
+    sink += train_with_loss(BinaryCrossEntropyWithLogits::new());
+    sink += train_with_loss(SoftmaxCrossEntropy::new());
 
     // Jeder Lernraten-Plan.
     for step in 0..50u32 {
@@ -343,9 +344,9 @@ fn losses_optimizers_and_helpers_added_later_never_touch_the_heap() {
     let mut sink = 0.0f32;
 
     // Neue Verluste (mit Adam, 20 Schritte).
-    sink += train_with_loss(LogCosh);
-    sink += train_with_loss(Hinge);
-    sink += train_with_loss(SquaredHinge);
+    sink += train_with_loss(LogCosh::new());
+    sink += train_with_loss(Hinge::new());
+    sink += train_with_loss(SquaredHinge::new());
     sink += train_with_loss(WeightedBinaryCrossEntropyWithLogits::new(3.0));
     sink += train_with_loss(FocalLossWithLogits::new(2.0).with_alpha(0.25));
     sink += train_with_loss(FocalLossWithLogits::default());
@@ -370,7 +371,7 @@ fn losses_optimizers_and_helpers_added_later_never_touch_the_heap() {
     net.init(&XavierUniform, &mut Pcg32::seeded(6));
     let mut trainer = Trainer::new(
         net,
-        BinaryCrossEntropyWithLogits,
+        BinaryCrossEntropyWithLogits::new(),
         Lookahead::new(AdamW::new(0.03)),
     );
     let mut ema = ParamEma::<[f32; 2 * 4 + 4 + 4 + 1]>::for_params(trainer.network(), 0.9);

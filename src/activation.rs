@@ -14,6 +14,124 @@ use crate::math;
 use crate::model::Crc32;
 
 /// Elementweise Aktivierungsfunktion mit Ableitung für den Backward-Pass.
+///
+/// Ein [`Dense`](crate::dense::DenseLayer)-Layer wendet sie auf jede Vor-Aktivierung
+/// `z = W x + b` an. Zu liefern sind:
+///
+/// * [`apply`](Self::apply): `y = f(x)` im Forward-Pass,
+/// * [`derivative`](Self::derivative): `f'(x)` im Backward-Pass, wo der ankommende Gradient
+///   damit multipliziert wird (`dL/dz = dL/dy · f'(z)`). Neben der Vor-Aktivierung `x` bekommt
+///   die Methode den schon berechneten Ausgabewert `y = f(x)`; Sigmoid, Tanh und ähnliche
+///   Funktionen kommen damit ohne ein zweites `exp` aus,
+/// * optional [`signature`](Self::signature), die Kennung für den Architektur-Fingerprint.
+///
+/// Eine Aktivierung darf Parameter haben (wie [`LeakyRelu`] sein `alpha`), aber keinen
+/// veränderlichen Zustand: alle Methoden nehmen `&self`.
+///
+/// # Die Rolle von `signature()`
+///
+/// Der [Fingerprint](crate::params::Params::fingerprint) eines Netzes ist eine Prüfsumme über
+/// Layer-Art, Dimensionen und die `signature()` der Aktivierung jedes parametertragenden Layers.
+/// [`load_model`](crate::params::Params::load_model) vergleicht ihn mit dem im Modell gespeicherten
+/// und weist Gewichte einer anderen Architektur mit
+/// [`ModelError::ArchitectureMismatch`](crate::model::ModelError::ArchitectureMismatch) ab, bevor
+/// etwas geschrieben wird. Der Standardwert `0` bedeutet „nicht spezifiziert“: Zwei Netze, die
+/// sich nur in Aktivierungen mit dieser Kennung (oder in deren Parametern) unterscheiden, haben
+/// denselben Fingerprint, und ein Modell wird ohne Fehler in das falsche Netz geladen. Eine eigene
+/// Aktivierung sollte deshalb eine Kennung liefern, die Funktion **und** Parameter bestimmt –
+/// am einfachsten als CRC32 über einen Namen und die Bits der Parameter (ähnlich bilden die
+/// eingebauten parametrisierten Funktionen wie [`LeakyRelu`] ihre Kennung). Sie darf sich nicht
+/// mehr ändern, solange gespeicherte Modelle weiter ladbar sein sollen.
+///
+/// # Beispiel: eine eigene Aktivierung
+///
+/// `ScaledTanh` ist `f(x) = scale · tanh(x)` mit Ausgabe in `(-scale, scale)`. Die Ableitung
+/// `scale · (1 - tanh²(x)) = scale - y² / scale` kommt mit dem mitgelieferten `y` aus. Das
+/// Beispiel prüft die Ableitung gegen zentrale Differenzen, trainiert ein Neuron damit und belegt,
+/// dass die Kennung den Fingerprint bestimmt – im Gegensatz zum Standard `0`:
+///
+/// ```
+/// use neuron::prelude::*;
+/// use neuron::Crc32;
+///
+/// #[derive(Clone, Copy)]
+/// struct ScaledTanh {
+///     scale: f32,
+/// }
+///
+/// impl Activation for ScaledTanh {
+///     fn apply(&self, x: f32) -> f32 {
+///         self.scale * libm::tanhf(x) // `core` kennt kein `tanh`; die Bibliothek nutzt `libm`
+///     }
+///
+///     fn derivative(&self, _x: f32, y: f32) -> f32 {
+///         self.scale - y * y / self.scale
+///     }
+///
+///     fn signature(&self) -> u32 {
+///         // Name und Parameter-Bits ergeben die Kennung.
+///         let mut crc = Crc32::new();
+///         crc.update(b"ScaledTanh");
+///         crc.update(&self.scale.to_bits().to_le_bytes());
+///         crc.finish()
+///     }
+/// }
+///
+/// // 1. Gradientencheck: die Ableitung stimmt mit zentralen Differenzen überein.
+/// let act = ScaledTanh { scale: 2.0 };
+/// for x in [-2.0f32, -0.5, 0.0, 0.7, 1.5] {
+///     let h = 1e-2;
+///     let numeric = (act.apply(x + h) - act.apply(x - h)) / (2.0 * h);
+///     let analytic = act.derivative(x, act.apply(x));
+///     assert!((numeric - analytic).abs() < 1e-3, "x = {x}: {numeric} vs {analytic}");
+/// }
+///
+/// // 2. Im Training: ein Neuron lernt y = 2 · tanh(0,8 x + 0,1) aus 21 Punkten.
+/// let xs: [[f32; 1]; 21] = core::array::from_fn(|i| [i as f32 * 0.2 - 2.0]);
+/// let ys = xs.map(|[x]| [2.0 * libm::tanhf(0.8 * x + 0.1)]);
+/// let batch = || xs.iter().zip(&ys).map(|(x, y)| (&x[..], &y[..]));
+/// let mut trainer = Trainer::new(Dense::<1, 1, _>::new(act), Mse::new(), Adam::new(0.05));
+/// let before = trainer.evaluate_batch(batch());
+/// for _ in 0..400 {
+///     trainer.train_batch(batch());
+/// }
+/// assert!(trainer.evaluate_batch(batch()) < before / 1000.0);
+/// let mut p = [0.0f32; 2]; // Gewicht, Bias
+/// trainer.network().copy_params_to_slice(&mut p).unwrap();
+/// assert!((p[0] - 0.8).abs() < 0.05 && (p[1] - 0.1).abs() < 0.05, "gelernt: {p:?}");
+///
+/// // 3. Die Kennung unterscheidet Netze, die sich nur im Parameter der Aktivierung unterscheiden.
+/// let net = |scale| Dense::<2, 3, _>::new(ScaledTanh { scale });
+/// assert_eq!(net(2.0).fingerprint(), net(2.0).fingerprint());
+/// assert_ne!(net(1.0).fingerprint(), net(2.0).fingerprint());
+///
+/// let mut buf = [0u8; neuron::model::model_len(2 * 3 + 3)];
+/// net(2.0).save_model(&mut buf).unwrap();
+/// assert!(matches!(
+///     net(1.0).load_model(&buf),
+///     Err(ModelError::ArchitectureMismatch { .. })
+/// ));
+/// net(2.0).load_model(&buf).unwrap(); // gleiche Kennung: wird angenommen
+///
+/// // 4. Ohne eigene `signature` gilt der Standard `0`: die Netze sind nicht zu unterscheiden,
+/// // und das Modell wird auch in das Netz mit anderem Parameter geladen.
+/// struct Unlabeled {
+///     scale: f32,
+/// }
+/// impl Activation for Unlabeled {
+///     fn apply(&self, x: f32) -> f32 {
+///         self.scale * x
+///     }
+///     fn derivative(&self, _x: f32, _y: f32) -> f32 {
+///         self.scale
+///     }
+/// }
+/// let plain = |scale| Dense::<2, 3, _>::new(Unlabeled { scale });
+/// assert_eq!(Unlabeled { scale: 1.0 }.signature(), 0);
+/// assert_eq!(plain(1.0).fingerprint(), plain(2.0).fingerprint());
+/// plain(2.0).save_model(&mut buf).unwrap();
+/// assert!(plain(1.0).load_model(&buf).is_ok()); // unbemerkt „falsche“ Aktivierung
+/// ```
 pub trait Activation {
     /// `y = f(x)`.
     fn apply(&self, x: f32) -> f32;

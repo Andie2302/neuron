@@ -1,8 +1,11 @@
 # TODO – Ideen und offene Punkte
 
 Stand: nach den Runden „Priorität 1–3" (BCE-Logits, `ParamKind`, Modellformat,
-Inferenz-Typen, Hard-Aktivierungen, Lion, CI) und der Runde „Verluste, Optimizer,
-Trainings-Hilfen, Inferenz-Entscheidungen". Reihenfolge innerhalb einer Gruppe
+Inferenz-Typen, Hard-Aktivierungen, Lion, CI), „Verluste, Optimizer, Trainings-Hilfen,
+Inferenz-Entscheidungen" und „Qualität der Basis / 0.2.0" (nur noch die Logit-Variante der
+binären Kreuzentropie, einheitliche Loss-Konstruktoren, gepinnte Toolchain und Actions,
+`CHANGELOG.md`, Doctests an Crate und Traits; Breaking Changes sind in der Entwicklungsphase
+ausdrücklich erlaubt, Migration: `CHANGELOG.md`). Reihenfolge innerhalb einer Gruppe
 = empfohlene Reihenfolge. `[ ]` offen, `[x]` erledigt.
 
 ## Erledigt
@@ -12,7 +15,8 @@ Trainings-Hilfen, Inferenz-Entscheidungen". Reihenfolge innerhalb einer Gruppe
 - [x] Modellformat mit Header, Architektur-Fingerprint und CRC32 (`Params::save_model` / `load_model`)
 - [x] `ParamKind` (Weight Decay nur auf Gewichte), `RmsProp` ohne unnötigen Momentum-Puffer
 - [x] `Relu6`, `HardSigmoid`, `HardSwish`, `HardTanh`, `Softsign`; `Lion`
-- [x] CI-Workflow (fmt, clippy, tests, Bare-Metal-Build, MSRV, Doku)
+- [x] CI-Workflow (fmt, clippy, tests, Bare-Metal-Build, MSRV, Doku); der Test-Job führt zusätzlich die Beispiele aus
+      (`cargo test` baut sie nur)
 - [x] Verluste: `LogCosh`, `Hinge`, `SquaredHinge`, `WeightedBinaryCrossEntropyWithLogits` (`pos_weight`),
       `FocalLossWithLogits`, `LabelSmoothingCrossEntropy`
 - [x] Optimizer: `NAdam`, `RAdam`, `Lookahead<O>` (Wrapper um jeden Optimizer); Adam/AdamW per Golden-Test bitgleich
@@ -20,28 +24,35 @@ Trainings-Hilfen, Inferenz-Entscheidungen". Reihenfolge innerhalb einer Gruppe
       `Standardizer`/`RunningStats`, `one_hot`, `EarlyStopping`, `ParamEma`, `ConfusionMatrix`, `r2_score`
 - [x] Inferenz: `InferExt` (`classify`, `classify_confident`, `probabilities`, `top_k`, `accuracy`), `math::softmax_confidence`,
       `math::top_k`; Beispiel `examples/classifier.rs`
+- [x] `BinaryCrossEntropy` (auf Wahrscheinlichkeiten, sättigt) **entfernt** statt deprecated (0.2.0, Breaking): es gibt nur noch
+      `BinaryCrossEntropyWithLogits`; ein test-lokaler Nachbau in `tests/training_extensions.rs` belegt das Einfrieren
+- [x] Einheitliche Loss-Konstruktoren (0.2.0, Breaking): jeder Verlust mit `X::new(..)` und `Default`; parameterlose als
+      `#[non_exhaustive]`-Einheits-Structs (`Mse::new()`), parametrische mit privaten Feldern, Gettern und validierten
+      `new`/`with_*` (`Huber::new(0.5)`, `FocalLossWithLogits::new(2.0).with_alpha(0.25)`)
+- [x] Toolchain gepinnt: `rust-toolchain.toml` (1.99.0), in der CI dieselbe Version samt Konsistenz-Job gegen die Datei;
+      die Mindestversion der Bibliothek (1.80) prüft ein eigener Job
+- [x] GitHub Actions auf Commit-SHAs gepinnt (Tag als Kommentar), Dependabot für `github-actions`
+- [x] `CHANGELOG.md` (Format „Keep a Changelog", Release-Prozess) und Version 0.2.0
+- [x] MSRV-Zusage ausdrücklich auf die Bibliothek beschränkt (README, Abschnitt „Grenzen“; die CI prüft
+      `cargo +1.80.0 build --lib`). Tests, Doctests und Beispiele bauen und laufen lokal ebenfalls auf 1.80
+      (`cargo +1.80.0 test`, mit und ohne `alloc`), die CI erzwingt das aber nicht
+- [x] Doctests: in `src/lib.rs` Schnellstart-Training, Epochen mit Early Stopping, Inferenz (inkl. `static` im Flash),
+      Modell speichern → laden (inkl. Fehlerfälle); an den erweiterbaren Traits `Loss`, `Optimizer`, `Activation`,
+      `Initializer`, `LrSchedule` (je ein eigener Typ), `Layer`/`Chain`, `Params`/`ParamError` und am Modellformat,
+      an `Dense`/`InferenceDense`, `Sequential`, `InferLayer`/`InferExt` und am `Trainer`
 
 ## Sofort / Qualität der Basis
 
 - [ ] **CI zum ersten Mal auf GitHub laufen lassen** und Fehler beheben. Der Workflow wurde bisher nur
-      lokal nachgespielt (alle `run`-Schritte mit Matrix-Expansion); ob die Action-Referenzen auflösen,
-      ist ungeprüft.
-- [ ] Actions auf Commit-SHAs pinnen statt auf Tags (`actions/checkout`, `dtolnay/rust-toolchain`,
-      `Swatinem/rust-cache`) und Dependabot für `github-actions` einschalten.
-- [ ] `BinaryCrossEntropy` (auf Wahrscheinlichkeiten) als `#[deprecated]` markieren oder in der
-      Dokumentation noch deutlicher auf die Logit-Variante umlenken – sie sättigt.
+      lokal nachgespielt (alle `run`-Schritte mit Matrix-Expansion); ob die Action-Referenzen (jetzt
+      Commit-SHAs) auflösen und `.github/dependabot.yml` greift, ist ungeprüft.
 - [ ] **Bare-Metal-Test ausführen, nicht nur bauen:** kleines `no_std`-Binary für Cortex-M, das in CI
       unter `qemu-system-arm` (Semihosting) eine Inferenz rechnet und das Ergebnis prüft.
 - [ ] **Flash-Größe verfolgen:** `cargo size` für ein Beispielnetz in CI, damit Größen-Regressionen
       auffallen. Dabei messen, wie viel `assert_eq!`-Formatierung kostet (bisher nur vermutet) und ob
       `try_*`-Varianten mit `Result` sinnvoll sind.
-- [ ] **Toolchain in der CI pinnen** (`rust-toolchain.toml` o. Ä.): `-D warnings` auf dem beweglichen
-      `stable` bricht die Pipeline, sobald eine neue Clippy-/Rustdoc-Lint erscheint.
-- [ ] MSRV auch für Tests/Beispiele prüfen oder die Zusage ausdrücklich auf die Bibliothek beschränken
-      (so steht es in der README).
 - [ ] Benchmarks (Zyklen je Forward/Backward) für `Dense` und `InferenceDense`.
 - [ ] Fuzz-Ziel für `load_model` / `inspect` (eigenes Crate, damit das Hauptcrate abhängigkeitsfrei bleibt).
-- [ ] `CHANGELOG.md`, Versionierung und Release-Prozess.
 
 ## Modellformat und Embedded
 
@@ -76,9 +87,6 @@ Trainings-Hilfen, Inferenz-Entscheidungen". Reihenfolge innerhalb einer Gruppe
 
 - [ ] Klassengewichte für `SoftmaxCrossEntropy` (Mehrklassen-Gegenstück zu `pos_weight`)
 - [ ] KL-Divergenz (Destillation: Ziele sind bereits weiche Verteilungen); Multi-Label-Fokalverlust auf Softmax
-- [ ] Ein einheitlicher Konstruktor-Stil: `WeightedBinaryCrossEntropyWithLogits`, `FocalLossWithLogits` und
-      `LabelSmoothingCrossEntropy` haben `new` mit Prüfung; die älteren Verluste sind Einheits-Structs
-      (bewusst nicht angefasst, um nichts zu brechen – bei einer 0.2 vereinheitlichen)
 
 ## Optimizer und Training
 
@@ -118,7 +126,12 @@ Trainings-Hilfen, Inferenz-Entscheidungen". Reihenfolge innerhalb einer Gruppe
 ## Ergonomie und Dokumentation
 
 - [ ] Makro zum Verketten (`chain!(a, b, c)`) und Typ-Aliase – die geschachtelten `Chain`-Typen sind lang
-- [ ] Mehr Doctests an den öffentlichen Typen; ein Beispiel für Modell speichern → Flash → laden
+- [ ] Weitere Doctests an einzelnen öffentlichen Typen: Die Traits und zentralen Typen haben Beispiele (siehe
+      „Erledigt“); ein eigenes fehlt noch an den einzelnen Implementierungen (Aktivierungen, Initialisierer, Optimizer
+      außer `Lookahead`, Lernraten-Pläne, Verluste außer `BinaryCrossEntropyWithLogits`) und an `Dropout`,
+      `Buffer`/`Storage`, `ParamKind` und `LayerKind`. Der Weg „Modell mit `include_bytes!` ins Flash einbetten →
+      laden“ steht in `src/lib.rs` nur als `text`-Block (braucht eine Datei und `std` auf dem Host), nicht als
+      ausgeführter Doctest.
 - [ ] `infer` bindet das Ergebnis an Netz *und* Eingabe (nötig für zero-copy `Passthrough`);
       eine Variante, die nur vom Netz borgt, würde Temporaries als Eingabe erleichtern.
 - [ ] Batch-Forward (Matrix × Matrix) für höheren Durchsatz auf Geräten mit Cache
@@ -129,3 +142,7 @@ Trainings-Hilfen, Inferenz-Entscheidungen". Reihenfolge innerhalb einer Gruppe
 - Das Modellformat speichert nur `f32`; Optimizer-Zustand und Gradienten werden nicht gespeichert.
 - Der Fingerprint unterscheidet eigene Aktivierungen nur über deren `signature()`.
 - `Sequential` braucht zum Training mindestens einen Layer.
+- Es gibt bewusst keine Kreuzentropie auf Wahrscheinlichkeiten (sie sättigt in `f32`): `BinaryCrossEntropyWithLogits`
+  braucht einen `Linear`-Ausgang, Sigmoid kommt erst bei der Inferenz.
+- Die Mindestversion Rust 1.80 gilt nur für die Bibliothek. Tests, Doctests und Beispiele bauen und laufen lokal
+  auch auf 1.80, die CI prüft sie aber nur mit der gepinnten Toolchain 1.99.0.

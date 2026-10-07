@@ -2,22 +2,55 @@
 
 Konfigurierbares neuronales Netz in Rust – **`#![no_std]`, ohne `alloc`, ohne
 `std`**, Speicher ausschließlich über Const Generics. Einzige Abhängigkeit: `libm`.
-Offene Punkte und Ideen: [`TODO.md`](TODO.md).
+Offene Punkte und Ideen: [`TODO.md`](TODO.md). Änderungen und Migrationshinweise (u. a. von 0.1 auf
+0.2): [`CHANGELOG.md`](CHANGELOG.md).
 
 ```text
 cargo run --example xor                                # Stack, kein Heap
 cargo run --example dynamic_xor --features alloc       # Opt-In: Vec-Puffer
 cargo run --release --example gelu_adamw               # GELU/Swish + AdamW, Export/Import
 cargo run --release --example classifier               # Standardisierung, Epochen, Early Stopping, EMA, Ablehnung
-cargo test                                             # Standardmodus
+cargo test                                             # Standardmodus (inkl. Doctests)
 cargo test --features alloc                            # inkl. Heap-Zweig
+cargo clippy --all-targets -- -D warnings              # Lints wie in der CI
+cargo doc --no-deps                                    # Doku; die CI baut mit RUSTDOCFLAGS="-D warnings"
 cargo build --lib --target thumbv7em-none-eabihf       # echtes no_std (Cortex-M4F)
 ```
 
-Die CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) prüft bei jedem Push auf `main` und jedem Pull Request:
-`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` (mit und ohne
-`alloc`), den Bare-Metal-Build `thumbv7em-none-eabihf`, die Mindestversion Rust 1.80 (Bibliothek)
-und `cargo doc -D warnings`.
+**Toolchain.** [`rust-toolchain.toml`](rust-toolchain.toml) pinnt Rust **1.99.0** (Profil `minimal`, dazu `rustfmt`,
+`clippy` und das Cortex-M-Ziel `thumbv7em-none-eabihf`). Im Repository wählt `rustup` sie automatisch, ein
+`+toolchain` ist nicht nötig. Der feste Stand verhindert, dass `-D warnings` (Clippy, Rustdoc) bei einem
+Toolchain-Update unerwartet an einer neuen Lint bricht; angehoben wird bewusst von Hand (Dependabot kennt
+`rust-toolchain.toml` nicht).
+
+Ist die Toolchain auf dem Rechner noch nicht installiert, lädt `rustup` (geprüft mit 1.29.1) sie beim ersten
+`cargo`-Aufruf samt Komponenten und Ziel nach und weist dabei mit einer Warnung darauf hin. Das lässt sich mit
+`RUSTUP_AUTO_INSTALL=0` oder `rustup set auto-install disable` abschalten; `cargo` bricht dann mit „toolchain … is not
+installed“ ab und empfiehlt `rustup toolchain install`. Dieser Befehl installiert ohne Argumente die aktive, hier also
+die in der Datei genannte Toolchain ausdrücklich, wieder samt Komponenten und Ziel. Wie sich andere `rustup`-Versionen
+beim Nachladen verhalten, ist nicht geprüft; der ausdrückliche Befehl ist der sichere Weg.
+
+**CI.** Die CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) prüft bei jedem Push auf `main` und jedem
+Pull Request:
+
+* `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` und `cargo doc --no-deps` mit
+  `RUSTDOCFLAGS=-D warnings` (Clippy, Test und Doku jeweils mit und ohne `alloc`) – alles auf der festen Toolchain
+  1.99.0 (`RUST_TOOLCHAIN` im Workflow);
+* die Beispiele `xor`, `classifier` und `gelu_adamw` (mit `alloc` zusätzlich `dynamic_xor`): der Test-Job
+  **führt** sie im Release-Modus aus, denn `cargo test` baut sie nur; so fallen Panics und Rechenfehler in ihnen auf;
+* den Bare-Metal-Build `thumbv7em-none-eabihf` (mit und ohne `alloc`);
+* die Mindestversion Rust 1.80 (nur Bibliothek, mit und ohne `alloc`) mit `cargo +1.80.0 build --lib`. Die
+  ausdrückliche `+toolchain`-Angabe hat Vorrang vor `rust-toolchain.toml`; sonst würde dieser Job stillschweigend
+  1.99.0 prüfen;
+* den Job `toolchain-pin`: `channel` in `rust-toolchain.toml` und `RUST_TOOLCHAIN` im Workflow müssen dieselbe
+  Version nennen. Zum Anheben also beide Stellen gemeinsam ändern und lokal `cargo clippy --all-targets -- -D warnings`,
+  `cargo doc` und `cargo test` laufen lassen.
+
+Alle GitHub Actions sind auf **Commit-SHAs** statt auf bewegliche Tags gepinnt; der Kommentar dahinter nennt die
+Version (z. B. `# v7.0.1`). [Dependabot](.github/dependabot.yml) (`github-actions`, wöchentlich) schlägt Anhebungen als
+Pull Requests vor und aktualisiert SHA und Kommentar gemeinsam. Der Workflow hat nur Leserechte
+(`permissions: contents: read`), und `checkout` lässt keine Zugangsdaten im Arbeitsbaum zurück
+(`persist-credentials: false`).
 
 ## Minimalbeispiel (XOR, `no_std`-Standardmodus)
 
@@ -27,8 +60,9 @@ use neuron::prelude::*;
 let mut net = Dense::<2, 4, _>::new(Tanh).then(Dense::<4, 1, _>::new(Linear));
 net.init(&XavierUniform, &mut Pcg32::seeded(2024));
 
-// Logit-Verlust: Linear-Ausgang, Sigmoid erst bei der Inferenz (siehe "Sättigung" unten).
-let mut trainer = Trainer::new(net, BinaryCrossEntropyWithLogits, Adam::new(0.05));
+// Logit-Verlust: Linear-Ausgang, Sigmoid erst bei der Inferenz (Begründung: siehe
+// "Warum es nur die Logit-Variante der Binären Kreuzentropie gibt" unten).
+let mut trainer = Trainer::new(net, BinaryCrossEntropyWithLogits::new(), Adam::new(0.05));
 for _ in 0..1000 {
     trainer.train_batch(xs.iter().zip(&ys).map(|(x, y)| (&x[..], &y[..])));
 }
@@ -39,12 +73,18 @@ Vollständig: [`examples/xor.rs`](examples/xor.rs). Das gesamte Training
 (Gewichte, Gradienten, Adam-Zustand, Zwischenwerte) liegt in einem
 `Trainer`-Wert von **376 Byte** auf dem Stack (das Beispiel druckt den Wert).
 
+Weitere lauffähige Beispiele stehen als Doctests im Crate-Doc (`src/lib.rs`, `cargo doc --open`): Epochen mit
+Early Stopping, Inferenz (auch mit den Gewichten als `static` im Flash) sowie Modell speichern und laden samt
+Fehlerfällen. Die erweiterbaren Traits (`Loss`, `Optimizer`, `Activation`, `Initializer`, `LrSchedule`) zeigen in
+ihrer Dokumentation je einen eigenen Typ als Beispiel. `cargo test` führt die Doctests aus, die des Heap-Zweigs
+(`Sequential` u. a.) mit `--features alloc`.
+
 ## Trait-Abstraktionen
 
 | Trait           | Aufgabe                                | Implementierungen |
 |-----------------|----------------------------------------|-------------------|
 | `Activation`    | `apply(x)`, `derivative(x, y)`, `signature()` | `Linear`, `Relu`, `LeakyRelu`, `Sigmoid`, `Tanh`, `Gelu`, `Swish`, `Elu`, `Softplus`, `Mish`, **ohne `exp`/`tanh`:** `Relu6`, `HardSigmoid`, `HardSwish`, `HardTanh`, `Softsign`; Enum `ActivationKind` (Laufzeitwahl) |
-| `Loss`          | `value(pred, target)`, `gradient(..)`  | `Mse`, `Mae`, `Huber`, `LogCosh`, `Hinge`/`SquaredHinge` (Ziele ±1), `BinaryCrossEntropyWithLogits` (auf Logits), `WeightedBinaryCrossEntropyWithLogits` (`pos_weight`), `FocalLossWithLogits`, `BinaryCrossEntropy` (auf Wahrscheinlichkeiten, sättigt), `SoftmaxCrossEntropy` und `LabelSmoothingCrossEntropy` (auf Logits) |
+| `Loss`          | `value(pred, target)`, `gradient(..)`  | `Mse`, `Mae`, `Huber`, `LogCosh`, `Hinge`/`SquaredHinge` (Ziele ±1), `BinaryCrossEntropyWithLogits` (auf Logits), `WeightedBinaryCrossEntropyWithLogits` (`pos_weight`), `FocalLossWithLogits`, `SoftmaxCrossEntropy` und `LabelSmoothingCrossEntropy` (auf Logits); alle per `X::new(..)` (siehe „Einheitliche Loss-Konstruktoren“) |
 | `Initializer`   | `fill(w, fan_in, fan_out, rng)`        | `Constant`, `XavierUniform/Normal`, `HeUniform/Normal` |
 | `Optimizer`     | `update(state, params, grads, kind)`   | `Sgd`, `Momentum` (optional Nesterov), `Adam`, `AdamW`, `NAdam`, `RAdam`, `Lion`, `RmsProp`/`RmsPropMomentum`, `Adagrad`; Wrapper `Lookahead<O>` um jeden Optimizer |
 | `LrSchedule`    | `lr(step)`                             | `ConstantLr`, `StepDecay`, `ExponentialDecay`, `CosineAnnealing`, `Warmup<S>` |
@@ -62,15 +102,43 @@ Dropout hat einen expliziten Schalter: jeder `forward`-Aufruf bekommt einen
 
 ## Details
 
-**Sättigung der Binären Kreuzentropie.** `BinaryCrossEntropy` rechnet auf Wahrscheinlichkeiten
-(Sigmoid-Ausgang). In `f32` ist `σ(z)` für `z ≳ 17` exakt `1.0`, dann ist die Ableitung
+**Einheitliche Loss-Konstruktoren.** Jeder Verlust wird mit `X::new(..)` erzeugt und hat ein `Default`
+mit den üblichen Standardwerten. Es gibt zwei Sorten:
+
+* **Parameterlose** Verluste (`Mse`, `Mae`, `LogCosh`, `Hinge`, `SquaredHinge`,
+  `BinaryCrossEntropyWithLogits`, `SoftmaxCrossEntropy`) sind `#[non_exhaustive]`-Einheits-Structs mit
+  `const fn new()`. Außerhalb des Crates gibt es nur diesen einen Weg (`Mse::new()` oder `Mse::default()`;
+  das bloße `Mse` als Wert geht nicht mehr). Kommt später ein Parameter dazu, bricht das keinen Aufrufer.
+* Verluste **mit Parametern** (`Huber`, `WeightedBinaryCrossEntropyWithLogits`, `FocalLossWithLogits`,
+  `LabelSmoothingCrossEntropy`) halten ihre Felder **privat**, prüfen die Werte in `new` (ungültig, z. B.
+  `NaN` oder `delta ≤ 0`: `panic!` mit klarer Meldung) und lesen sie über gleichnamige **Getter** zurück
+  (`delta()`, `pos_weight()`, `gamma()`/`alpha()`, `smoothing()`). Optionales setzt ein validierter
+  `with_*`-Builder. Per Struktur-Literal lassen sich die Prüfungen so nicht umgehen.
+
+```rust
+let mse   = Mse::new();                                        // oder Mse::default()
+let huber = Huber::new(0.5);                                   // huber.delta() == 0.5
+let focal = FocalLossWithLogits::new(2.0).with_alpha(0.25);    // focal.alpha() == Some(0.25)
+```
+
+Die Standardwerte sind `Huber` δ = 1, `WeightedBinaryCrossEntropyWithLogits` `pos_weight` = 1,
+`FocalLossWithLogits` γ = 2 (ohne α) und `LabelSmoothingCrossEntropy` ε = 0,1. Die Konvention steht auch im
+Moduldoc von `src/loss.rs` (mit Doctest); die Umstellung von 0.1 beschreibt `CHANGELOG.md`.
+
+**Warum es nur die Logit-Variante der Binären Kreuzentropie gibt.** Eine Kreuzentropie auf Wahrscheinlichkeiten
+(Sigmoid-Ausgang) sättigt: In `f32` ist `σ(z)` für `z ≳ 17` exakt `1.0`, dann ist die Ableitung
 `y(1−y)` exakt `0` und der Gradient verschwindet – auch bei völlig falscher Vorhersage (Ziel `0`,
-Ausgabe `1.0`): das Netz bleibt für immer hängen. `BinaryCrossEntropyWithLogits` arbeitet auf den
-rohen Logits einer `Linear`-Ausgabe (Verlust `max(z,0) − t·z + ln(1+e^−|z|)`, Gradient `(σ(z) − t)/n` über `n` Ausgänge, bei einem Ausgang `σ(z) − t`);
+Ausgabe `1.0`): das Netz bleibt für immer hängen. Deshalb gibt es in `neuron` nur
+`BinaryCrossEntropyWithLogits`; die frühere `BinaryCrossEntropy` auf Wahrscheinlichkeiten wurde in 0.2.0
+ersatzlos entfernt, damit man den sättigenden Verlust nicht versehentlich wählen kann. Die Logit-Variante
+arbeitet auf den rohen Logits einer `Linear`-Ausgabe (Verlust `max(z,0) − t·z + ln(1+e^−|z|)`,
+Gradient `(σ(z) − t)/n` über `n` Ausgänge, bei einem Ausgang `σ(z) − t`);
 Sigmoid und Logarithmus kürzen sich heraus, der Gradient bleibt voll erhalten.
-`tests/training_extensions.rs` trainiert dasselbe schlecht gestartete Netz mit beiden Verlusten:
-mit dem alten friert das Gewicht exakt ein, mit dem neuen erholt es sich. `math::sigmoid` macht
-bei der Inferenz aus Logits Wahrscheinlichkeiten.
+`tests/training_extensions.rs` enthält einen test-lokalen Nachbau der entfernten Variante
+(`ProbabilityBce`) und trainiert damit ein gleich schlecht gestartetes Netz (Logit 30, Ziel 0; beim Nachbau mit
+`Sigmoid`-, beim Logit-Verlust mit `Linear`-Ausgang): beim Nachbau friert das Gewicht exakt ein, mit dem
+Logit-Verlust erholt es sich.
+`math::sigmoid` macht bei der Inferenz aus Logits Wahrscheinlichkeiten.
 
 **GELU / Swish.** `Gelu` ist die tanh-Näherung `0.5·x·(1 + tanh(√(2/π)(x + 0.044715·x³)))`
 (Abweichung zur exakten `x·Φ(x)` unter `1e-3`, per Test gegen `erf` belegt). Das tanh-Argument
@@ -116,8 +184,7 @@ sind zustandslos; angewendet werden sie über `Trainer::set_learning_rate`.
 das Maximum ab (Logits wie `1000.0` laufen nicht über), allokiert nichts und definiert die
 Randfälle (leer, alles `-inf`, `+inf`, `NaN`). `math::argmax` liefert den Klassenindex.
 
-**Weitere Verluste.** Die bestehenden Verluste sind unveränderte Einheits-Structs; was Parameter braucht,
-kam als eigener Typ dazu (kein Breaking Change).
+**Weitere Verluste.** Alle folgen der oben beschriebenen Konstruktor-Konvention.
 `LogCosh` (`ln cosh(p − t)`) verhält sich wie `Mse` für kleine und wie `Mae` für große Fehler, ist überall glatt,
 und sein Gradient `tanh(d)/n` ist durch `1/n` begrenzt; ausgewertet wird überlauffrei und mit einem
 `exp_m1`/`ln_1p`-Zweig für winzige `d` (die Lehrbuchform verliert dort ihre Stellen: bei `d = 1e-3` hat sie 4,6 % Fehler,
@@ -303,15 +370,17 @@ Für große Netze liegt der `Trainer` entweder in einem `static`/`static mut`
 | Ableitung jeder Aktivierung stimmt | Unit-Tests (Finite Differences, Referenzwerte, Extremwerte) und `tests/gradcheck_activations.rs` (durch echte Layer, mit Knick-Vorbedingung) |
 | Der Standardpfad allokiert **nie** | `tests/no_alloc.rs` (zählender `#[global_allocator]`, 0 Allokationen über Aufbau, Init, Training mit jedem Optimizer, jeder Aktivierung (statisch und jede `ActivationKind`-Variante), jedem Verlust, Clipping, jedem Lernraten-Plan, Softmax, Modell speichern/laden, Inferenz, Epochen-Training, Early Stopping, EMA, Metriken und `InferExt`) |
 | Lernt XOR/Regression | `tests/xor.rs`, `tests/training_extensions.rs` (ausgewählte Kombinationen aus Aktivierung und Optimizer, je 4 Seeds; Ridge-Lösung für L2; Clipping; Ausreißer-Robustheit) |
-| BCE-Sättigung behoben | `tests/training_extensions.rs` (altes Netz friert exakt ein, Logit-Verlust erholt sich) und Unit-Tests (gesättigte und extreme Logits) |
+| Nur die Logit-Variante der BCE (Begründung) | `tests/training_extensions.rs` (test-lokaler Nachbau `ProbabilityBce` friert exakt ein, Logit-Verlust erholt sich) und Unit-Tests in `src/loss.rs` (gesättigte und extreme Logits; die fusionierte Form gegen die Kettenregel der Wahrscheinlichkeitsform) |
 | Bias bleibt vom Zerfall verschont | Unit-Tests je Optimizer und Ende-zu-Ende-Test (`b = 5` statt `4`) |
-| `RmsProp`/`Lion`-Zustandsgröße | `size_of`-Tests (ein bzw. zwei Puffer) |
+| Zustandsgröße von `RmsProp`, `RmsPropMomentum` und `Lion` | `size_of`-Tests in `src/optim.rs` (`RmsProp` und `Lion`: ein Puffer, `RmsPropMomentum`: zwei wie `Adam`) |
 | Modellformat | `tests/model_format.rs` (**Golden-Bytes**, jedes einzelne gekippte Bit und jede Kürzung abgelehnt, Fuzz mit Zufallsbytes, Architektur-Abweichungen) und Unit-Tests in `src/model.rs` (CRC32-Normvektoren) |
 | Inferenz spart Speicher, rechnet gleich | `tests/inference.rs` (`size_of_val`, bitgleiche Ausgaben für jede `ActivationKind`, `static` im Flash) |
 | Parameter-Import/-Export | `tests/params_io.rs` (Layout, atomare Fehler, Roundtrip, handgeschriebene `const`-Gewichte, Stack ↔ Heap) |
 | Stack ≡ Heap | `tests/dynamic.rs` (bitgleiche Verluste/Vorhersagen, auch mit Clipping) |
-| Dimensionsfehler = Compilerfehler | `compile_fail`-Doctests in `src/lib.rs` und `src/infer.rs` |
+| Dimensionsfehler = Compilerfehler | `compile_fail`-Doctests in `src/lib.rs`, `src/layer.rs`, `src/dense.rs` und `src/infer.rs` |
+| Die dokumentierten Beispiele laufen | Doctests in `src/lib.rs` (Schnellstart-Training, Epochen mit Early Stopping, Inferenz und `static` im Flash, Modell speichern → laden samt Fehlerfällen), an den erweiterbaren Traits (`Loss`, `Optimizer`, `Activation`, `Initializer`, `LrSchedule`, `Layer`) und an `Trainer`, `Params`/`model`, `Dense`, `Sequential` und `InferLayer`; die CI führt sie über `cargo test` mit aus |
 | Neue Verluste | Unit-Tests je Verlust (Gradient gegen zentrale Differenzen, Extremwerte bis `±f32::MAX`, `NaN`, Spezialfälle wie `w = 1`/`γ = 0`/`ε = 0` ≡ Basisverlust) und `tests/new_losses.rs` (Recall mit `pos_weight`, Glättungs-Optimum, Ausreißer-Robustheit von `LogCosh`) |
+| Einheitliche Loss-Konstruktoren | Unit-Tests in `src/loss.rs` (`#[should_panic]` für ungültige Werte inkl. `NaN`, Getter, Standardwerte von `FocalLossWithLogits`) und der Doctest im Moduldoc von `src/loss.rs`; dass der bloße Name (`Mse`) nicht mehr als Wert kompiliert, erzwingt der Compiler in jedem Test, Beispiel und Doctest |
 | NAdam, RAdam, Lookahead | Unit-Tests gegen `f64`-Referenzen, `size_of`-Tests, Mutationsprüfung der Formeln; `tests/new_optimizers.rs` (XOR, Stack ≡ Heap, Rauschdämpfung) |
 | Training/Auswertung/Entscheidung | `tests/training_utils.rs`, `tests/inference_helpers.rs`, Unit-Tests in `rng`, `data`, `metrics`, `stopping`, `average`, `math` |
 | Wirklich `no_std` | CI: `cargo build --lib --target thumbv7em-none-eabihf` (mit und ohne `alloc`) |
@@ -321,9 +390,12 @@ Für große Netze liegt der `Trainer` entweder in einem `static`/`static mut`
 * Nur `f32`; kein Batch-Parallelismus (ein Sample pro Forward/Backward, Mini-Batches
   durch Gradienten-Akkumulation). Das Modellformat speichert `f32` (Version 1).
 * `backward` muss auf das zugehörige `forward` mit derselben Eingabe folgen.
-* `SoftmaxCrossEntropy` und `BinaryCrossEntropyWithLogits` erwarten Logits (Linear-Ausgang);
-  `BinaryCrossEntropy` erwartet Wahrscheinlichkeiten und sättigt (siehe oben).
+* `SoftmaxCrossEntropy` und `BinaryCrossEntropyWithLogits` erwarten Logits (Linear-Ausgang). Eine
+  Kreuzentropie auf Wahrscheinlichkeiten gibt es bewusst nicht (sie sättigt, siehe oben); Sigmoid
+  kommt erst bei der Inferenz.
 * `Sequential` braucht zum Training mindestens einen Layer; Dimensionen `0` sind nicht erlaubt.
-* Die Mindestversion Rust 1.80 gilt für die Bibliothek; Tests und Beispiele werden nur mit der
-  aktuellen stabilen Version gebaut.
+* Die Mindestversion Rust 1.80 gilt ausdrücklich nur für die Bibliothek (die CI prüft `cargo +1.80.0 build --lib`,
+  mit und ohne `alloc`). Tests, Doctests und Beispiele baut und führt die CI mit der gepinnten Version 1.99.0 aus.
+  Lokal bauen und laufen sie auch auf 1.80 (geprüft: `cargo +1.80.0 test` mit und ohne `alloc` samt Doctests, dazu
+  die vier Beispiele); die CI erzwingt das aber nicht.
 * Das Beispiel-`main` nutzt `std` nur zum Drucken; die Bibliothek ist `no_std`.

@@ -9,9 +9,15 @@ fn batch() -> impl Iterator<Item = (&'static [f32], &'static [f32])> {
     XS.iter().zip(&YS).map(|(x, y)| (&x[..], &y[..]))
 }
 
-fn assert_xor_learned<L: Layer, Ls: Loss, O: Optimizer>(t: &mut Trainer<L, Ls, O>) {
+/// Prüft, ob XOR gelernt wurde. `to_prob` bildet die rohe Netzausgabe auf eine
+/// Wahrscheinlichkeit ab: `sigmoid` für Logit-Ausgänge (Linear-Ausgangsschicht),
+/// die Identität für Netze mit Sigmoid-Ausgang.
+fn assert_xor_learned<L: Layer, Ls: Loss, O: Optimizer>(
+    t: &mut Trainer<L, Ls, O>,
+    to_prob: fn(f32) -> f32,
+) {
     for (x, y) in XS.iter().zip(&YS) {
-        let p = t.predict(x)[0];
+        let p = to_prob(t.predict(x)[0]);
         assert!(
             (p - y[0]).abs() < 0.1,
             "x = {x:?}: Vorhersage {p}, Ziel {}",
@@ -23,16 +29,18 @@ fn assert_xor_learned<L: Layer, Ls: Loss, O: Optimizer>(t: &mut Trainer<L, Ls, O
 #[test]
 fn xor_with_adam_and_bce() {
     for seed in [1u64, 2, 3, 2024] {
-        let mut net = Dense::<2, 4, _>::new(Tanh).then(Dense::<4, 1, _>::new(Sigmoid));
+        // Linear-Ausgang: das Netz liefert rohe Logits, die Verlustfunktion
+        // wendet die Sigmoid-Funktion numerisch stabil selbst an.
+        let mut net = Dense::<2, 4, _>::new(Tanh).then(Dense::<4, 1, _>::new(Linear));
         net.init(&XavierUniform, &mut Pcg32::seeded(seed));
-        let mut t = Trainer::new(net, BinaryCrossEntropy::default(), Adam::new(0.05));
+        let mut t = Trainer::new(net, BinaryCrossEntropyWithLogits::new(), Adam::new(0.05));
         let first = t.train_batch(batch());
         let mut last = first;
         for _ in 0..1000 {
             last = t.train_batch(batch());
         }
         assert!(last < first / 10.0, "seed {seed}: {first} -> {last}");
-        assert_xor_learned(&mut t);
+        assert_xor_learned(&mut t, sigmoid);
     }
 }
 
@@ -40,24 +48,24 @@ fn xor_with_adam_and_bce() {
 fn xor_with_momentum_and_mse() {
     let mut net = Dense::<2, 6, _>::new(Tanh).then(Dense::<6, 1, _>::new(Sigmoid));
     net.init(&XavierUniform, &mut Pcg32::seeded(7));
-    let mut t = Trainer::new(net, Mse, Momentum::new(0.3, 0.9));
+    let mut t = Trainer::new(net, Mse::new(), Momentum::new(0.3, 0.9));
     for _ in 0..3000 {
         t.train_batch(batch());
     }
-    assert_xor_learned(&mut t);
+    assert_xor_learned(&mut t, |p| p);
 }
 
 #[test]
 fn xor_with_relu_he_init_and_per_sample_steps() {
-    let mut net = Dense::<2, 8, _>::new(Relu).then(Dense::<8, 1, _>::new(Sigmoid));
+    let mut net = Dense::<2, 8, _>::new(Relu).then(Dense::<8, 1, _>::new(Linear));
     net.init(&HeUniform, &mut Pcg32::seeded(3));
-    let mut t = Trainer::new(net, BinaryCrossEntropy::default(), Adam::new(0.02));
+    let mut t = Trainer::new(net, BinaryCrossEntropyWithLogits::new(), Adam::new(0.02));
     for _ in 0..1500 {
         for (x, y) in XS.iter().zip(&YS) {
             t.train_step(x, y);
         }
     }
-    assert_xor_learned(&mut t);
+    assert_xor_learned(&mut t, sigmoid);
 }
 
 #[test]
@@ -65,7 +73,7 @@ fn xor_as_two_class_softmax() {
     let ys: [[f32; 2]; 4] = [[1.0, 0.0], [0.0, 1.0], [0.0, 1.0], [1.0, 0.0]];
     let mut net = Dense::<2, 6, _>::new(Tanh).then(Dense::<6, 2, _>::new(Linear));
     net.init(&XavierUniform, &mut Pcg32::seeded(5));
-    let mut t = Trainer::new(net, SoftmaxCrossEntropy, Adam::new(0.05));
+    let mut t = Trainer::new(net, SoftmaxCrossEntropy::new(), Adam::new(0.05));
     for _ in 0..800 {
         t.train_batch(XS.iter().zip(&ys).map(|(x, y)| (&x[..], &y[..])));
     }
@@ -85,7 +93,7 @@ fn linear_regression_recovers_coefficients() {
     // y = 2·x0 - 3·x1 + 1
     let mut net = Dense::<2, 1, _>::new(Linear);
     net.init(&Constant(0.0), &mut Pcg32::seeded(0));
-    let mut t = Trainer::new(net, Mse, Sgd::new(0.1));
+    let mut t = Trainer::new(net, Mse::new(), Sgd::new(0.1));
     let mut rng = Pcg32::seeded(99);
     for _ in 0..2000 {
         let x = [rng.uniform(-1.0, 1.0), rng.uniform(-1.0, 1.0)];
@@ -104,7 +112,7 @@ fn dropout_mode_switch_in_a_network() {
         .then(Dropout::<16>::new(0.5, 17))
         .then(Dense::<16, 1, _>::new(Linear));
     net.init(&XavierUniform, &mut Pcg32::seeded(4));
-    let mut t = Trainer::new(net, Mse, Sgd::new(0.0));
+    let mut t = Trainer::new(net, Mse::new(), Sgd::new(0.0));
 
     // Inferenz: deterministisch.
     let a = t.predict(&[0.3, -0.7])[0];
