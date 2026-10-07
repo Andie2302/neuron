@@ -121,6 +121,11 @@ impl<A: Layer, B: Layer<Input = A::Output>> Chain<A, B> {
         &self.second
     }
 
+    /// Zerlegt die Kette in ihre beiden Teile.
+    pub fn into_parts(self) -> (A, B) {
+        (self.first, self.second)
+    }
+
     /// Erster Teil der Kette (mutabel).
     pub fn first_mut(&mut self) -> &mut A {
         &mut self.first

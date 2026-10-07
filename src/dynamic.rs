@@ -8,8 +8,9 @@ use alloc::vec::Vec;
 
 use crate::activation::ActivationKind;
 use crate::buffer::Heap;
-use crate::dense::{DenseOptState, HeapDense};
+use crate::dense::{DenseOptState, HeapDense, HeapInferenceDense};
 use crate::dropout::HeapDropout;
+use crate::infer::{InferLayer, IntoInference};
 use crate::init::Initializer;
 use crate::layer::{Layer, Mode};
 use crate::optim::Optimizer;
@@ -263,6 +264,84 @@ impl Layer for Sequential {
     fn step<O: Optimizer>(&mut self, opt: &O, state: &mut Self::OptState<O>) {
         for (l, s) in self.layers.iter_mut().zip(state.iter_mut()) {
             l.step(opt, s);
+        }
+    }
+}
+
+/// Inferenz-Gegenstück zu [`Sequential`]: nur die Dense-Layer mit Gewichten und
+/// Biases, ohne Gradienten und ohne Dropout (in der Inferenz die Identität).
+///
+/// Entsteht über [`IntoInference::into_inference`]. Ein Netz ohne Dense-Layer
+/// gibt seine Eingabe unverändert zurück.
+#[derive(Clone, Debug)]
+pub struct InferSequential {
+    in_dim: usize,
+    layers: Vec<HeapInferenceDense<ActivationKind>>,
+}
+
+impl InferSequential {
+    /// Die verbliebenen Dense-Layer in Reihenfolge.
+    pub fn layers(&self) -> &[HeapInferenceDense<ActivationKind>] {
+        &self.layers
+    }
+}
+
+impl Params for InferSequential {
+    fn param_count(&self) -> usize {
+        self.layers.iter().map(|l| l.param_count()).sum()
+    }
+    fn visit_params<F: FnMut(&[f32])>(&self, f: &mut F) {
+        for l in &self.layers {
+            l.visit_params(f);
+        }
+    }
+    fn visit_params_mut<F: FnMut(&mut [f32])>(&mut self, f: &mut F) {
+        for l in &mut self.layers {
+            l.visit_params_mut(f);
+        }
+    }
+    fn visit_signatures<F: FnMut(LayerSig)>(&self, f: &mut F) {
+        for l in &self.layers {
+            l.visit_signatures(f);
+        }
+    }
+}
+
+impl InferLayer for InferSequential {
+    type Input = Vec<f32>;
+    type Output = Vec<f32>;
+
+    fn in_dim(&self) -> usize {
+        self.in_dim
+    }
+    fn out_dim(&self) -> usize {
+        self.layers.last().map_or(self.in_dim, |l| l.out_dim())
+    }
+    fn infer<'a>(&'a mut self, input: &'a [f32]) -> &'a [f32] {
+        assert_eq!(input.len(), self.in_dim, "falsche Eingabelänge");
+        let mut current = input;
+        for layer in self.layers.iter_mut() {
+            current = layer.infer(current);
+        }
+        current
+    }
+}
+
+impl IntoInference for Sequential {
+    type Inference = InferSequential;
+
+    fn into_inference(self) -> InferSequential {
+        let layers = self
+            .layers
+            .into_iter()
+            .filter_map(|layer| match layer {
+                DynLayer::Dense(d) => Some(d.into_inference()),
+                DynLayer::Dropout(_) => None,
+            })
+            .collect();
+        InferSequential {
+            in_dim: self.in_dim,
+            layers,
         }
     }
 }

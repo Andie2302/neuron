@@ -65,6 +65,7 @@ pub mod activation;
 pub mod buffer;
 pub mod dense;
 pub mod dropout;
+pub mod infer;
 pub mod init;
 pub mod layer;
 pub mod loss;
@@ -85,8 +86,9 @@ pub use activation::{
     Tanh,
 };
 pub use buffer::{Buffer, Stack, Storage};
-pub use dense::{Dense, DenseLayer};
+pub use dense::{Dense, DenseLayer, InferDense, InferenceDense};
 pub use dropout::{Dropout, DropoutLayer};
+pub use infer::{InferChain, InferLayer, IntoInference, Passthrough};
 pub use init::{Constant, HeNormal, HeUniform, Initializer, XavierNormal, XavierUniform};
 pub use layer::{Chain, Layer, Mode};
 pub use loss::{
@@ -105,11 +107,11 @@ pub use trainer::Trainer;
 #[cfg(feature = "alloc")]
 pub use buffer::Heap;
 #[cfg(feature = "alloc")]
-pub use dense::HeapDense;
+pub use dense::{HeapDense, HeapInferenceDense};
 #[cfg(feature = "alloc")]
 pub use dropout::HeapDropout;
 #[cfg(feature = "alloc")]
-pub use dynamic::{DynLayer, Sequential};
+pub use dynamic::{DynLayer, InferSequential, Sequential};
 
 /// Alles Wichtige auf einmal importieren.
 pub mod prelude {
@@ -117,12 +119,12 @@ pub mod prelude {
         argmax, sigmoid, softmax_inplace, Activation, ActivationKind, Adagrad, Adam, AdamW,
         BinaryCrossEntropy, BinaryCrossEntropyWithLogits, Buffer, Chain, Constant, ConstantLr,
         CosineAnnealing, Dense, Dropout, Elu, ExponentialDecay, Gelu, HeNormal, HeUniform, Huber,
-        Initializer, Layer, LeakyRelu, Linear, Loss, LrSchedule, Mae, Mish, Mode, ModelError,
-        Momentum, Mse, Optimizer, ParamError, ParamKind, Params, Pcg32, Relu, RmsProp,
-        RmsPropMomentum, Rng, Sgd, Sigmoid, SoftmaxCrossEntropy, Softplus, StepDecay, Swish, Tanh,
-        Trainer, Warmup, XavierNormal, XavierUniform,
+        InferDense, InferLayer, Initializer, IntoInference, Layer, LeakyRelu, Linear, Loss,
+        LrSchedule, Mae, Mish, Mode, ModelError, Momentum, Mse, Optimizer, ParamError, ParamKind,
+        Params, Pcg32, Relu, RmsProp, RmsPropMomentum, Rng, Sgd, Sigmoid, SoftmaxCrossEntropy,
+        Softplus, StepDecay, Swish, Tanh, Trainer, Warmup, XavierNormal, XavierUniform,
     };
 
     #[cfg(feature = "alloc")]
-    pub use crate::{HeapDense, HeapDropout, Sequential};
+    pub use crate::{HeapDense, HeapDropout, HeapInferenceDense, InferSequential, Sequential};
 }

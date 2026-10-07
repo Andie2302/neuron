@@ -268,3 +268,35 @@ fn model_save_load_inspect_and_fingerprint_never_touch_the_heap() {
         "{used} Heap-Allokationen in Modell-Speichern/-Laden"
     );
 }
+
+static BAKED: InferDense<2, 1, Relu> = InferDense::from_parts([[1.0, -1.0]], [0.5], Relu);
+
+#[test]
+fn inference_conversion_and_forward_never_touch_the_heap() {
+    let before = allocs();
+
+    let mut net = Dense::<2, 8, _>::new(Gelu)
+        .then(Dropout::<8>::new(0.1, 1))
+        .then(Dense::<8, 1, _>::new(Swish));
+    net.init(&XavierUniform, &mut Pcg32::seeded(9));
+    let mut bytes = [0u8; neuron::model::model_len(2 * 8 + 8 + 8 + 1)];
+    net.save_model(&mut bytes).unwrap();
+
+    let mut deployed = net.into_inference();
+    let mut sink = 0.0f32;
+    for x in &XS {
+        sink += deployed.infer(x)[0];
+    }
+    let mut restored = Dense::<2, 8, _>::new(Gelu)
+        .into_inference()
+        .then(Dense::<8, 1, _>::new(Swish).into_inference());
+    restored.load_model(&bytes).unwrap();
+    sink += restored.infer(&XS[1])[0];
+    let mut out = [0.0];
+    BAKED.infer_into(&[3.0, 1.0], &mut out);
+    sink += out[0];
+
+    let used = allocs() - before;
+    std::hint::black_box(sink);
+    assert_eq!(used, 0, "{used} Heap-Allokationen in der Inferenz");
+}
