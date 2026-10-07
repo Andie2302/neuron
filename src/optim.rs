@@ -52,6 +52,143 @@ impl ParamKind {
 }
 
 /// Aktualisiert Parameter anhand ihrer Gradienten.
+///
+/// Ein Optimizer kennt weder Netz noch Verlust, sondern nur einzelne **Parameter-Tensoren**
+/// (ein Dense-Layer hat zwei: die Gewichtsmatrix und den Bias). [`update`](Self::update) bekommt
+/// Parameter und Gradient als gleich geformte Puffer und verändert die Parameter. Der
+/// [`Trainer`](crate::trainer::Trainer) löst in [`apply`](crate::trainer::Trainer::apply) einen
+/// Optimierungsschritt aus, und der Ablauf ist:
+///
+/// 1. [`begin_step`](Self::begin_step) **einmal** je Schritt, vor allen Updates. Es ist die
+///    einzige Methode im Schrittablauf mit `&mut self` und der Ort für alles, was sich je
+///    Schritt global ändert (Adams Schrittzähler). Bei einem Mini-Batch ist ein Schritt der
+///    ganze Batch, nicht ein Sample.
+/// 2. [`update`](Self::update) **einmal je Tensor** mit `&self`, also bei unveränderten
+///    Hyperparametern, und dem Zustand dieses Tensors.
+///
+/// # Zustand je Tensor
+///
+/// `State<B>` ist der Hilfszustand eines Tensors mit Puffertyp `B`. Er ist ein generischer
+/// assoziierter Typ, damit er ohne Heap und ohne `generic_const_exprs` genau so groß sein kann
+/// wie der Tensor selbst (siehe die Moduldokumentation). [`init_state`](Self::init_state) legt
+/// ihn einmal je Tensor an; der [`Trainer`](crate::trainer::Trainer) besitzt ihn (gesammelt für
+/// alle Tensoren des Netzes) und reicht ihn dem Layer in jedem Schritt als `&mut` durch, der
+/// Layer gibt ihn an `update` weiter. Zustandslose Optimizer wie [`Sgd`] wählen
+/// `type State<B: Buffer> = ();` und brauchen damit weder Speicher noch Rechenzeit dafür;
+/// [`Momentum`] speichert je Tensor die Geschwindigkeit (`State<B> = B`), [`Adam`] zwei Puffer.
+///
+/// [`ParamKind`] sagt, ob der Tensor eine Gewichtsmatrix oder ein Bias ist: Weight Decay wirkt nur
+/// auf Gewichte. [`learning_rate`](Self::learning_rate) und
+/// [`set_learning_rate`](Self::set_learning_rate) sind die Schnittstelle, über die
+/// [`Trainer::set_learning_rate`](crate::trainer::Trainer::set_learning_rate) die Lernrate
+/// liest und setzt; so lässt sie sich aus einem [`LrSchedule`](crate::schedule::LrSchedule)
+/// steuern, den die Trainingsschleife des Aufrufers anwendet. Beide ändern nur die Lernrate:
+/// Der Tensor-Zustand `State<B>` ist in ihnen gar nicht erreichbar, und eigene Felder des
+/// Optimizers wie Adams Schrittzähler dürfen sie nicht verändern.
+///
+/// # Beispiel: ein eigener, zustandsloser Optimizer
+///
+/// Sign-SGD verschiebt jeden Parameter je Schritt um `lr` gegen das Vorzeichen seines Gradienten;
+/// der Betrag des Gradienten spielt keine Rolle. Das Beispiel prüft die Konvergenz auf einer
+/// quadratischen Zielfunktion von Hand, zeigt die Wirkung von `kind` und setzt den Optimizer dann
+/// im Trainer ein:
+///
+/// ```
+/// use neuron::prelude::*;
+///
+/// struct SignSgd {
+///     lr: f32,
+///     weight_decay: f32,
+///     steps: u32, // zählt die Aufrufe von `begin_step`
+/// }
+///
+/// impl SignSgd {
+///     fn new(lr: f32) -> Self {
+///         SignSgd { lr, weight_decay: 0.0, steps: 0 }
+///     }
+/// }
+///
+/// impl Optimizer for SignSgd {
+///     type State<B: Buffer> = (); // es gibt nichts zu merken
+///
+///     fn init_state<B: Buffer>(&self, _len: usize) -> Self::State<B> {}
+///
+///     fn begin_step(&mut self) {
+///         self.steps += 1;
+///     }
+///
+///     fn update<B: Buffer>(&self, _state: &mut (), params: &mut B, grads: &B, kind: ParamKind) {
+///         // Weight Decay nur auf Gewichte, nie auf den Bias.
+///         let decay = match kind {
+///             ParamKind::Weight => self.weight_decay,
+///             ParamKind::Bias => 0.0,
+///         };
+///         for (p, g) in params.as_mut_slice().iter_mut().zip(grads.as_slice()) {
+///             let sign = if *g > 0.0 {
+///                 1.0
+///             } else if *g < 0.0 {
+///                 -1.0
+///             } else {
+///                 0.0
+///             };
+///             *p -= self.lr * (sign + decay * *p);
+///         }
+///     }
+///
+///     fn learning_rate(&self) -> f32 {
+///         self.lr
+///     }
+///     fn set_learning_rate(&mut self, lr: f32) {
+///         self.lr = lr;
+///     }
+/// }
+///
+/// // 1. Von Hand: f(p) = Σ (p_i - c_i)² hat den Gradienten 2 (p_i - c_i) und das Minimum bei c.
+/// // Die Schrittweite halbiert sich alle 20 Schritte, sonst sprängen die Parameter um c herum.
+/// let target = [1.0f32, 2.0, -1.0];
+/// let mut p = [5.0f32, -3.0, 0.5];
+/// let mut opt = SignSgd::new(0.5);
+/// let mut state = opt.init_state::<[f32; 3]>(3); // zustandslos: `()`
+/// let plan = StepDecay::new(0.5, 0.5, 20);
+/// for step in 0..200 {
+///     let grads: [f32; 3] = core::array::from_fn(|i| 2.0 * (p[i] - target[i]));
+///     opt.set_learning_rate(plan.lr(step));
+///     opt.begin_step();
+///     opt.update(&mut state, &mut p, &grads, ParamKind::Weight);
+/// }
+/// assert_eq!(opt.steps, 200);
+/// for (p, c) in p.iter().zip(&target) {
+///     assert!((p - c).abs() < 0.01, "{p} statt {c}");
+/// }
+///
+/// // 2. `kind`: Weight Decay verkleinert die Gewichte, den Bias lässt er unberührt.
+/// let decaying = SignSgd { weight_decay: 0.5, ..SignSgd::new(0.1) };
+/// let (mut weight, mut bias) = ([2.0f32], [2.0f32]);
+/// let no_grad = [0.0f32];
+/// decaying.update(&mut (), &mut weight, &no_grad, ParamKind::Weight);
+/// decaying.update(&mut (), &mut bias, &no_grad, ParamKind::Bias);
+/// assert!((weight[0] - 1.9).abs() < 1e-6); // 2 - 0,1 · 0,5 · 2
+/// assert_eq!(bias[0], 2.0);
+///
+/// // 3. Im Trainer: Regression auf y = 3x - 1. Er ruft `begin_step` einmal je Mini-Batch und
+/// // `update` für die Gewichte und den Bias des Layers auf.
+/// let xs: [[f32; 1]; 20] = core::array::from_fn(|i| [i as f32 / 10.0 - 1.0]);
+/// let ys = xs.map(|[x]| [3.0 * x - 1.0]);
+/// let batch = || xs.iter().zip(&ys).map(|(x, y)| (&x[..], &y[..]));
+/// let mut trainer = Trainer::new(Dense::<1, 1, _>::new(Linear), Mse::new(), SignSgd::new(0.1));
+/// let plan = StepDecay::new(0.1, 0.5, 60);
+/// let before = trainer.evaluate_batch(batch());
+/// for step in 0..300 {
+///     trainer.set_learning_rate(plan.lr(step)); // landet in `SignSgd::set_learning_rate`
+///     trainer.train_batch(batch());
+/// }
+/// assert_eq!(trainer.learning_rate(), plan.lr(299));
+/// assert_eq!(trainer.optimizer_mut().steps, 300); // 300 Batches zu je 20 Samples
+/// assert!(trainer.evaluate_batch(batch()) < before / 1000.0);
+/// let mut learned = [0.0f32; 2]; // Gewicht, Bias
+/// trainer.network().copy_params_to_slice(&mut learned).unwrap();
+/// assert!((learned[0] - 3.0).abs() < 0.05 && (learned[1] + 1.0).abs() < 0.05);
+/// ```
 pub trait Optimizer {
     /// Zustand je Parameter-Tensor mit Puffertyp `B`.
     type State<B: Buffer>;

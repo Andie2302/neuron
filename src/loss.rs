@@ -41,6 +41,117 @@
 use crate::math;
 
 /// Austauschbare Verlustfunktion.
+///
+/// Ein Verlust bewertet die Vorhersage `pred` (die Ausgabe des Netzes) für **ein Sample** gegen
+/// das Ziel `target`. Der [`Trainer`](crate::trainer::Trainer) braucht zwei Dinge davon:
+/// [`value`](Self::value) für den Verlustwert (Rückgabe von `train_step`, `evaluate` und
+/// `evaluate_batch`) und [`gradient`](Self::gradient) für `dL/dpred`, den Startwert des
+/// Backward-Passes durch das Netz. Der Vertrag:
+///
+/// * `pred`, `target` und `grad` sind gleich lang (die Ausgangsdimension des Netzes). `value` ist
+///   ein Skalar je Sample; die eingebauten Verluste mitteln dazu über die `n` Ausgabeelemente.
+/// * `gradient` ist die Ableitung **genau dessen, was `value` zurückgibt**, einschließlich des
+///   Faktors `1/n` eines Mittelwerts. Weichen beide voneinander ab, lernt das Netz in eine falsche
+///   Richtung, ohne dass etwas meldet, warum. Die Probe ist der Vergleich mit zentralen
+///   Differenzen (im Beispiel unten).
+/// * `gradient` **überschreibt** `grad` vollständig: Der Trainer verwendet den Puffer für jedes
+///   Sample wieder.
+/// * Beide Methoden nehmen `&self` und allokieren nichts. Der Verlust darf Hyperparameter tragen,
+///   aber keinen veränderlichen Zustand. Das Mitteln über die Samples eines Mini-Batches
+///   übernimmt der Trainer, nicht der Verlust.
+///
+/// # Beispiel: ein eigener Verlust
+///
+/// `AsymmetricMse` ist ein quadratischer Fehler mit zwei Gewichten: Eine zu niedrige Vorhersage
+/// (`p < t`) zählt `under`-fach, eine zu hohe `over`-fach. Mit `under > over` zieht er die
+/// Vorhersage nach oben (Expektil-Regression). Das Beispiel prüft den Gradienten gegen zentrale
+/// Differenzen und trainiert dieselbe Regression mit [`Mse`] und mit dem eigenen Verlust:
+///
+/// ```
+/// use neuron::prelude::*;
+///
+/// struct AsymmetricMse {
+///     under: f32,
+///     over: f32,
+/// }
+///
+/// impl AsymmetricMse {
+///     fn weight(&self, p: f32, t: f32) -> f32 {
+///         if p < t {
+///             self.under
+///         } else {
+///             self.over
+///         }
+///     }
+/// }
+///
+/// impl Loss for AsymmetricMse {
+///     fn value(&self, pred: &[f32], target: &[f32]) -> f32 {
+///         let sum: f32 = pred
+///             .iter()
+///             .zip(target)
+///             .map(|(&p, &t)| self.weight(p, t) * (p - t) * (p - t))
+///             .sum();
+///         sum / pred.len() as f32 // Mittel über die Ausgabeelemente
+///     }
+///
+///     fn gradient(&self, pred: &[f32], target: &[f32], grad: &mut [f32]) {
+///         let n = pred.len() as f32;
+///         for ((g, &p), &t) in grad.iter_mut().zip(pred).zip(target) {
+///             // d/dp [w (p - t)² / n]; geschrieben wird mit `=`, nicht mit `+=`.
+///             *g = 2.0 * self.weight(p, t) * (p - t) / n;
+///         }
+///     }
+/// }
+///
+/// // 1. Gradientencheck (zentrale Differenz). Bei p == t springt die Krümmung (von `under` auf
+/// //    `over`); die Punkte liegen deshalb mit Abstand zum Ziel, damit die Differenz nicht über
+/// //    den Sprung hinweg rechnet.
+/// let loss = AsymmetricMse { under: 4.0, over: 1.0 };
+/// let pred = [0.5f32, 2.0, -1.0];
+/// let target = [1.0f32, 1.0, 0.0];
+/// assert_eq!(loss.value(&pred, &target), (4.0 * 0.25 + 1.0 + 4.0 * 1.0) / 3.0);
+///
+/// let mut analytic = [0.0f32; 3];
+/// loss.gradient(&pred, &target, &mut analytic);
+/// for i in 0..3 {
+///     let h = 1e-2;
+///     let (mut up, mut down) = (pred, pred);
+///     up[i] += h;
+///     down[i] -= h;
+///     let numeric = (loss.value(&up, &target) - loss.value(&down, &target)) / (2.0 * h);
+///     assert!((numeric - analytic[i]).abs() < 1e-3, "p{i}: {numeric} vs {}", analytic[i]);
+/// }
+///
+/// // 2. Training: Punkte um y = 2x + 1 mit gleichverteiltem Rauschen in ±0,5.
+/// let mut rng = Pcg32::seeded(8);
+/// let xs: [[f32; 1]; 64] = core::array::from_fn(|i| [i as f32 / 32.0 - 1.0]);
+/// let ys = xs.map(|[x]| [2.0 * x + 1.0 + rng.uniform(-0.5, 0.5)]);
+///
+/// // Dieselbe Regression mit beliebigem Verlust; Ergebnis: (Gewicht, Bias).
+/// fn fit<Ls: Loss>(loss: Ls, xs: &[[f32; 1]], ys: &[[f32; 1]]) -> (f32, f32) {
+///     let mut trainer = Trainer::new(Dense::<1, 1, _>::new(Linear), loss, Adam::new(0.05));
+///     for _ in 0..400 {
+///         trainer.train_batch(xs.iter().zip(ys).map(|(x, y)| (&x[..], &y[..])));
+///     }
+///     let mut p = [0.0f32; 2];
+///     trainer.network().copy_params_to_slice(&mut p).unwrap();
+///     (p[0], p[1])
+/// }
+///
+/// // Der Standardverlust trifft die Gerade; die Rauschmitte liegt bei 0.
+/// let (w_mse, b_mse) = fit(Mse::new(), &xs, &ys);
+/// assert!((w_mse - 2.0).abs() < 0.3 && (b_mse - 1.0).abs() < 0.15);
+///
+/// // Der eigene Verlust bestraft zu niedrige Vorhersagen vierfach: Die Gerade wandert nach oben.
+/// let (w_asym, b_asym) = fit(AsymmetricMse { under: 4.0, over: 1.0 }, &xs, &ys);
+/// assert!((w_asym - 2.0).abs() < 0.3);
+/// assert!(b_asym > b_mse + 0.05, "Bias {b_asym} gegenüber {b_mse}");
+///
+/// // Entsprechend liegen weniger Punkte über der Geraden (die Vorhersage ist zu niedrig).
+/// let above = |w: f32, b: f32| xs.iter().zip(&ys).filter(|(x, y)| w * x[0] + b < y[0]).count();
+/// assert!(above(w_asym, b_asym) + 4 < above(w_mse, b_mse));
+/// ```
 pub trait Loss {
     /// Verlust für eine Vorhersage `pred` und das Ziel `target`.
     fn value(&self, pred: &[f32], target: &[f32]) -> f32;
