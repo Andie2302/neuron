@@ -502,3 +502,36 @@ fn xor_with_logits_loss_and_sigmoid_only_at_inference() {
         }
     }
 }
+
+/// `(w, b)` nach dem Training auf konstantem Ziel 5 bei Eingabe 0: das Gewicht
+/// beeinflusst den Verlust nicht (x = 0), es kann also nur zerfallen; der Bias
+/// muss das Ziel erreichen.
+fn fit_constant_target<O: Optimizer>(opt: O, steps: usize) -> (f32, f32) {
+    let mut net = Dense::<1, 1, _>::new(Linear);
+    net.init(&Constant(1.0), &mut Pcg32::seeded(0));
+    let mut t = Trainer::new(net, Mse, opt);
+    for _ in 0..steps {
+        t.train_step(&[0.0], &[5.0]);
+    }
+    (
+        t.network().weights_as_slice()[0],
+        t.network().bias_as_slice()[0],
+    )
+}
+
+#[test]
+fn weight_decay_shrinks_the_weight_but_leaves_the_bias_alone() {
+    // Sgd: ohne Bias-Ausnahme läge das Gleichgewicht bei b = 2·5/(2 + wd) = 4.
+    let (w, b) = fit_constant_target(Sgd::new(0.1).with_weight_decay(0.5), 400);
+    assert!(w.abs() < 1e-3, "Gewicht müsste zerfallen sein: {w}");
+    assert!((b - 5.0).abs() < 1e-3, "Bias wurde mit zerfallen: {b}");
+
+    let (w, b) = fit_constant_target(Momentum::new(0.05, 0.9).with_weight_decay(0.5), 600);
+    assert!(w.abs() < 1e-2, "Momentum: Gewicht {w}");
+    assert!((b - 5.0).abs() < 1e-2, "Momentum: Bias {b}");
+
+    // AdamW: mit Bias-Zerfall läge das Gleichgewicht bei ≈ 1/wd = 1.
+    let (w, b) = fit_constant_target(AdamW::new(0.05).with_weight_decay(1.0), 2000);
+    assert!(w.abs() < 0.05, "AdamW: Gewicht {w}");
+    assert!((b - 5.0).abs() < 0.1, "AdamW: Bias {b}");
+}

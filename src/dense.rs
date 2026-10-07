@@ -21,7 +21,7 @@ use crate::activation::Activation;
 use crate::buffer::{Buffer, Stack, Storage};
 use crate::init::Initializer;
 use crate::layer::{Layer, Mode, ParamError};
-use crate::optim::Optimizer;
+use crate::optim::{Optimizer, ParamKind};
 use crate::rng::Rng;
 
 /// Dense-Layer mit Const-Generic-Dimensionen auf dem Stack.
@@ -290,7 +290,7 @@ impl<S: Storage, A: Activation> Layer for DenseLayer<S, A> {
     }
 
     fn step<O: Optimizer>(&mut self, opt: &O, state: &mut Self::OptState<O>) {
-        opt.update(&mut state.0, &mut self.w, &self.gw);
-        opt.update(&mut state.1, &mut self.b, &self.gb);
+        opt.update(&mut state.0, &mut self.w, &self.gw, ParamKind::Weight);
+        opt.update(&mut state.1, &mut self.b, &self.gb, ParamKind::Bias);
     }
 }

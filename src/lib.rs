@@ -91,7 +91,9 @@ pub use loss::{
     BinaryCrossEntropy, BinaryCrossEntropyWithLogits, Huber, Loss, Mae, Mse, SoftmaxCrossEntropy,
 };
 pub use math::{argmax, sigmoid, softmax_inplace};
-pub use optim::{Adagrad, Adam, AdamW, Momentum, Optimizer, RmsProp, Sgd};
+pub use optim::{
+    Adagrad, Adam, AdamW, Momentum, Optimizer, ParamKind, RmsProp, RmsPropMomentum, Sgd,
+};
 pub use rng::{Pcg32, Rng};
 pub use schedule::{ConstantLr, CosineAnnealing, ExponentialDecay, LrSchedule, StepDecay, Warmup};
 pub use trainer::Trainer;
@@ -112,8 +114,9 @@ pub mod prelude {
         BinaryCrossEntropy, BinaryCrossEntropyWithLogits, Buffer, Chain, Constant, ConstantLr,
         CosineAnnealing, Dense, Dropout, Elu, ExponentialDecay, Gelu, HeNormal, HeUniform, Huber,
         Initializer, Layer, LeakyRelu, Linear, Loss, LrSchedule, Mae, Mish, Mode, Momentum, Mse,
-        Optimizer, ParamError, Pcg32, Relu, RmsProp, Rng, Sgd, Sigmoid, SoftmaxCrossEntropy,
-        Softplus, StepDecay, Swish, Tanh, Trainer, Warmup, XavierNormal, XavierUniform,
+        Optimizer, ParamError, ParamKind, Pcg32, Relu, RmsProp, RmsPropMomentum, Rng, Sgd, Sigmoid,
+        SoftmaxCrossEntropy, Softplus, StepDecay, Swish, Tanh, Trainer, Warmup, XavierNormal,
+        XavierUniform,
     };
 
     #[cfg(feature = "alloc")]
