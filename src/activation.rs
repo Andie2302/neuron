@@ -860,6 +860,9 @@ mod tests {
         assert_eq!(HardSwish.derivative(3.0, 3.0), 1.0);
         assert_eq!(HardSigmoid.derivative(3.0, 1.0), 0.0);
         assert_eq!(HardTanh.derivative(1.0, 1.0), 0.0);
+        // untere Knicke
+        assert_eq!(HardSigmoid.derivative(-3.0, 0.0), 0.0);
+        assert_eq!(HardTanh.derivative(-1.0, -1.0), 0.0);
         assert!((HardSwish.derivative(0.0, 0.0) - 0.5).abs() < 1e-7);
         assert!((HardSigmoid.derivative(0.0, 0.5) - 1.0 / 6.0).abs() < 1e-7);
     }
@@ -893,6 +896,85 @@ mod tests {
         assert_eq!(Softsign.derivative(1e30, 0.0), 0.0);
         assert_eq!(HardSwish.apply(1e30), 1e30);
         assert_eq!(HardSwish.derivative(1e30, 0.0), 1.0);
+    }
+
+    /// Jede Enum-Variante muss exakt dieselbe Funktion sein wie ihr statischer Typ. Der
+    /// Vergleich mit dem Enum selbst (wie in den Finite-Differenzen-Tests) würde eine
+    /// falsch verdrahtete, aber in sich konsistente Variante nicht bemerken.
+    fn same<A: Activation>(name: &str, stat: A, kind: ActivationKind) {
+        for &x in &[-9.0f32, -4.0, -2.0, -0.7, 0.0, 0.3, 1.7, 3.5, 7.0] {
+            let y = stat.apply(x);
+            assert_eq!(y.to_bits(), kind.apply(x).to_bits(), "{name}.apply({x})");
+            assert_eq!(
+                stat.derivative(x, y).to_bits(),
+                kind.derivative(x, y).to_bits(),
+                "{name}.derivative({x})"
+            );
+        }
+        assert_eq!(stat.signature(), kind.signature(), "{name}.signature");
+    }
+
+    #[test]
+    fn every_enum_variant_is_exactly_its_static_type() {
+        same("Linear", Linear, ActivationKind::Linear);
+        same("Relu", Relu, ActivationKind::Relu);
+        same(
+            "LeakyRelu",
+            LeakyRelu { alpha: 0.2 },
+            ActivationKind::LeakyRelu(0.2),
+        );
+        same("Sigmoid", Sigmoid, ActivationKind::Sigmoid);
+        same("Tanh", Tanh, ActivationKind::Tanh);
+        same("Gelu", Gelu, ActivationKind::Gelu);
+        same("Swish", Swish, ActivationKind::Swish);
+        same("Elu", Elu { alpha: 0.7 }, ActivationKind::Elu(0.7));
+        same("Softplus", Softplus, ActivationKind::Softplus);
+        same("Mish", Mish, ActivationKind::Mish);
+        same("Relu6", Relu6, ActivationKind::Relu6);
+        same("HardSigmoid", HardSigmoid, ActivationKind::HardSigmoid);
+        same("HardSwish", HardSwish, ActivationKind::HardSwish);
+        same("HardTanh", HardTanh, ActivationKind::HardTanh);
+        same("Softsign", Softsign, ActivationKind::Softsign);
+    }
+
+    #[test]
+    fn signature_ids_are_pinned_because_they_are_part_of_the_file_format() {
+        assert_eq!(
+            [
+                Linear.signature(),
+                Relu.signature(),
+                Sigmoid.signature(),
+                Tanh.signature(),
+                Gelu.signature(),
+                Swish.signature(),
+                Softplus.signature(),
+                Mish.signature(),
+                Relu6.signature(),
+                HardSigmoid.signature(),
+                HardSwish.signature(),
+                HardTanh.signature(),
+                Softsign.signature(),
+            ],
+            [1, 2, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15]
+        );
+        // Mit Parameter: CRC32 über [Kennung, Bitmuster des Parameters als f32 little endian].
+        let bytes = |id: u8, p: f32| {
+            let b = p.to_bits().to_le_bytes();
+            [id, b[0], b[1], b[2], b[3]]
+        };
+        assert_eq!(
+            LeakyRelu { alpha: 0.1 }.signature(),
+            crate::model::crc32(&bytes(3, 0.1))
+        );
+        assert_eq!(
+            Elu { alpha: 0.8 }.signature(),
+            crate::model::crc32(&bytes(8, 0.8))
+        );
+        // Gleiches alpha, andere Funktion -> andere Kennung (die Id fließt ein).
+        assert_ne!(
+            LeakyRelu { alpha: 0.5 }.signature(),
+            Elu { alpha: 0.5 }.signature()
+        );
     }
 
     #[test]

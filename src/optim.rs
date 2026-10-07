@@ -6,7 +6,7 @@
 //! *generisches assoziiertes Typ* über den Puffertyp des Tensors:
 //!
 //! ```text
-//! type State<B: Buffer>;   // Sgd: ()   Momentum/Adagrad/RmsProp: B   Adam/AdamW: AdamState<B>   RmsPropMomentum: RmsPropState<B>
+//! type State<B: Buffer>;   // Sgd: ()   Momentum/Adagrad/RmsProp/Lion: B   Adam/AdamW: AdamState<B>   RmsPropMomentum: RmsPropState<B>
 //! ```
 //!
 //! Für ein Gewichts-Array `[[f32; IN]; OUT]` ist der Zustand also wieder ein
@@ -1245,6 +1245,28 @@ mod tests {
         let weights = size_of::<<Lion as Optimizer>::State<[[f32; 16]; 16]>>();
         let adam = size_of::<<Adam as Optimizer>::State<[[f32; 16]; 16]>>();
         assert_eq!(adam - weights, 16 * 16 * 4);
+    }
+
+    #[test]
+    fn lion_uses_beta1_for_the_direction_and_beta2_for_the_momentum() {
+        // β₁ = 0.2, β₂ = 0.9, lr = 1. Drei Schritte, in denen sich die Rollen unterscheiden lassen:
+        //   1) g = +1:   c = 0.8·1 = 0.8 > 0 -> p -= 1;         m = 0.1·1 = 0.1
+        //   2) g = -0.5: c = β₁·m + (1-β₁)·g = 0.02 - 0.4 = -0.38 < 0 -> p += 1;
+        //                (mit β₂ in c: 0.09 - 0.05 = +0.04 > 0, also das Gegenteil)
+        //                m = β₂·m + (1-β₂)·g = 0.09 - 0.05 = 0.04
+        //   3) g = 0:    c = β₁·m = 0.008 > 0 -> p -= 1
+        //                (mit β₁ in m wäre m = 0.2·0.1 + 0.8·(-0.5) = -0.38, c < 0)
+        let opt = Lion::new(1.0).with_betas(0.2, 0.9);
+        let mut m = opt.init_state::<[f32; 1]>(1);
+        let mut p = [0.0];
+        opt.update(&mut m, &mut p, &[1.0], ParamKind::Weight);
+        assert_eq!(p, [-1.0]);
+        assert!((m[0] - 0.1).abs() < 1e-6, "m = {m:?}");
+        opt.update(&mut m, &mut p, &[-0.5], ParamKind::Weight);
+        assert_eq!(p, [0.0], "Richtung nutzt β₁ und den alten Impuls");
+        assert!((m[0] - 0.04).abs() < 1e-6, "Impuls nutzt β₂: m = {m:?}");
+        opt.update(&mut m, &mut p, &[0.0], ParamKind::Weight);
+        assert_eq!(p, [-1.0], "der Impuls trägt die Richtung weiter");
     }
 
     #[test]

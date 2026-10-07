@@ -50,7 +50,7 @@ Vollständig: [`examples/xor.rs`](examples/xor.rs). Das gesamte Training
 | `Params`        | Parameter lesen/schreiben, Fingerprint, Modell speichern/laden | alle Layer und Inferenz-Layer |
 | `Layer`         | `forward` / `backward` / `step` ...    | `Dense<IN, OUT, A>`, `Dropout<N>`, `Chain<A, B>`; mit `alloc`: `HeapDense`, `HeapDropout`, `Sequential` |
 | `InferLayer`    | nur `infer` (kein Training)            | `InferDense<IN, OUT, A>`, `InferChain<A, B>`, `Passthrough<N>`; mit `alloc`: `InferSequential` |
-| `IntoInference` | `net.into_inference()`                 | `Dense`, `Dropout`, `Chain`, (`alloc`) `Sequential` |
+| `IntoInference` | `net.into_inference()`                 | `Dense`, `Dropout` (Stack: `Passthrough`, Heap: `HeapPassthrough`), `Chain`, (`alloc`) `Sequential` |
 | `Buffer`        | `f32`-Speicher                         | `[f32; N]`, `[[f32; C]; R]`, `Vec<f32>` (`alloc`) |
 | `Storage`       | Puffertypen eines Dense-Layers         | `Stack<IN, OUT>`, `Heap` (`alloc`) |
 
@@ -64,7 +64,7 @@ Dropout hat einen expliziten Schalter: jeder `forward`-Aufruf bekommt einen
 (Sigmoid-Ausgang). In `f32` ist `σ(z)` für `z ≳ 17` exakt `1.0`, dann ist die Ableitung
 `y(1−y)` exakt `0` und der Gradient verschwindet – auch bei völlig falscher Vorhersage (Ziel `0`,
 Ausgabe `1.0`): das Netz bleibt für immer hängen. `BinaryCrossEntropyWithLogits` arbeitet auf den
-rohen Logits einer `Linear`-Ausgabe (Verlust `max(z,0) − t·z + ln(1+e^−|z|)`, Gradient `σ(z) − t`);
+rohen Logits einer `Linear`-Ausgabe (Verlust `max(z,0) − t·z + ln(1+e^−|z|)`, Gradient `(σ(z) − t)/n` über `n` Ausgänge, bei einem Ausgang `σ(z) − t`);
 Sigmoid und Logarithmus kürzen sich heraus, der Gradient bleibt voll erhalten.
 `tests/training_extensions.rs` trainiert dasselbe schlecht gestartete Netz mit beiden Verlusten:
 mit dem alten friert das Gewicht exakt ein, mit dem neuen erholt es sich. `math::sigmoid` macht
@@ -139,7 +139,12 @@ let y = deployed.infer(&[0.5, -0.5]);
 * Die Ausgaben sind **bitgleich** zu `forward(.., Mode::Inference)`: Training und Inferenz teilen
   sich dieselbe Rechenvorschrift (`pre_activation`).
 * `InferenceDense::infer_into(&self, ..)` braucht keinen veränderlichen Zustand, und `from_parts`
-  ist eine `const fn`: ein Netz kann als `static` mit den Gewichten im Flash liegen.
+  ist eine `const fn`: ein **einzelner Layer** kann als `static` mit den Gewichten im Flash liegen.
+  Mehrere Layer sind je ein `static`, von Hand über `infer_into` verkettet; ein `InferChain` braucht
+  `&mut self` für seine Ausgabepuffer und passt nicht in ein `static` (siehe `TODO.md`).
+* `infer` bindet das Ergebnis an *beide* Borrows (Netz und Eingabe), damit `Passthrough` die Eingabe
+  ohne Kopie zurückgeben kann. Folge: `net.infer(&sensor())` mit einem Temporary als Eingabe ist nur
+  nutzbar, wenn das Ergebnis im selben Statement verbraucht wird; sonst die Eingabe an eine Variable binden.
 * Die Dimensionsprüfung bleibt zur Compilezeit (`Input = Output`), auch für `InferChain`.
 
 ## Modellformat: sicher speichern und laden
@@ -247,7 +252,7 @@ Für große Netze liegt der `Trainer` entweder in einem `static`/`static mut`
 | BCE-Sättigung behoben | `tests/training_extensions.rs` (altes Netz friert exakt ein, Logit-Verlust erholt sich) und Unit-Tests (gesättigte und extreme Logits) |
 | Bias bleibt vom Zerfall verschont | Unit-Tests je Optimizer und Ende-zu-Ende-Test (`b = 5` statt `4`) |
 | `RmsProp`/`Lion`-Zustandsgröße | `size_of`-Tests (ein bzw. zwei Puffer) |
-| Modellformat | `tests/model_format.rs` (CRC32-Normvektoren, **Golden-Bytes**, jedes einzelne gekippte Bit und jede Kürzung abgelehnt, Fuzz mit Zufallsbytes, Architektur-Abweichungen) |
+| Modellformat | `tests/model_format.rs` (**Golden-Bytes**, jedes einzelne gekippte Bit und jede Kürzung abgelehnt, Fuzz mit Zufallsbytes, Architektur-Abweichungen) und Unit-Tests in `src/model.rs` (CRC32-Normvektoren) |
 | Inferenz spart Speicher, rechnet gleich | `tests/inference.rs` (`size_of_val`, bitgleiche Ausgaben für jede `ActivationKind`, `static` im Flash) |
 | Parameter-Import/-Export | `tests/params_io.rs` (Layout, atomare Fehler, Roundtrip, handgeschriebene `const`-Gewichte, Stack ↔ Heap) |
 | Stack ≡ Heap | `tests/dynamic.rs` (bitgleiche Verluste/Vorhersagen, auch mit Clipping) |

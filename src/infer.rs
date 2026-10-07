@@ -63,6 +63,13 @@ pub trait InferLayer: Params {
     ///
     /// Das Ergebnis lebt im internen Puffer des Layers – oder ist `input` selbst
     /// (z. B. bei [`Passthrough`], das nichts kopiert).
+    ///
+    /// **Lebensdauer:** Das Ergebnis ist an *beide* Borrows gebunden (`&mut self` und
+    /// `input`) und darf deshalb nicht länger leben als die Eingabe. Eine Eingabe als
+    /// Temporary (`net.infer(&sensor())`) lässt sich nur verwenden, wenn das Ergebnis im
+    /// selben Statement verbraucht wird; sonst die Eingabe zuerst an eine Variable binden.
+    /// Das ist der Preis dafür, dass [`Passthrough`] seine Eingabe zurückgeben darf, ohne
+    /// zu kopieren.
     fn infer<'a>(&'a mut self, input: &'a [f32]) -> &'a [f32];
 
     /// Hängt `next` hinten an. Passen die Dimensionen bei Stack-Layern nicht

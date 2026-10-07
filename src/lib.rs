@@ -13,12 +13,14 @@
 //! |---------------|------------------------------------------|-----------------------------------------------------|
 //! | [`Buffer`]    | `f32`-Speicher (Stack/Heap)              | `[f32; N]`, `[[f32; C]; R]`, `Vec<f32>` (`alloc`)   |
 //! | [`Storage`]   | Puffertypen eines Dense-Layers           | [`Stack`], `Heap` (`alloc`)                         |
-//! | [`Activation`]| Aktivierung + Ableitung                  | [`Linear`], [`Relu`], [`LeakyRelu`], [`Sigmoid`], [`Tanh`], [`Gelu`], [`Swish`], [`Elu`], [`Softplus`], [`Mish`], [`ActivationKind`] |
+//! | [`Activation`]| Aktivierung + Ableitung + Kennung        | [`Linear`], [`Relu`], [`LeakyRelu`], [`Sigmoid`], [`Tanh`], [`Gelu`], [`Swish`], [`Elu`], [`Softplus`], [`Mish`]; ohne `exp`/`tanh`: [`Relu6`], [`HardSigmoid`], [`HardSwish`], [`HardTanh`], [`Softsign`]; [`ActivationKind`] |
 //! | [`Loss`]      | Verlust + Gradient                       | [`Mse`], [`Mae`], [`Huber`], [`BinaryCrossEntropy`], [`BinaryCrossEntropyWithLogits`], [`SoftmaxCrossEntropy`] |
 //! | [`Initializer`]| Gewichtsinitialisierung                 | [`Constant`], [`XavierUniform`], [`XavierNormal`], [`HeUniform`], [`HeNormal`] |
-//! | [`Optimizer`] | Parameter-Update (+ Zustand je Tensor)   | [`Sgd`], [`Momentum`], [`Adam`], [`AdamW`], [`RmsProp`], [`Adagrad`] |
+//! | [`Optimizer`] | Parameter-Update (+ Zustand je Tensor)   | [`Sgd`], [`Momentum`], [`Adam`], [`AdamW`], [`Lion`], [`RmsProp`], [`RmsPropMomentum`], [`Adagrad`] |
 //! | [`LrSchedule`]| Lernrate je Schritt                      | [`ConstantLr`], [`StepDecay`], [`ExponentialDecay`], [`CosineAnnealing`], [`Warmup`] |
+//! | [`Params`]    | Parameter lesen/schreiben, Fingerprint, Modell speichern/laden | alle Layer und Inferenz-Layer |
 //! | [`Layer`]     | Baustein mit Forward/Backward            | [`Dense`], [`Dropout`], [`Chain`], `Sequential` (`alloc`) |
+//! | [`InferLayer`]| Baustein nur zum Rechnen (kein Training) | [`InferDense`], [`InferChain`], [`Passthrough`], `InferSequential` (`alloc`); erzeugt über [`IntoInference`] |
 //!
 //! ## Stack und Heap hinter denselben Traits
 //!
@@ -111,7 +113,7 @@ pub use dense::{HeapDense, HeapInferenceDense};
 #[cfg(feature = "alloc")]
 pub use dropout::HeapDropout;
 #[cfg(feature = "alloc")]
-pub use dynamic::{DynLayer, InferSequential, Sequential};
+pub use dynamic::{DynLayer, HeapPassthrough, InferSequential, Sequential};
 
 /// Alles Wichtige auf einmal importieren.
 pub mod prelude {

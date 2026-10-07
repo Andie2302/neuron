@@ -154,6 +154,18 @@ fn train_briefly<O: Optimizer>(opt: O) -> f32 {
     sum + t.predict(&XS[0])[0]
 }
 
+/// Trainiert kurz ein kleines Netz mit der gegebenen (statischen) Aktivierung.
+fn train_with_activation<A: Activation + Copy>(act: A) -> f32 {
+    let mut net = Dense::<2, 3, _>::new(act).then(Dense::<3, 1, _>::new(Linear));
+    net.init(&XavierUniform, &mut Pcg32::seeded(2));
+    let mut t = Trainer::new(net, Mse, Sgd::new(0.01));
+    let mut sum = 0.0;
+    for i in 0..20 {
+        sum += t.train_step(&XS[i % 4], &YS[i % 4]);
+    }
+    sum + t.predict(&XS[0])[0]
+}
+
 /// Trainiert kurz mit dem gegebenen Verlust (Softmax-Cross-Entropy braucht Ziele, die
 /// zu einer Verteilung summieren – hier genügt eine feste, gültige Zielverteilung).
 fn train_with_loss<Ls: Loss>(loss: Ls) -> f32 {
@@ -201,6 +213,23 @@ fn every_activation_optimizer_loss_and_schedule_never_touches_the_heap() {
         }
         sink += t.predict(&XS[0])[0];
     }
+
+    // Jede Aktivierung als statischer Typ (nicht nur über das Enum).
+    sink += train_with_activation(Linear);
+    sink += train_with_activation(Relu);
+    sink += train_with_activation(LeakyRelu::default());
+    sink += train_with_activation(Sigmoid);
+    sink += train_with_activation(Tanh);
+    sink += train_with_activation(Gelu);
+    sink += train_with_activation(Swish);
+    sink += train_with_activation(Elu::default());
+    sink += train_with_activation(Softplus);
+    sink += train_with_activation(Mish);
+    sink += train_with_activation(Relu6);
+    sink += train_with_activation(HardSigmoid);
+    sink += train_with_activation(HardSwish);
+    sink += train_with_activation(HardTanh);
+    sink += train_with_activation(Softsign);
 
     // Jeder Optimizer (inklusive Weight Decay, Nesterov und Momentum bei RMSprop).
     sink += train_briefly(Sgd::new(0.01));

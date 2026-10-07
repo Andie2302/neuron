@@ -12,7 +12,7 @@ const XS: [[f32; 3]; 4] = [
     [3.0, 3.0, -3.0],
 ];
 
-const KINDS: [ActivationKind; 10] = [
+const KINDS: [ActivationKind; 15] = [
     ActivationKind::Linear,
     ActivationKind::Relu,
     ActivationKind::LeakyRelu(0.1),
@@ -23,6 +23,11 @@ const KINDS: [ActivationKind; 10] = [
     ActivationKind::Elu(0.8),
     ActivationKind::Softplus,
     ActivationKind::Mish,
+    ActivationKind::Relu6,
+    ActivationKind::HardSigmoid,
+    ActivationKind::HardSwish,
+    ActivationKind::HardTanh,
+    ActivationKind::Softsign,
 ];
 
 // ------------------------------------------------------------------ Speicher
@@ -177,11 +182,29 @@ fn conversion_keeps_parameters_fingerprint_and_model_format() {
     b.copy_from_slice(fresh.infer(&XS[0]));
     assert_eq!(a, b);
 
-    // ... und eine falsche Architektur wird auch dort abgelehnt.
-    let mut wrong = Dense::<3, 4, _>::new(Relu).into_inference();
-    assert!(wrong
-        .load_model(&bytes[..neuron::model::model_len(16)])
-        .is_err());
+    // ... und eine falsche Architektur wird auch dort abgelehnt – mit dem *richtigen* Grund
+    // (Fingerprint), nicht schon an der Länge: gleiche Parameterzahl 16, aber
+    //   a) andere Aktivierung   b) andere Dimensionen.
+    let mut source = Dense::<3, 4, _>::new(Tanh).into_inference();
+    // Nicht-triviale Werte, damit das gespeicherte Modell kein Nullmodell ist.
+    source.copy_params_from_slice(&[0.25; 16]).unwrap();
+    let mut model = [0u8; neuron::model::model_len(16)];
+    source.save_model(&mut model).unwrap();
+    let mut other_activation = Dense::<3, 4, _>::new(Relu).into_inference();
+    assert_eq!(other_activation.param_count(), 16);
+    assert!(matches!(
+        other_activation.load_model(&model),
+        Err(ModelError::ArchitectureMismatch { .. })
+    ));
+    let mut other_shape = Dense::<1, 8, _>::new(Tanh).into_inference();
+    assert_eq!(other_shape.param_count(), 16);
+    assert!(matches!(
+        other_shape.load_model(&model),
+        Err(ModelError::ArchitectureMismatch { .. })
+    ));
+    // Gegenprobe: dieselbe Architektur lädt.
+    let mut same = Dense::<3, 4, _>::new(Tanh).into_inference();
+    same.load_model(&model).unwrap();
 }
 
 #[test]
@@ -279,6 +302,43 @@ mod heap {
         let r = std::panic::catch_unwind(|| {
             HeapInferenceDense::new(2, 4, Relu).then(HeapInferenceDense::new(5, 1, Relu))
         });
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn a_heap_chain_with_heap_dropout_converts_to_inference() {
+        let mut net = HeapDense::new(3, 5, Gelu)
+            .then(HeapDropout::new(5, 0.3, 1))
+            .then(HeapDense::new(5, 2, Swish));
+        net.init(&XavierUniform, &mut Pcg32::seeded(4));
+        let fingerprint = net.fingerprint();
+        let mut reference = Vec::new();
+        for x in &XS {
+            reference.push(net.forward(x, Mode::Inference).to_vec());
+        }
+
+        let mut infer = net.into_inference();
+        assert_eq!(
+            infer.fingerprint(),
+            fingerprint,
+            "Dropout trägt nichts zum Fingerprint bei"
+        );
+        for (x, expected) in XS.iter().zip(&reference) {
+            let got = infer.infer(x).to_vec();
+            assert_eq!(
+                got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn heap_passthrough_copies_nothing_and_checks_the_length() {
+        let mut p = neuron::HeapPassthrough::new(3);
+        let input = [1.0, 2.0, 3.0];
+        assert!(core::ptr::eq(p.infer(&input).as_ptr(), input.as_ptr()));
+        assert_eq!((p.in_dim(), p.out_dim(), p.param_count()), (3, 3, 0));
+        let r = std::panic::catch_unwind(|| neuron::HeapPassthrough::new(3).infer(&[1.0]).len());
         assert!(r.is_err());
     }
 

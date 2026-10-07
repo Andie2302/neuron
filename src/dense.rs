@@ -448,7 +448,18 @@ impl<const IN: usize, const OUT: usize, A: Activation> InferenceDense<Stack<IN, 
     /// LAYER.infer_into(&[3.0, 1.0], &mut out); // relu(3 - 1 + 0.5)
     /// assert_eq!(out, [2.5]);
     /// ```
+    ///
+    /// Null-Dimensionen sind wie bei [`new`](Self::new) ein Compilerfehler:
+    ///
+    /// ```compile_fail
+    /// use neuron::prelude::*;
+    ///
+    /// let _ = InferDense::<0, 1, Relu>::from_parts([[]], [0.5], Relu);
+    /// ```
     pub const fn from_parts(weights: [[f32; IN]; OUT], bias: [f32; OUT], act: A) -> Self {
+        const {
+            assert!(IN > 0 && OUT > 0, "Dimensionen müssen > 0 sein");
+        }
         InferenceDense {
             shape: Stack,
             act,

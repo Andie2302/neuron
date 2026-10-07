@@ -345,3 +345,58 @@ impl IntoInference for Sequential {
         }
     }
 }
+
+/// Dropout-Ersatz für Heap-Netze in der Inferenz: gibt die Eingabe unverändert zurück.
+///
+/// Das Gegenstück zu [`Passthrough`](crate::infer::Passthrough) für Netze, deren Dimension
+/// erst zur Laufzeit feststeht. Hat keine Parameter und taucht weder im Export noch im
+/// Fingerprint auf. Entsteht über [`IntoInference::into_inference`] aus einem
+/// [`HeapDropout`], etwa in einer `Chain` aus Heap-Layern.
+#[derive(Clone, Copy, Debug)]
+pub struct HeapPassthrough {
+    dim: usize,
+}
+
+impl HeapPassthrough {
+    /// Identität über `dim` Features.
+    ///
+    /// # Panics
+    /// Bei `dim == 0`.
+    pub fn new(dim: usize) -> Self {
+        assert!(dim > 0, "Dimension muss > 0 sein");
+        HeapPassthrough { dim }
+    }
+}
+
+impl Params for HeapPassthrough {
+    fn param_count(&self) -> usize {
+        0
+    }
+    fn visit_params<F: FnMut(&[f32])>(&self, _f: &mut F) {}
+    fn visit_params_mut<F: FnMut(&mut [f32])>(&mut self, _f: &mut F) {}
+    fn visit_signatures<F: FnMut(LayerSig)>(&self, _f: &mut F) {}
+}
+
+impl InferLayer for HeapPassthrough {
+    type Input = Vec<f32>;
+    type Output = Vec<f32>;
+
+    fn in_dim(&self) -> usize {
+        self.dim
+    }
+    fn out_dim(&self) -> usize {
+        self.dim
+    }
+    fn infer<'a>(&'a mut self, input: &'a [f32]) -> &'a [f32] {
+        assert_eq!(input.len(), self.dim, "falsche Eingabelänge");
+        input
+    }
+}
+
+impl IntoInference for HeapDropout {
+    type Inference = HeapPassthrough;
+
+    fn into_inference(self) -> HeapPassthrough {
+        HeapPassthrough::new(self.in_dim())
+    }
+}

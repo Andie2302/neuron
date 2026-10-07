@@ -185,7 +185,9 @@ impl Loss for BinaryCrossEntropy {
 ///
 /// * Verlust: `L = max(z, 0) - t z + ln(1 + e^-|z|)` (Mittel über alle Elemente) –
 ///   der überlauffreie Ausdruck für `-t ln σ(z) - (1 - t) ln(1 - σ(z))`.
-/// * Gradient: `dL/dz = σ(z) - t`.
+/// * Gradient: `dL/dz_i = (σ(z_i) - t_i) / n` bei `n` Elementen – der Verlust ist ein Mittel,
+///   der Gradient trägt dessen Faktor `1/n` (wie bei [`Mse`] und den anderen Verlusten). Bei
+///   einem Ausgang ist das `σ(z) - t`.
 ///
 /// Die Ableitung von Sigmoid und Logarithmus kürzt sich analytisch heraus. Der
 /// Gradient bleibt dadurch auch für stark gesättigte Ausgaben `|z| ≫ 17`
@@ -421,6 +423,25 @@ mod tests {
         assert_eq!(g[0], 1.0, "voller Gradient trotz Sättigung");
         let v = BinaryCrossEntropyWithLogits.value(&[30.0], &[0.0]);
         assert!((v - 30.0).abs() < 1e-4, "Verlust {v}");
+    }
+
+    #[test]
+    fn bce_with_logits_gradient_is_the_mean_gradient_for_several_outputs() {
+        let (z, t) = ([0.0f32, 2.0, -1.0], [1.0f32, 0.0, 0.5]);
+        let mut g = [0.0; 3];
+        BinaryCrossEntropyWithLogits.gradient(&z, &t, &mut g);
+        for i in 0..3 {
+            let expected = (math::sigmoid(z[i]) - t[i]) / 3.0;
+            assert!(
+                (g[i] - expected).abs() < 1e-7,
+                "i = {i}: {} vs {expected}",
+                g[i]
+            );
+        }
+        // Ein Ausgang: genau σ(z) - t.
+        let mut one = [0.0];
+        BinaryCrossEntropyWithLogits.gradient(&[2.0], &[0.0], &mut one);
+        assert!((one[0] - math::sigmoid(2.0)).abs() < 1e-7);
     }
 
     #[test]

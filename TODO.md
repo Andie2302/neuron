@@ -7,7 +7,7 @@ Inferenz-Typen, Hard-Aktivierungen, Lion, CI). Reihenfolge innerhalb einer Grupp
 ## Erledigt
 
 - [x] `BinaryCrossEntropyWithLogits` (Gradient `σ(z) − t`), `math::sigmoid`
-- [x] `InferenceDense`, `InferLayer`, `IntoInference` (≈ 50 % weniger Speicher), `static` im Flash
+- [x] `InferenceDense`, `InferLayer`, `IntoInference` (≈ 50 % weniger Speicher), einzelner Layer als `static` im Flash
 - [x] Modellformat mit Header, Architektur-Fingerprint und CRC32 (`Params::save_model` / `load_model`)
 - [x] `ParamKind` (Weight Decay nur auf Gewichte), `RmsProp` ohne unnötigen Momentum-Puffer
 - [x] `Relu6`, `HardSigmoid`, `HardSwish`, `HardTanh`, `Softsign`; `Lion`
@@ -27,6 +27,8 @@ Inferenz-Typen, Hard-Aktivierungen, Lion, CI). Reihenfolge innerhalb einer Grupp
 - [ ] **Flash-Größe verfolgen:** `cargo size` für ein Beispielnetz in CI, damit Größen-Regressionen
       auffallen. Dabei messen, wie viel `assert_eq!`-Formatierung kostet (bisher nur vermutet) und ob
       `try_*`-Varianten mit `Result` sinnvoll sind.
+- [ ] **Toolchain in der CI pinnen** (`rust-toolchain.toml` o. Ä.): `-D warnings` auf dem beweglichen
+      `stable` bricht die Pipeline, sobald eine neue Clippy-/Rustdoc-Lint erscheint.
 - [ ] MSRV auch für Tests/Beispiele prüfen oder die Zusage ausdrücklich auf die Bibliothek beschränken
       (so steht es in der README).
 - [ ] Benchmarks (Zyklen je Forward/Backward) für `Dense` und `InferenceDense`.
@@ -34,6 +36,10 @@ Inferenz-Typen, Hard-Aktivierungen, Lion, CI). Reihenfolge innerhalb einer Grupp
 - [ ] `CHANGELOG.md`, Versionierung und Release-Prozess.
 
 ## Modellformat und Embedded
+
+- [ ] **Mehrlagige Netze als `static` im Flash:** zustandsloses `infer_into(&self, input, scratch, out)`
+      am `InferLayer`-Trait (Zwischenpuffer vom Aufrufer), damit auch `InferChain` unveränderlich sein
+      kann. Heute passt nur ein einzelner `InferDense` in ein `static`.
 
 - [ ] **Version 2 mit `dtype`-Feld** (Flags sind bereits reserviert): `i8`/`Q15` neben `f32`.
 - [ ] **Quantisierung für die Inferenz:** int8-Gewichte mit Skalierung je Zeile/Tensor,
@@ -84,6 +90,8 @@ Inferenz-Typen, Hard-Aktivierungen, Lion, CI). Reihenfolge innerhalb einer Grupp
 
 - [ ] Makro zum Verketten (`chain!(a, b, c)`) und Typ-Aliase – die geschachtelten `Chain`-Typen sind lang
 - [ ] Mehr Doctests an den öffentlichen Typen; ein Beispiel für Modell speichern → Flash → laden
+- [ ] `infer` bindet das Ergebnis an Netz *und* Eingabe (nötig für zero-copy `Passthrough`);
+      eine Variante, die nur vom Netz borgt, würde Temporaries als Eingabe erleichtern.
 - [ ] Batch-Forward (Matrix × Matrix) für höheren Durchsatz auf Geräten mit Cache
 
 ## Bekannte Einschränkungen (bewusst, siehe README)
