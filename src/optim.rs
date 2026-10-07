@@ -6,7 +6,8 @@
 //! *generisches assoziiertes Typ* über den Puffertyp des Tensors:
 //!
 //! ```text
-//! type State<B: Buffer>;   // Sgd: ()   Momentum/Adagrad/RmsProp/Lion: B   Adam/AdamW: AdamState<B>   RmsPropMomentum: RmsPropState<B>
+//! type State<B: Buffer>;   // Sgd: ()   Momentum/Adagrad/RmsProp/Lion: B   Adam/AdamW/NAdam/RAdam: AdamState<B>
+//!                          // RmsPropMomentum: RmsPropState<B>   Lookahead<O>: O-Zustand + ein Puffer
 //! ```
 //!
 //! Für ein Gewichts-Array `[[f32; IN]; OUT]` ist der Zustand also wieder ein
@@ -16,7 +17,7 @@
 //!
 //! * [`Sgd`], [`Momentum`]: klassische **L2-Regularisierung** (wie PyTorch):
 //!   `g ← g + weight_decay · p`, *vor* Momentum bzw. Skalierung.
-//! * [`AdamW`]: **entkoppelter** Weight Decay (Loshchilov & Hutter). Der Zerfall
+//! * [`AdamW`], [`NAdam`], [`RAdam`], [`Lion`]: **entkoppelter** Weight Decay (Loshchilov & Hutter). Der Zerfall
 //!   wird direkt auf den Parametern angewendet und durchläuft weder die
 //!   Gradienten noch Adams adaptive Skalierung:
 //!   `p ← p - lr · weight_decay · p - lr · m̂ / (√v̂ + ε)`.
@@ -247,7 +248,19 @@ impl AdamClock {
     }
 }
 
-/// Gemeinsamer Rechenkern von [`Adam`] und [`AdamW`].
+/// Welche Schrittvorschrift der gemeinsame Adam-Kern ausführt.
+#[derive(Clone, Copy)]
+enum AdamRule {
+    /// Adam/AdamW: `m̂ / (√v̂ + ε)`.
+    Plain,
+    /// NAdam: `(β₁ m̂ + (1 - β₁) g / (1 - β₁ᵗ)) / (√v̂ + ε)`.
+    Nesterov,
+    /// RAdam: `Some(r)` = adaptiver Schritt `r · m̂ · √(1 - β₂ᵗ) / (√v + ε)`, `None` =
+    /// unadaptierter Momentum-Schritt `m̂` (solange die Varianz noch nicht verlässlich ist).
+    Rectified(Option<f32>),
+}
+
+/// Gemeinsamer Rechenkern von [`Adam`], [`AdamW`], [`NAdam`] und [`RAdam`].
 #[derive(Clone, Copy)]
 struct AdamStep {
     lr: f32,
@@ -256,6 +269,7 @@ struct AdamStep {
     eps: f32,
     /// Entkoppelter Zerfall; `0.0` für klassisches Adam.
     decay: f32,
+    rule: AdamRule,
     clock: AdamClock,
 }
 
@@ -271,12 +285,28 @@ impl AdamStep {
             *m = self.beta1 * *m + (1.0 - self.beta1) * g;
             *v = self.beta2 * *v + (1.0 - self.beta2) * g * g;
             let m_hat = *m / self.clock.bias1;
-            let v_hat = *v / self.clock.bias2;
             // p ← p - lr·wd·p - lr·m̂/(√v̂ + ε): Zerfall direkt auf p, nicht über g.
             if self.decay != 0.0 {
                 *p -= self.lr * self.decay * *p;
             }
-            *p -= self.lr * m_hat / (math::sqrt(v_hat) + self.eps);
+            match self.rule {
+                AdamRule::Plain => {
+                    let v_hat = *v / self.clock.bias2;
+                    *p -= self.lr * m_hat / (math::sqrt(v_hat) + self.eps);
+                }
+                AdamRule::Nesterov => {
+                    let v_hat = *v / self.clock.bias2;
+                    let lookahead = self.beta1 * m_hat + (1.0 - self.beta1) * g / self.clock.bias1;
+                    *p -= self.lr * lookahead / (math::sqrt(v_hat) + self.eps);
+                }
+                AdamRule::Rectified(Some(rect)) => {
+                    let adaptive = math::sqrt(self.clock.bias2) / (math::sqrt(*v) + self.eps);
+                    *p -= self.lr * m_hat * adaptive * rect;
+                }
+                AdamRule::Rectified(None) => {
+                    *p -= self.lr * m_hat;
+                }
+            }
         }
     }
 }
@@ -344,6 +374,7 @@ impl Optimizer for Adam {
             beta2: self.beta2,
             eps: self.eps,
             decay: 0.0,
+            rule: AdamRule::Plain,
             clock: self.clock,
         }
         .apply(state, params, grads);
@@ -438,6 +469,7 @@ impl Optimizer for AdamW {
             beta2: self.beta2,
             eps: self.eps,
             decay: kind.decay(self.weight_decay),
+            rule: AdamRule::Plain,
             clock: self.clock,
         }
         .apply(state, params, grads);
@@ -448,6 +480,384 @@ impl Optimizer for AdamW {
     }
     fn set_learning_rate(&mut self, lr: f32) {
         self.lr = lr;
+    }
+}
+
+/// NAdam (Dozat): Adam mit **Nesterov**-Vorausschau.
+///
+/// ```text
+/// m ← β₁ m + (1 - β₁) g        v ← β₂ v + (1 - β₂) g²
+/// p ← p - lr · (β₁ m̂ + (1 - β₁) g / (1 - β₁ᵗ)) / (√v̂ + ε)
+/// ```
+///
+/// Statt des geglätteten Gradienten `m̂` geht der Impuls schon um einen Schritt „vorausgeschaut"
+/// ein; das beschleunigt Adam oft ein wenig, ohne zusätzlichen Speicher (Zustand wie
+/// [`Adam`]: zwei Puffer). Dies ist die Form mit **konstantem** `β₁` (ohne Dozats
+/// Momentum-Zeitplan). Der erste Schritt hat die Länge `lr · (1 + β₁)`.
+///
+/// Mit `β₁ = 0` ist NAdam bitgleich zu [`Adam`] mit `β₁ = 0`. Der optionale Weight Decay ist wie
+/// bei [`AdamW`] **entkoppelt** und wirkt nur auf Gewichte (Standard `0.0` = aus).
+#[derive(Clone, Copy, Debug)]
+pub struct NAdam {
+    /// Lernrate.
+    pub lr: f32,
+    /// Zerfallsrate des ersten Moments (Standard `0.9`).
+    pub beta1: f32,
+    /// Zerfallsrate des zweiten Moments (Standard `0.999`).
+    pub beta2: f32,
+    /// Stabilisierung gegen Division durch 0 (Standard `1e-8`).
+    pub eps: f32,
+    /// Entkoppelter Weight Decay (Standard `0.0`).
+    pub weight_decay: f32,
+    clock: AdamClock,
+}
+
+impl NAdam {
+    /// NAdam mit Standard-Hyperparametern und Lernrate `lr`, ohne Weight Decay.
+    pub fn new(lr: f32) -> Self {
+        NAdam {
+            lr,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+            weight_decay: 0.0,
+            clock: AdamClock::new(),
+        }
+    }
+
+    /// Überschreibt `beta1` und `beta2`.
+    pub fn with_betas(mut self, beta1: f32, beta2: f32) -> Self {
+        self.beta1 = beta1;
+        self.beta2 = beta2;
+        self
+    }
+
+    /// Setzt den entkoppelten Weight Decay (nur auf Gewichte).
+    ///
+    /// # Panics
+    /// Wenn `weight_decay` negativ oder nicht endlich ist.
+    pub fn with_weight_decay(mut self, weight_decay: f32) -> Self {
+        check_weight_decay(weight_decay);
+        self.weight_decay = weight_decay;
+        self
+    }
+}
+
+impl Optimizer for NAdam {
+    type State<B: Buffer> = AdamState<B>;
+
+    fn init_state<B: Buffer>(&self, len: usize) -> AdamState<B> {
+        AdamState {
+            m: B::zeroed(len),
+            v: B::zeroed(len),
+        }
+    }
+
+    fn begin_step(&mut self) {
+        self.clock.tick(self.beta1, self.beta2);
+    }
+
+    fn update<B: Buffer>(
+        &self,
+        state: &mut AdamState<B>,
+        params: &mut B,
+        grads: &B,
+        kind: ParamKind,
+    ) {
+        AdamStep {
+            lr: self.lr,
+            beta1: self.beta1,
+            beta2: self.beta2,
+            eps: self.eps,
+            decay: kind.decay(self.weight_decay),
+            rule: AdamRule::Nesterov,
+            clock: self.clock,
+        }
+        .apply(state, params, grads);
+    }
+
+    fn learning_rate(&self) -> f32 {
+        self.lr
+    }
+    fn set_learning_rate(&mut self, lr: f32) {
+        self.lr = lr;
+    }
+}
+
+/// RAdam (Liu et al., „On the Variance of the Adaptive Learning Rate and Beyond"):
+/// Adam mit **berichtigter** adaptiver Lernrate – ein Warmup ist nicht mehr nötig.
+///
+/// In den ersten Schritten ist die Schätzung der Varianz `v` noch sehr verrauscht; das macht
+/// Adams adaptiven Nenner dort unzuverlässig (der Grund für das übliche Warmup). RAdam misst
+/// die Verlässlichkeit über die „effektive Länge" `ρₜ = ρ∞ - 2t β₂ᵗ / (1 - β₂ᵗ)` mit
+/// `ρ∞ = 2 / (1 - β₂) - 1`:
+///
+/// ```text
+/// ρₜ <= 5:  p ← p - lr · m̂                      (Momentum-SGD, ohne adaptiven Nenner)
+/// ρₜ >  5:  p ← p - lr · r · m̂ · √(1 - β₂ᵗ) / (√v + ε)
+///           r = √( (ρₜ - 4)(ρₜ - 2) ρ∞ / ((ρ∞ - 4)(ρ∞ - 2) ρₜ) )   < 1, wächst gegen 1
+/// ```
+///
+/// Die Schrittweite wächst so von selbst an. Beachten: in den ersten Schritten
+/// (`β₂ = 0.999`: etwa fünf) skaliert der Schritt mit dem Gradienten wie bei SGD, nicht
+/// mit `lr` wie bei Adam. Zustand wie [`Adam`] (zwei Puffer). Der optionale Weight Decay ist wie
+/// bei [`AdamW`] **entkoppelt** und wirkt nur auf Gewichte (Standard `0.0` = aus).
+#[derive(Clone, Copy, Debug)]
+pub struct RAdam {
+    /// Lernrate.
+    pub lr: f32,
+    /// Zerfallsrate des ersten Moments (Standard `0.9`).
+    pub beta1: f32,
+    /// Zerfallsrate des zweiten Moments (Standard `0.999`).
+    pub beta2: f32,
+    /// Stabilisierung gegen Division durch 0 (Standard `1e-8`).
+    pub eps: f32,
+    /// Entkoppelter Weight Decay (Standard `0.0`).
+    pub weight_decay: f32,
+    clock: AdamClock,
+}
+
+impl RAdam {
+    /// RAdam mit Standard-Hyperparametern und Lernrate `lr`, ohne Weight Decay.
+    pub fn new(lr: f32) -> Self {
+        RAdam {
+            lr,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+            weight_decay: 0.0,
+            clock: AdamClock::new(),
+        }
+    }
+
+    /// Überschreibt `beta1` und `beta2`.
+    pub fn with_betas(mut self, beta1: f32, beta2: f32) -> Self {
+        self.beta1 = beta1;
+        self.beta2 = beta2;
+        self
+    }
+
+    /// Setzt den entkoppelten Weight Decay (nur auf Gewichte).
+    ///
+    /// # Panics
+    /// Wenn `weight_decay` negativ oder nicht endlich ist.
+    pub fn with_weight_decay(mut self, weight_decay: f32) -> Self {
+        check_weight_decay(weight_decay);
+        self.weight_decay = weight_decay;
+        self
+    }
+
+    /// Berichtigungsfaktor `r` im aktuellen Schritt, oder `None`, solange `ρₜ <= 5`.
+    fn rectification(&self) -> Option<f32> {
+        let rho_inf = 2.0 / (1.0 - self.beta2) - 1.0;
+        let t = self.clock.t as f32;
+        // β₂ᵗ = 1 - bias2, beide kommen aus derselben Uhr wie die Bias-Korrektur.
+        let rho = rho_inf - 2.0 * t * (1.0 - self.clock.bias2) / self.clock.bias2;
+        if rho > 5.0 {
+            let num = (rho - 4.0) * (rho - 2.0) * rho_inf;
+            let den = (rho_inf - 4.0) * (rho_inf - 2.0) * rho;
+            Some(math::sqrt(num / den))
+        } else {
+            None
+        }
+    }
+}
+
+impl Optimizer for RAdam {
+    type State<B: Buffer> = AdamState<B>;
+
+    fn init_state<B: Buffer>(&self, len: usize) -> AdamState<B> {
+        AdamState {
+            m: B::zeroed(len),
+            v: B::zeroed(len),
+        }
+    }
+
+    fn begin_step(&mut self) {
+        self.clock.tick(self.beta1, self.beta2);
+    }
+
+    fn update<B: Buffer>(
+        &self,
+        state: &mut AdamState<B>,
+        params: &mut B,
+        grads: &B,
+        kind: ParamKind,
+    ) {
+        AdamStep {
+            lr: self.lr,
+            beta1: self.beta1,
+            beta2: self.beta2,
+            eps: self.eps,
+            decay: kind.decay(self.weight_decay),
+            rule: AdamRule::Rectified(self.rectification()),
+            clock: self.clock,
+        }
+        .apply(state, params, grads);
+    }
+
+    fn learning_rate(&self) -> f32 {
+        self.lr
+    }
+    fn set_learning_rate(&mut self, lr: f32) {
+        self.lr = lr;
+    }
+}
+
+/// Zustand von [`Lookahead`]: der Zustand des inneren Optimizers plus die „langsamen"
+/// Gewichte (ein zusätzlicher Puffer je Tensor).
+#[derive(Clone, Debug)]
+pub struct LookaheadState<S, B: Buffer> {
+    inner: S,
+    slow: B,
+    /// `false` bis zum ersten Update; dann werden die langsamen Gewichte aus den Parametern gesetzt.
+    primed: bool,
+}
+
+/// Lookahead (Zhang et al.): macht aus **jedem** Optimizer einen stabileren.
+///
+/// Der innere Optimizer führt `k` Schritte auf den „schnellen" Gewichten aus. Danach werden die
+/// „langsamen" Gewichte ein Stück in deren Richtung gezogen und die schnellen darauf
+/// zurückgesetzt:
+///
+/// ```text
+/// alle k Schritte:   slow ← slow + α (fast - slow)        fast ← slow
+/// ```
+///
+/// Das glättet das Rauschen des inneren Optimizers und macht das Training weniger empfindlich
+/// gegenüber Lernrate und Batchgröße. Üblich: `k = 5`, `α = 0.5`.
+///
+/// **Speicher:** der Zustand des inneren Optimizers plus **ein** Puffer (die langsamen
+/// Gewichte) je Tensor. Lernrate und `begin_step` werden an den inneren Optimizer durchgereicht.
+///
+/// **Hinweise:** Die langsamen Gewichte werden beim ersten Update aus den dann aktuellen
+/// Parametern angelegt; Gewichte, die man *nach* Trainingsbeginn in das Netz lädt, kennt
+/// Lookahead nicht – dafür einen neuen [`Trainer`](crate::trainer::Trainer) anlegen. Direkt
+/// nach einem Synchronisationsschritt (Schrittzahl ein Vielfaches von `k`) sind schnelle und
+/// langsame Gewichte gleich; dann ist der beste Zeitpunkt, das Netz zu bewerten oder zu
+/// speichern. Ohne [`begin_step`](Optimizer::begin_step) (das der `Trainer` pro Schritt ruft)
+/// wird nie synchronisiert.
+///
+/// ```
+/// use neuron::prelude::*;
+/// use neuron::optim::Lookahead;
+///
+/// // Lookahead um Adam: k = 5 Schritte, α = 0.5.
+/// let opt = Lookahead::new(Adam::new(0.01));
+/// let net = Dense::<2, 4, _>::new(Tanh).then(Dense::<4, 1, _>::new(Linear));
+/// let trainer = Trainer::new(net, Mse, opt);
+/// assert_eq!(trainer.learning_rate(), 0.01);
+/// ```
+#[derive(Clone, Copy, Debug)]
+pub struct Lookahead<O: Optimizer> {
+    inner: O,
+    /// Synchronisationsperiode `k >= 1`.
+    k: u32,
+    /// Schrittweite `α ∈ (0, 1]` der langsamen Gewichte.
+    alpha: f32,
+    /// Anzahl bisheriger `begin_step`-Aufrufe.
+    steps: u32,
+}
+
+impl<O: Optimizer> Lookahead<O> {
+    /// Lookahead um `inner` mit `k = 5` und `α = 0.5`.
+    pub fn new(inner: O) -> Self {
+        Lookahead {
+            inner,
+            k: 5,
+            alpha: 0.5,
+            steps: 0,
+        }
+    }
+
+    /// Setzt die Synchronisationsperiode `k` (Schritte zwischen zwei Synchronisationen).
+    ///
+    /// # Panics
+    /// Wenn `k == 0`.
+    pub fn with_sync_period(mut self, k: u32) -> Self {
+        assert!(k > 0, "k muss >= 1 sein");
+        self.k = k;
+        self
+    }
+
+    /// Setzt die Schrittweite `α` der langsamen Gewichte (`1` = bei jeder Synchronisation
+    /// komplett auf die schnellen Gewichte setzen).
+    ///
+    /// # Panics
+    /// Wenn `alpha` nicht in `(0, 1]` liegt.
+    pub fn with_alpha(mut self, alpha: f32) -> Self {
+        assert!(alpha > 0.0 && alpha <= 1.0, "alpha muss in (0, 1] liegen");
+        self.alpha = alpha;
+        self
+    }
+
+    /// Der innere Optimizer.
+    pub fn inner(&self) -> &O {
+        &self.inner
+    }
+
+    /// Der innere Optimizer (mutabel), z. B. um dessen Hyperparameter zu ändern.
+    pub fn inner_mut(&mut self) -> &mut O {
+        &mut self.inner
+    }
+
+    /// Synchronisationsperiode `k`.
+    pub fn sync_period(&self) -> u32 {
+        self.k
+    }
+
+    /// Schrittweite `α` der langsamen Gewichte.
+    pub fn alpha(&self) -> f32 {
+        self.alpha
+    }
+}
+
+impl<O: Optimizer> Optimizer for Lookahead<O> {
+    type State<B: Buffer> = LookaheadState<O::State<B>, B>;
+
+    fn init_state<B: Buffer>(&self, len: usize) -> Self::State<B> {
+        LookaheadState {
+            inner: self.inner.init_state(len),
+            slow: B::zeroed(len),
+            primed: false,
+        }
+    }
+
+    fn begin_step(&mut self) {
+        self.inner.begin_step();
+        self.steps = self.steps.wrapping_add(1);
+    }
+
+    fn update<B: Buffer>(
+        &self,
+        state: &mut Self::State<B>,
+        params: &mut B,
+        grads: &B,
+        kind: ParamKind,
+    ) {
+        if !state.primed {
+            state.slow.as_mut_slice().copy_from_slice(params.as_slice());
+            state.primed = true;
+        }
+        self.inner.update(&mut state.inner, params, grads, kind);
+        if self.steps > 0 && self.steps % self.k == 0 {
+            let it = state
+                .slow
+                .as_mut_slice()
+                .iter_mut()
+                .zip(params.as_mut_slice());
+            for (slow, fast) in it {
+                *slow += self.alpha * (*fast - *slow);
+                *fast = *slow;
+            }
+        }
+    }
+
+    fn learning_rate(&self) -> f32 {
+        self.inner.learning_rate()
+    }
+    fn set_learning_rate(&mut self, lr: f32) {
+        self.inner.set_learning_rate(lr);
     }
 }
 
@@ -1304,5 +1714,458 @@ mod tests {
         roundtrip(RmsProp::new(0.1), 0.1);
         roundtrip(Adagrad::new(0.05), 0.05);
         roundtrip(Lion::new(0.02), 0.02);
+        roundtrip(NAdam::new(0.07), 0.07);
+        roundtrip(RAdam::new(0.06), 0.06);
+        roundtrip(Lookahead::new(Adam::new(0.03)), 0.03);
+    }
+
+    // ---- Referenzen in f64, unabhängig von der Implementierung -----------------------------
+
+    /// Deterministische Gradientenfolge mit wechselndem Vorzeichen und Betrag.
+    fn grad_at(k: usize) -> f32 {
+        let k = k as f32;
+        (0.37 * k).sin() * (1.0 + 0.1 * (k % 7.0)) + 0.2
+    }
+
+    struct Hyper {
+        lr: f64,
+        b1: f64,
+        b2: f64,
+        eps: f64,
+        wd: f64,
+    }
+
+    /// NAdam mit konstantem β₁, Schritt für Schritt wie in der Doku, in `f64`.
+    fn nadam_reference(h: &Hyper, steps: usize, p0: f64) -> f64 {
+        let (mut p, mut m, mut v) = (p0, 0.0f64, 0.0f64);
+        for k in 0..steps {
+            let g = grad_at(k) as f64;
+            let t = (k + 1) as i32;
+            m = h.b1 * m + (1.0 - h.b1) * g;
+            v = h.b2 * v + (1.0 - h.b2) * g * g;
+            let (bias1, bias2) = (1.0 - h.b1.powi(t), 1.0 - h.b2.powi(t));
+            let (m_hat, v_hat) = (m / bias1, v / bias2);
+            p -= h.lr * h.wd * p;
+            p -= h.lr * (h.b1 * m_hat + (1.0 - h.b1) * g / bias1) / (v_hat.sqrt() + h.eps);
+        }
+        p
+    }
+
+    /// RAdam wie im Paper / in der Doku, in `f64`.
+    fn radam_reference(h: &Hyper, steps: usize, p0: f64) -> f64 {
+        let (mut p, mut m, mut v) = (p0, 0.0f64, 0.0f64);
+        let rho_inf = 2.0 / (1.0 - h.b2) - 1.0;
+        for k in 0..steps {
+            let g = grad_at(k) as f64;
+            let t = (k + 1) as i32;
+            m = h.b1 * m + (1.0 - h.b1) * g;
+            v = h.b2 * v + (1.0 - h.b2) * g * g;
+            let (bias1, bias2) = (1.0 - h.b1.powi(t), 1.0 - h.b2.powi(t));
+            let m_hat = m / bias1;
+            let rho = rho_inf - 2.0 * t as f64 * h.b2.powi(t) / bias2;
+            p -= h.lr * h.wd * p;
+            if rho > 5.0 {
+                let rect = (((rho - 4.0) * (rho - 2.0) * rho_inf)
+                    / ((rho_inf - 4.0) * (rho_inf - 2.0) * rho))
+                    .sqrt();
+                p -= h.lr * m_hat * rect * bias2.sqrt() / (v.sqrt() + h.eps);
+            } else {
+                p -= h.lr * m_hat;
+            }
+        }
+        p
+    }
+
+    fn run_scalar<O: Optimizer>(mut opt: O, kind: ParamKind, steps: usize, p0: f32) -> f32 {
+        let mut st = opt.init_state::<[f32; 1]>(1);
+        let mut p = [p0];
+        for k in 0..steps {
+            opt.begin_step();
+            opt.update(&mut st, &mut p, &[grad_at(k)], kind);
+        }
+        p[0]
+    }
+
+    // ---- NAdam -----------------------------------------------------------------------------
+
+    #[test]
+    fn nadam_first_step_has_length_lr_times_one_plus_beta1() {
+        // m̂ = g, v̂ = g²: Zähler β₁ g + g = (1 + β₁) g, Nenner |g|.
+        for &g in &[5.0f32, -0.2, 1e-3] {
+            let mut opt = NAdam::new(0.01);
+            let mut st = opt.init_state::<[f32; 1]>(1);
+            let mut p = [0.0];
+            opt.begin_step();
+            opt.update(&mut st, &mut p, &[g], ParamKind::Weight);
+            let expected = -0.01 * 1.9 * g.signum();
+            assert!(
+                (p[0] - expected).abs() < 1e-5,
+                "g = {g}: {} vs {expected}",
+                p[0]
+            );
+        }
+    }
+
+    #[test]
+    fn nadam_with_beta1_zero_is_bit_identical_to_adam_with_beta1_zero() {
+        let mut nadam = NAdam::new(0.03).with_betas(0.0, 0.99);
+        let mut adam = Adam::new(0.03).with_betas(0.0, 0.99);
+        let mut sn = nadam.init_state::<[f32; 3]>(3);
+        let mut sa = adam.init_state::<[f32; 3]>(3);
+        let mut pn = [0.5, -1.0, 2.0];
+        let mut pa = pn;
+        for k in 0..40 {
+            let g = [grad_at(k), -2.0 * grad_at(k + 1), 0.3 * grad_at(k + 2)];
+            nadam.begin_step();
+            adam.begin_step();
+            nadam.update(&mut sn, &mut pn, &g, ParamKind::Weight);
+            adam.update(&mut sa, &mut pa, &g, ParamKind::Weight);
+        }
+        assert_eq!(pn, pa);
+    }
+
+    #[test]
+    fn nadam_matches_the_f64_reference() {
+        let h = Hyper {
+            lr: 0.02,
+            b1: 0.9,
+            b2: 0.99,
+            eps: 1e-8,
+            wd: 0.0,
+        };
+        let opt = NAdam::new(0.02).with_betas(0.9, 0.99);
+        let got = run_scalar(opt, ParamKind::Weight, 60, 1.5);
+        let want = nadam_reference(&h, 60, 1.5);
+        assert!((got as f64 - want).abs() < 1e-4, "{got} vs {want}");
+    }
+
+    #[test]
+    fn nadam_weight_decay_is_decoupled_and_skips_biases() {
+        let h = Hyper {
+            lr: 0.02,
+            b1: 0.9,
+            b2: 0.999,
+            eps: 1e-8,
+            wd: 0.5,
+        };
+        let opt = NAdam::new(0.02).with_weight_decay(0.5);
+        let weight = run_scalar(opt, ParamKind::Weight, 40, 1.5);
+        let want = nadam_reference(&h, 40, 1.5);
+        assert!((weight as f64 - want).abs() < 1e-4, "{weight} vs {want}");
+        // Der Bias zerfällt nicht: gleiches Ergebnis wie ganz ohne Zerfall.
+        let bias = run_scalar(opt, ParamKind::Bias, 40, 1.5);
+        let plain = run_scalar(NAdam::new(0.02), ParamKind::Weight, 40, 1.5);
+        assert_eq!(bias, plain);
+        assert_ne!(weight, plain);
+    }
+
+    #[test]
+    fn nadam_minimises_quadratic() {
+        let x = minimise_quadratic(NAdam::new(0.1), 500);
+        assert!((x - 3.0).abs() < 0.05, "x = {x}");
+    }
+
+    // ---- RAdam -----------------------------------------------------------------------------
+
+    #[test]
+    fn radam_starts_as_momentum_sgd_and_scales_with_the_gradient() {
+        // β₂ = 0.9: ρ₁..ρ₄ <= 5, die ersten vier Schritte sind p ← p - lr·m̂. Im ersten
+        // Schritt ist m̂ = g, die Schrittlänge also lr·g und *nicht* ≈ lr wie bei Adam.
+        for &g in &[0.5f32, 5.0, 100.0] {
+            let mut opt = RAdam::new(0.01).with_betas(0.9, 0.9);
+            let mut st = opt.init_state::<[f32; 1]>(1);
+            let mut p = [0.0];
+            opt.begin_step();
+            opt.update(&mut st, &mut p, &[g], ParamKind::Weight);
+            assert!(
+                (p[0] + 0.01 * g).abs() < 1e-6 * (1.0 + g),
+                "g = {g}: {}",
+                p[0]
+            );
+
+            let mut adam = Adam::new(0.01).with_betas(0.9, 0.9);
+            let mut sa = adam.init_state::<[f32; 1]>(1);
+            let mut q = [0.0];
+            adam.begin_step();
+            adam.update(&mut sa, &mut q, &[g], ParamKind::Weight);
+            assert!((q[0] + 0.01).abs() < 1e-5, "Adam bleibt bei lr: {}", q[0]);
+        }
+    }
+
+    #[test]
+    fn radam_matches_the_f64_reference_across_the_switch_to_adaptive_steps() {
+        // β₂ = 0.9: ρ₅ = 4.58 (Momentum-Schritt), ρ₆ = 5.39 (adaptiv) – klare Abstände zu 5.
+        let h = Hyper {
+            lr: 0.02,
+            b1: 0.9,
+            b2: 0.9,
+            eps: 1e-8,
+            wd: 0.0,
+        };
+        for steps in [3usize, 5, 6, 7, 40] {
+            let opt = RAdam::new(0.02).with_betas(0.9, 0.9);
+            let got = run_scalar(opt, ParamKind::Weight, steps, 1.5);
+            let want = radam_reference(&h, steps, 1.5);
+            assert!(
+                (got as f64 - want).abs() < 1e-4,
+                "{steps} Schritte: {got} vs {want}"
+            );
+        }
+        // Mit Zerfall.
+        let hw = Hyper { wd: 0.3, ..h };
+        let opt = RAdam::new(0.02).with_betas(0.9, 0.9).with_weight_decay(0.3);
+        let got = run_scalar(opt, ParamKind::Weight, 30, 1.5);
+        let want = radam_reference(&hw, 30, 1.5);
+        assert!((got as f64 - want).abs() < 1e-4, "{got} vs {want}");
+    }
+
+    #[test]
+    fn radam_rectification_grows_towards_one() {
+        let mut opt = RAdam::new(0.1);
+        let mut previous = 0.0f32;
+        let mut t = 0;
+        for target in [10, 30, 100, 1000, 10_000] {
+            while t < target {
+                opt.begin_step();
+                t += 1;
+            }
+            let r = opt.rectification().expect("ρ > 5 ab dem sechsten Schritt");
+            assert!(
+                r > previous && r < 1.0,
+                "t = {t}: r = {r}, davor {previous}"
+            );
+            previous = r;
+        }
+        assert!(previous > 0.99, "r(10000) = {previous}");
+    }
+
+    #[test]
+    fn radam_has_no_rectification_in_the_first_steps() {
+        let mut opt = RAdam::new(0.1); // β₂ = 0.999: ρ₁ = 1 … ρ₄ = 4
+        for _ in 0..4 {
+            opt.begin_step();
+            assert!(opt.rectification().is_none());
+        }
+    }
+
+    #[test]
+    fn radam_weight_decay_skips_biases() {
+        let opt = RAdam::new(0.02).with_betas(0.9, 0.9).with_weight_decay(0.5);
+        let bias = run_scalar(opt, ParamKind::Bias, 30, 1.5);
+        let plain = run_scalar(
+            RAdam::new(0.02).with_betas(0.9, 0.9),
+            ParamKind::Weight,
+            30,
+            1.5,
+        );
+        assert_eq!(bias, plain);
+    }
+
+    #[test]
+    fn radam_minimises_quadratic_without_warmup() {
+        let x = minimise_quadratic(RAdam::new(0.1), 600);
+        assert!((x - 3.0).abs() < 0.1, "x = {x}");
+    }
+
+    #[test]
+    fn nadam_and_radam_need_the_same_two_buffers_as_adam() {
+        use core::mem::size_of;
+        let adam = size_of::<<Adam as Optimizer>::State<[f32; 40]>>();
+        assert_eq!(size_of::<<NAdam as Optimizer>::State<[f32; 40]>>(), adam);
+        assert_eq!(size_of::<<RAdam as Optimizer>::State<[f32; 40]>>(), adam);
+        assert_eq!(adam, 2 * 40 * 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "weight_decay")]
+    fn nadam_rejects_negative_weight_decay() {
+        let _ = NAdam::new(0.1).with_weight_decay(-1.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "weight_decay")]
+    fn radam_rejects_negative_weight_decay() {
+        let _ = RAdam::new(0.1).with_weight_decay(f32::NAN);
+    }
+
+    #[test]
+    fn nadam_and_radam_defaults_are_pinned() {
+        let n = NAdam::new(0.1);
+        assert_eq!(
+            (n.beta1, n.beta2, n.eps, n.weight_decay),
+            (0.9, 0.999, 1e-8, 0.0)
+        );
+        let r = RAdam::new(0.1);
+        assert_eq!(
+            (r.beta1, r.beta2, r.eps, r.weight_decay),
+            (0.9, 0.999, 1e-8, 0.0)
+        );
+    }
+
+    // ---- Lookahead -------------------------------------------------------------------------
+
+    #[test]
+    fn lookahead_known_values() {
+        // SGD lr 0.1, g = 1, k = 2, α = 0.5, Start 0:
+        //   Schritt 1: fast -0.1                    Schritt 2: fast -0.2 -> slow -0.1, fast -0.1
+        //   Schritt 3: fast -0.2                    Schritt 4: fast -0.3 -> slow -0.2, fast -0.2
+        let mut opt = Lookahead::new(Sgd::new(0.1))
+            .with_sync_period(2)
+            .with_alpha(0.5);
+        let mut st = opt.init_state::<[f32; 1]>(1);
+        let mut p = [0.0];
+        let expected = [-0.1, -0.1, -0.2, -0.2, -0.3, -0.3];
+        for (k, want) in expected.iter().enumerate() {
+            opt.begin_step();
+            opt.update(&mut st, &mut p, &[1.0], ParamKind::Weight);
+            assert!(
+                (p[0] - want).abs() < 1e-6,
+                "Schritt {}: {} vs {want}",
+                k + 1,
+                p[0]
+            );
+        }
+    }
+
+    #[test]
+    fn lookahead_primes_the_slow_weights_from_the_parameters_at_the_first_update() {
+        // Start nicht bei 0: die langsamen Gewichte müssen bei 5.0 beginnen, nicht bei 0.0.
+        let mut opt = Lookahead::new(Sgd::new(0.1))
+            .with_sync_period(1)
+            .with_alpha(0.5);
+        let mut st = opt.init_state::<[f32; 1]>(1);
+        let mut p = [5.0];
+        opt.begin_step();
+        opt.update(&mut st, &mut p, &[1.0], ParamKind::Weight);
+        // fast 4.9; slow 5.0 + 0.5·(4.9 - 5.0) = 4.95
+        assert!((p[0] - 4.95).abs() < 1e-6, "{p:?}");
+    }
+
+    #[test]
+    fn lookahead_with_full_alpha_and_k_one_tracks_the_inner_optimizer() {
+        let plain = run_scalar(Adam::new(0.05), ParamKind::Weight, 50, 1.0);
+        let wrapped = run_scalar(
+            Lookahead::new(Adam::new(0.05))
+                .with_sync_period(1)
+                .with_alpha(1.0),
+            ParamKind::Weight,
+            50,
+            1.0,
+        );
+        assert!((plain - wrapped).abs() < 1e-5, "{plain} vs {wrapped}");
+    }
+
+    #[test]
+    fn lookahead_pulls_back_only_on_sync_steps() {
+        let plain = |steps| run_scalar(Sgd::new(0.1), ParamKind::Weight, steps, 0.0);
+        let la = |steps| {
+            run_scalar(
+                Lookahead::new(Sgd::new(0.1))
+                    .with_sync_period(3)
+                    .with_alpha(0.5),
+                ParamKind::Weight,
+                steps,
+                0.0,
+            )
+        };
+        assert_eq!(la(1), plain(1));
+        assert_eq!(la(2), plain(2));
+        assert_ne!(la(3), plain(3), "Schritt 3 synchronisiert");
+    }
+
+    #[test]
+    fn lookahead_never_syncs_without_begin_step() {
+        let opt = Lookahead::new(Sgd::new(0.1)).with_sync_period(1);
+        let mut st = opt.init_state::<[f32; 1]>(1);
+        let mut p = [0.0];
+        for _ in 0..5 {
+            opt.update(&mut st, &mut p, &[1.0], ParamKind::Weight);
+        }
+        assert!((p[0] + 0.5).abs() < 1e-6, "wie der innere Optimizer: {p:?}");
+    }
+
+    #[test]
+    fn lookahead_forwards_begin_step_the_kind_and_the_learning_rate() {
+        // begin_step: Adams erster Schritt hat Länge lr nur mit tickender Uhr.
+        let mut opt = Lookahead::new(Adam::new(0.01)).with_sync_period(100);
+        let mut st = opt.init_state::<[f32; 1]>(1);
+        let mut p = [0.0];
+        opt.begin_step();
+        opt.update(&mut st, &mut p, &[3.0], ParamKind::Weight);
+        assert!((p[0] + 0.01).abs() < 1e-5, "{p:?}");
+
+        // kind: der Bias zerfällt auch hier nicht.
+        let sgd = Lookahead::new(Sgd::new(0.1).with_weight_decay(0.5));
+        let (mut sw, mut sb) = (sgd.init_state::<[f32; 1]>(1), sgd.init_state::<[f32; 1]>(1));
+        let (mut w, mut b) = ([2.0], [2.0]);
+        sgd.update(&mut sw, &mut w, &[0.0], ParamKind::Weight);
+        sgd.update(&mut sb, &mut b, &[0.0], ParamKind::Bias);
+        assert!((w[0] - 1.9).abs() < 1e-6 && b == [2.0], "{w:?} {b:?}");
+
+        // Lernrate: lesen und setzen wirken auf den inneren Optimizer.
+        let mut la = Lookahead::new(Sgd::new(0.5));
+        la.set_learning_rate(0.25);
+        assert_eq!((la.learning_rate(), la.inner().lr), (0.25, 0.25));
+        la.inner_mut().lr = 0.125;
+        assert_eq!(la.learning_rate(), 0.125);
+    }
+
+    #[test]
+    fn lookahead_minimises_quadratic_with_several_inner_optimizers() {
+        let x = minimise_quadratic(Lookahead::new(Adam::new(0.1)), 600);
+        assert!((x - 3.0).abs() < 0.1, "Adam: x = {x}");
+        let x = minimise_quadratic(Lookahead::new(Sgd::new(0.1)), 300);
+        assert!((x - 3.0).abs() < 0.05, "Sgd: x = {x}");
+        let x = minimise_quadratic(Lookahead::new(RAdam::new(0.1)), 600);
+        assert!((x - 3.0).abs() < 0.15, "RAdam: x = {x}");
+    }
+
+    #[test]
+    fn lookahead_state_is_the_inner_state_plus_one_buffer() {
+        use core::mem::size_of;
+        type La = <Lookahead<Adam> as Optimizer>::State<[f32; 100]>;
+        let adam = size_of::<<Adam as Optimizer>::State<[f32; 100]>>();
+        let size = size_of::<La>();
+        // Genau ein zusätzlicher Puffer (+ das Flag, höchstens 4 Byte mit Ausrichtung).
+        assert!(
+            size >= adam + 100 * 4 && size <= adam + 100 * 4 + 4,
+            "{size}"
+        );
+        // Um den zustandslosen SGD: nur die langsamen Gewichte.
+        type LaSgd = <Lookahead<Sgd> as Optimizer>::State<[f32; 100]>;
+        let size = size_of::<LaSgd>();
+        assert!((100 * 4..=100 * 4 + 4).contains(&size), "{size}");
+    }
+
+    #[test]
+    fn lookahead_defaults_and_validation() {
+        let la = Lookahead::new(Sgd::new(0.1));
+        assert_eq!((la.sync_period(), la.alpha()), (5, 0.5));
+        let la = la.with_sync_period(7).with_alpha(1.0);
+        assert_eq!((la.sync_period(), la.alpha()), (7, 1.0));
+    }
+
+    #[test]
+    #[should_panic(expected = "k muss")]
+    fn lookahead_rejects_zero_period() {
+        let _ = Lookahead::new(Sgd::new(0.1)).with_sync_period(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "alpha")]
+    fn lookahead_rejects_zero_alpha() {
+        let _ = Lookahead::new(Sgd::new(0.1)).with_alpha(0.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "alpha")]
+    fn lookahead_rejects_alpha_above_one() {
+        let _ = Lookahead::new(Sgd::new(0.1)).with_alpha(1.5);
+    }
+
+    #[test]
+    #[should_panic(expected = "alpha")]
+    fn lookahead_rejects_nan_alpha() {
+        let _ = Lookahead::new(Sgd::new(0.1)).with_alpha(f32::NAN);
     }
 }

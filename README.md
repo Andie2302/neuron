@@ -8,6 +8,7 @@ Offene Punkte und Ideen: [`TODO.md`](TODO.md).
 cargo run --example xor                                # Stack, kein Heap
 cargo run --example dynamic_xor --features alloc       # Opt-In: Vec-Puffer
 cargo run --release --example gelu_adamw               # GELU/Swish + AdamW, Export/Import
+cargo run --release --example classifier               # Standardisierung, Epochen, Early Stopping, EMA, Ablehnung
 cargo test                                             # Standardmodus
 cargo test --features alloc                            # inkl. Heap-Zweig
 cargo build --lib --target thumbv7em-none-eabihf       # echtes no_std (Cortex-M4F)
@@ -43,13 +44,14 @@ Vollständig: [`examples/xor.rs`](examples/xor.rs). Das gesamte Training
 | Trait           | Aufgabe                                | Implementierungen |
 |-----------------|----------------------------------------|-------------------|
 | `Activation`    | `apply(x)`, `derivative(x, y)`, `signature()` | `Linear`, `Relu`, `LeakyRelu`, `Sigmoid`, `Tanh`, `Gelu`, `Swish`, `Elu`, `Softplus`, `Mish`, **ohne `exp`/`tanh`:** `Relu6`, `HardSigmoid`, `HardSwish`, `HardTanh`, `Softsign`; Enum `ActivationKind` (Laufzeitwahl) |
-| `Loss`          | `value(pred, target)`, `gradient(..)`  | `Mse`, `Mae`, `Huber`, `BinaryCrossEntropyWithLogits` (auf Logits), `BinaryCrossEntropy` (auf Wahrscheinlichkeiten, sättigt), `SoftmaxCrossEntropy` (auf Logits) |
+| `Loss`          | `value(pred, target)`, `gradient(..)`  | `Mse`, `Mae`, `Huber`, `LogCosh`, `Hinge`/`SquaredHinge` (Ziele ±1), `BinaryCrossEntropyWithLogits` (auf Logits), `WeightedBinaryCrossEntropyWithLogits` (`pos_weight`), `FocalLossWithLogits`, `BinaryCrossEntropy` (auf Wahrscheinlichkeiten, sättigt), `SoftmaxCrossEntropy` und `LabelSmoothingCrossEntropy` (auf Logits) |
 | `Initializer`   | `fill(w, fan_in, fan_out, rng)`        | `Constant`, `XavierUniform/Normal`, `HeUniform/Normal` |
-| `Optimizer`     | `update(state, params, grads, kind)`   | `Sgd`, `Momentum` (optional Nesterov), `Adam`, `AdamW`, `Lion`, `RmsProp`/`RmsPropMomentum`, `Adagrad` |
+| `Optimizer`     | `update(state, params, grads, kind)`   | `Sgd`, `Momentum` (optional Nesterov), `Adam`, `AdamW`, `NAdam`, `RAdam`, `Lion`, `RmsProp`/`RmsPropMomentum`, `Adagrad`; Wrapper `Lookahead<O>` um jeden Optimizer |
 | `LrSchedule`    | `lr(step)`                             | `ConstantLr`, `StepDecay`, `ExponentialDecay`, `CosineAnnealing`, `Warmup<S>` |
 | `Params`        | Parameter lesen/schreiben, Fingerprint, Modell speichern/laden | alle Layer und Inferenz-Layer |
 | `Layer`         | `forward` / `backward` / `step` ...    | `Dense<IN, OUT, A>`, `Dropout<N>`, `Chain<A, B>`; mit `alloc`: `HeapDense`, `HeapDropout`, `Sequential` |
 | `InferLayer`    | nur `infer` (kein Training)            | `InferDense<IN, OUT, A>`, `InferChain<A, B>`, `Passthrough<N>`; mit `alloc`: `InferSequential` |
+| `InferExt`      | `classify`, `classify_confident`, `probabilities`, `top_k`, `accuracy` | automatisch für jeden `InferLayer` |
 | `IntoInference` | `net.into_inference()`                 | `Dense`, `Dropout` (Stack: `Passthrough`, Heap: `HeapPassthrough`), `Chain`, (`alloc`) `Sequential` |
 | `Buffer`        | `f32`-Speicher                         | `[f32; N]`, `[[f32; C]; R]`, `Vec<f32>` (`alloc`) |
 | `Storage`       | Puffertypen eines Dense-Layers         | `Stack<IN, OUT>`, `Heap` (`alloc`) |
@@ -113,6 +115,58 @@ sind zustandslos; angewendet werden sie über `Trainer::set_learning_rate`.
 **Softmax und Argmax bei der Inferenz.** `math::softmax_inplace(&mut [f32])` zieht vor dem `exp`
 das Maximum ab (Logits wie `1000.0` laufen nicht über), allokiert nichts und definiert die
 Randfälle (leer, alles `-inf`, `+inf`, `NaN`). `math::argmax` liefert den Klassenindex.
+
+**Weitere Verluste.** Die bestehenden Verluste sind unveränderte Einheits-Structs; was Parameter braucht,
+kam als eigener Typ dazu (kein Breaking Change).
+`LogCosh` (`ln cosh(p − t)`) verhält sich wie `Mse` für kleine und wie `Mae` für große Fehler, ist überall glatt,
+und sein Gradient `tanh(d)/n` ist durch `1/n` begrenzt; ausgewertet wird überlauffrei und mit einem
+`exp_m1`/`ln_1p`-Zweig für winzige `d` (die Lehrbuchform verliert dort ihre Stellen: bei `d = 1e-3` hat sie 4,6 % Fehler,
+bei `d = 1e-4` ergibt sie `0` statt `5·10⁻⁹`). `Hinge` und `SquaredHinge` erwarten Ziele `−1`/`+1` und rohe Vorhersagen; Samples mit Rand `t·p ≥ 1`
+tragen nichts bei, und `NaN` bleibt in Wert *und* Gradient `NaN` (ein verschluckter Gradient würde das Clipping
+täuschen). `WeightedBinaryCrossEntropyWithLogits` wirkt wie PyTorchs `pos_weight` (Gradient
+`((1 + (w−1)t)·σ(z) − w·t)/n`, bleibt bei gesättigten Logits voll erhalten): auf Daten im Verhältnis 1 : 9 hebt `w = 9`
+den Recall von 0,50 auf 0,88 und senkt dafür die Präzision von 0,77 auf 0,39. `FocalLossWithLogits` (`γ`, optional `α`)
+dämpft leichte Samples um `q^γ`; der Gradient ist so umgeformt, dass `q^(γ−1)` nie auftritt – bei hartem Ziel und `q = 0`
+gäbe es sonst `0·∞` (getestet für `γ ∈ {0, 0.3, 1, 2, 5}` und Logits bis `±f32::MAX`). `LabelSmoothingCrossEntropy`
+weicht das Ziel zu `(1−ε)t + εT/K` auf: auf trennbaren Daten landet die mittlere Sicherheit bei 0,9317 (Theorie
+`1 − ε + ε/K = 0,9333`) statt bei 0,9998 ohne Glättung.
+
+**NAdam, RAdam, Lookahead.** `NAdam` (Nesterov-Vorausschau, konstantes `β₁`) und `RAdam` (berichtigte adaptive Lernrate,
+kein Warmup nötig) teilen sich den Rechenkern mit `Adam`/`AdamW`; deren Ergebnisse sind unverändert (bitgleich, durch einen Golden-Test
+in `tests/golden_adam.rs` festgehalten), der Zustand ist derselbe: zwei Puffer. `NAdam` mit `β₁ = 0` ist bitgleich zu `Adam` mit `β₁ = 0`. Beide haben optional
+entkoppelten Weight Decay (nur Gewichte). `RAdam` rechnet in den ersten Schritten (`ρₜ ≤ 5`, bei `β₂ = 0.999` etwa fünf) ohne
+adaptiven Nenner – der Schritt skaliert dann mit dem Gradienten wie bei SGD, nicht mit `lr` wie bei Adam. Beide sind gegen
+unabhängige `f64`-Referenzen der Formeln getestet (bei `β₂ = 0.9`, damit der Wechsel bei `t = 6` klar vom Schwellenwert `5`
+getrennt ist). `Lookahead<O>` umhüllt **jeden** Optimizer: `k` schnelle Schritte, dann `slow ← slow + α(fast − slow)` und
+`fast ← slow` (Standard `k = 5`, `α = 0.5`). Der Zustand ist der des inneren Optimizers plus **ein** Puffer
+(`size_of`-getestet). Bei verrauschten Gradienten (`Sgd`, `lr = 0.4`, Zweier-Batches) sinkt die Varianz des Gewichts an den
+Synchronisationspunkten auf das 0,13-Fache. Grenze: Gewichte, die man *nach* Trainingsbeginn lädt, kennt Lookahead nicht
+(dann einen neuen `Trainer` anlegen).
+
+**Training ohne Heap: Epochen, Skalierung, Early Stopping, Gewichtsmittel.**
+`Trainer::train_epoch(inputs, targets, batch_size, order, rng)` mischt und trainiert eine Epoche in Mini-Batches; der
+Index-Puffer `order` kommt vom Aufrufer (`[usize; N]`), also kein Heap. Gemischt wird per Fisher–Yates mit `Rng::below`
+(Lemires Verfahren, ohne die Modulo-Verzerrung von `next_u32() % n`; bei `bound ≈ ⅔·2³²` landeten sonst ⅔ statt ½ der Züge in
+der unteren Hälfte). Die Golden-Werte für `below` und `shuffle` stammen aus einer unabhängigen Python-Umsetzung des
+Generators – Läufe sind mit gleichem Seed reproduzierbar. `Trainer::evaluate_batch` liefert den mittleren Verlust im
+Inferenzmodus (für Validierungsdaten). `Standardizer<N>` skaliert Merkmale auf Mittelwert 0 und Streuung 1; `RunningStats<N>`
+sammelt sie per Welford in einem Durchlauf (stabil auch bei `1000 ± 0.01`), und `Standardizer::from_parts` ist eine `const fn`,
+die ermittelten Konstanten passen also als `static` in den Flash. Merkmale von der Größenordnung `1000 ± 10` und `0.01 ± 0.001`
+ergeben ohne Skalierung R² = −0,02, mit Skalierung R² = 1,00; praktisch konstante Merkmale behalten Skala 1 statt ihr
+Rundungsrauschen aufzublasen. `EarlyStopping` (Geduld, `min_delta`, minimieren oder maximieren, `NaN` nie eine Verbesserung)
+meldet `Improved` (jetzt Modell sichern) / `Waiting` / `Stop`: im Test überanpasst ein 48-Neuronen-Netz auf zwölf verrauschten
+Punkten, der Abbruch kommt nach 281 Epochen, das gesicherte Modell aus Epoche 131 hat Validierungsverlust 0,0208 statt 0,0301.
+`ParamEma<B>` führt ein gleitendes Mittel aller Parameter über `Params` mit (`[f32; N]` auf dem Stack, `Vec<f32>` mit `alloc`);
+bei SGD mit großer Lernrate und verrauschten Batches ist sein Fehler 0,0195 statt 0,198 für die rohen Gewichte.
+`ConfusionMatrix<K>` (Präzision, Recall, F1, Makro-F1; undefinierte Quotienten sind `0.0`, nie `NaN`), `r2_score` und
+`one_hot` runden das ab. `examples/classifier.rs` zeigt den ganzen Ablauf.
+
+**Entscheidungen bei der Inferenz.** `InferExt` gibt jedem `InferLayer` Methoden für die Entscheidung auf Logits:
+`classify` (Argmax), `classify_with_confidence` (Klasse und Softmax-Wahrscheinlichkeit), `classify_confident(x, schwelle)`
+(unsichere Fälle ablehnen), `probabilities`, `positive_probability` (ein Logit-Ausgang), `top_k` und `accuracy` (etwa als
+Selbsttest beim Start mit Testvektoren im Flash). Die Sicherheit des Siegers ist `1 / Σ exp(xᵢ − max)` – ohne Hilfspuffer und
+bitgleich zu `softmax_inplace` (auch in den Randfällen `−inf`/`+inf`; `NaN` im Ausgang ist nie eine Entscheidung mit
+Sicherheit). Im Beispiel nimmt die Schwelle 0,8 nur 98 von 150 Entscheidungen an, davon sind 96,9 % richtig (insgesamt: 88,7 %).
 
 ## Inferenz ohne Trainingsballast
 
@@ -247,7 +301,7 @@ Für große Netze liegt der `Trainer` entweder in einem `static`/`static mut`
 |---|---|
 | Backprop ist korrekt (Gewichte, Biases, Eingabe) | `tests/gradcheck.rs` (numerische Gradienten, auch durch `Chain`) |
 | Ableitung jeder Aktivierung stimmt | Unit-Tests (Finite Differences, Referenzwerte, Extremwerte) und `tests/gradcheck_activations.rs` (durch echte Layer, mit Knick-Vorbedingung) |
-| Der Standardpfad allokiert **nie** | `tests/no_alloc.rs` (zählender `#[global_allocator]`, 0 Allokationen über Aufbau, Init, Training mit jedem Optimizer, jeder Aktivierung (statisch und jede `ActivationKind`-Variante), jedem Verlust, Clipping, jedem Lernraten-Plan, Softmax, Modell speichern/laden, Inferenz) |
+| Der Standardpfad allokiert **nie** | `tests/no_alloc.rs` (zählender `#[global_allocator]`, 0 Allokationen über Aufbau, Init, Training mit jedem Optimizer, jeder Aktivierung (statisch und jede `ActivationKind`-Variante), jedem Verlust, Clipping, jedem Lernraten-Plan, Softmax, Modell speichern/laden, Inferenz, Epochen-Training, Early Stopping, EMA, Metriken und `InferExt`) |
 | Lernt XOR/Regression | `tests/xor.rs`, `tests/training_extensions.rs` (ausgewählte Kombinationen aus Aktivierung und Optimizer, je 4 Seeds; Ridge-Lösung für L2; Clipping; Ausreißer-Robustheit) |
 | BCE-Sättigung behoben | `tests/training_extensions.rs` (altes Netz friert exakt ein, Logit-Verlust erholt sich) und Unit-Tests (gesättigte und extreme Logits) |
 | Bias bleibt vom Zerfall verschont | Unit-Tests je Optimizer und Ende-zu-Ende-Test (`b = 5` statt `4`) |
@@ -257,6 +311,9 @@ Für große Netze liegt der `Trainer` entweder in einem `static`/`static mut`
 | Parameter-Import/-Export | `tests/params_io.rs` (Layout, atomare Fehler, Roundtrip, handgeschriebene `const`-Gewichte, Stack ↔ Heap) |
 | Stack ≡ Heap | `tests/dynamic.rs` (bitgleiche Verluste/Vorhersagen, auch mit Clipping) |
 | Dimensionsfehler = Compilerfehler | `compile_fail`-Doctests in `src/lib.rs` und `src/infer.rs` |
+| Neue Verluste | Unit-Tests je Verlust (Gradient gegen zentrale Differenzen, Extremwerte bis `±f32::MAX`, `NaN`, Spezialfälle wie `w = 1`/`γ = 0`/`ε = 0` ≡ Basisverlust) und `tests/new_losses.rs` (Recall mit `pos_weight`, Glättungs-Optimum, Ausreißer-Robustheit von `LogCosh`) |
+| NAdam, RAdam, Lookahead | Unit-Tests gegen `f64`-Referenzen, `size_of`-Tests, Mutationsprüfung der Formeln; `tests/new_optimizers.rs` (XOR, Stack ≡ Heap, Rauschdämpfung) |
+| Training/Auswertung/Entscheidung | `tests/training_utils.rs`, `tests/inference_helpers.rs`, Unit-Tests in `rng`, `data`, `metrics`, `stopping`, `average`, `math` |
 | Wirklich `no_std` | CI: `cargo build --lib --target thumbv7em-none-eabihf` (mit und ohne `alloc`) |
 
 ## Grenzen

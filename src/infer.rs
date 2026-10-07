@@ -83,6 +83,112 @@ pub trait InferLayer: Params {
     }
 }
 
+/// Bequeme Entscheidungshilfen für jeden [`InferLayer`] – ohne Hilfspuffer (außer dem, den der
+/// Aufrufer selbst übergibt) und ohne Allokation.
+///
+/// Wird für **jeden** Inferenz-Layer automatisch bereitgestellt; es genügt, den Trait zu
+/// importieren (er steht in der [`prelude`](crate::prelude)). Die Ausgabe des Netzes wird dabei
+/// als **Logits** gelesen (letzte Schicht [`Linear`](crate::activation::Linear)); `argmax` ist
+/// auch auf Logits richtig, die Softmax-basierten Methoden rechnen sie in Wahrscheinlichkeiten um.
+///
+/// ```
+/// use neuron::prelude::*;
+///
+/// // 2 Merkmale -> 3 Klassen; die Gewichte legen fest: Klasse = größtes Merkmal-Muster.
+/// let mut model = InferDense::<2, 3, Linear>::from_parts(
+///     [[4.0, 0.0], [0.0, 4.0], [0.5, 0.5]],
+///     [0.0, 0.0, 0.0],
+///     Linear,
+/// );
+/// assert_eq!(model.classify(&[1.0, 0.0]), Some(0));
+///
+/// // Sicherheit des Siegers; unsichere Entscheidungen verwerfen:
+/// let (class, p) = model.classify_with_confidence(&[1.0, 0.0]).unwrap();
+/// assert_eq!(class, 0);
+/// assert!(p > 0.9);
+/// assert_eq!(model.classify_confident(&[1.0, 1.0], 0.9), None); // Klassen 0 und 1 gleich gut
+///
+/// let mut probabilities = [0.0; 3];
+/// model.probabilities(&[1.0, 0.0], &mut probabilities);
+/// assert!((probabilities.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+/// ```
+pub trait InferExt: InferLayer {
+    /// Klasse mit dem größten Ausgabewert (bei Gleichstand die erste); `None`, wenn die Ausgabe
+    /// leer ist oder nur aus `NaN` besteht. Siehe [`argmax`](crate::math::argmax).
+    fn classify(&mut self, input: &[f32]) -> Option<usize> {
+        crate::math::argmax(self.infer(input))
+    }
+
+    /// Klasse und deren Softmax-Wahrscheinlichkeit („Sicherheit“). `None` bei `NaN` im Ausgang.
+    /// Siehe [`softmax_confidence`](crate::math::softmax_confidence).
+    fn classify_with_confidence(&mut self, input: &[f32]) -> Option<(usize, f32)> {
+        crate::math::softmax_confidence(self.infer(input))
+    }
+
+    /// Wie [`classify`](Self::classify), aber nur, wenn die Sicherheit mindestens
+    /// `min_confidence` beträgt (typisch `0.5..=0.99`); sonst `None` („Ablehnung“). Eine
+    /// `NaN`-Schwelle lehnt alles ab.
+    fn classify_confident(&mut self, input: &[f32], min_confidence: f32) -> Option<usize> {
+        match self.classify_with_confidence(input) {
+            Some((class, p)) if p >= min_confidence => Some(class),
+            _ => None,
+        }
+    }
+
+    /// Schreibt die Softmax-Wahrscheinlichkeiten der Ausgabe nach `out`.
+    ///
+    /// # Panics
+    /// Wenn `out.len() != self.out_dim()`.
+    fn probabilities(&mut self, input: &[f32], out: &mut [f32]) {
+        let logits = self.infer(input);
+        assert_eq!(out.len(), logits.len(), "falsche Länge des Ausgabepuffers");
+        out.copy_from_slice(logits);
+        crate::math::softmax_inplace(out);
+    }
+
+    /// Wahrscheinlichkeit der positiven Klasse für ein Netz mit **einem** Logit-Ausgang
+    /// (trainiert mit [`BinaryCrossEntropyWithLogits`](crate::loss::BinaryCrossEntropyWithLogits)).
+    ///
+    /// # Panics
+    /// Wenn das Netz nicht genau einen Ausgang hat.
+    fn positive_probability(&mut self, input: &[f32]) -> f32 {
+        let out = self.infer(input);
+        assert_eq!(out.len(), 1, "genau ein Ausgang erwartet");
+        crate::math::sigmoid(out[0])
+    }
+
+    /// Indizes der `out.len()` größten Ausgabewerte, absteigend; gibt die Anzahl geschriebener
+    /// Indizes zurück. Siehe [`top_k`](crate::math::top_k).
+    fn top_k(&mut self, input: &[f32], out: &mut [usize]) -> usize {
+        crate::math::top_k(self.infer(input), out)
+    }
+
+    /// Anteil der Eingaben, deren [`classify`](Self::classify) dem Label entspricht – etwa als
+    /// Selbsttest beim Start mit im Flash abgelegten Testvektoren. Eine Eingabe ohne Entscheidung
+    /// (`None`) zählt als falsch. Leere Eingabe: `0.0`.
+    ///
+    /// # Panics
+    /// Wenn `inputs` und `labels` verschieden lang sind.
+    fn accuracy<X: AsRef<[f32]>>(&mut self, inputs: &[X], labels: &[usize]) -> f32 {
+        assert_eq!(
+            inputs.len(),
+            labels.len(),
+            "Eingaben und Labels verschieden lang"
+        );
+        if inputs.is_empty() {
+            return 0.0;
+        }
+        let correct = inputs
+            .iter()
+            .zip(labels)
+            .filter(|(x, &label)| self.classify(x.as_ref()) == Some(label))
+            .count();
+        correct as f32 / inputs.len() as f32
+    }
+}
+
+impl<T: InferLayer> InferExt for T {}
+
 /// Wandelt ein trainierbares Netz in sein Inferenz-Gegenstück um.
 ///
 /// Die Gradienten, Vor-Aktivierungen und der Eingabe-Gradient werden dabei
