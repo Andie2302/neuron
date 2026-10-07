@@ -136,6 +136,12 @@ impl Loss for Huber {
 /// `L = -1/n Σ [t ln p + (1-t) ln(1-p)]`.
 ///
 /// Die Vorhersage wird auf `[eps, 1 - eps]` begrenzt, damit `ln` endlich bleibt.
+///
+/// **Achtung, Sättigung:** In `f32` wird `σ(z)` für `z ≳ 17` exakt `1.0`. Dann ist
+/// die Sigmoid-Ableitung `y (1 - y)` exakt `0`, und der Gradient verschwindet –
+/// selbst wenn die Vorhersage völlig falsch ist (Ziel `0`, Ausgabe `1.0`). Das Netz
+/// bleibt dort für immer hängen. Für das Training ist deshalb
+/// [`BinaryCrossEntropyWithLogits`] auf einer `Linear`-Ausgabe vorzuziehen.
 #[derive(Clone, Copy, Debug)]
 pub struct BinaryCrossEntropy {
     /// Untere/obere Schranke für `p` (Standard `1e-7`).
@@ -168,6 +174,45 @@ impl Loss for BinaryCrossEntropy {
         for ((g, &p), &t) in grad.iter_mut().zip(pred).zip(target) {
             let p = p.clamp(self.eps, 1.0 - self.eps);
             *g = (p - t) / (p * (1.0 - p)) / n;
+        }
+    }
+}
+
+/// Binäre Kreuzentropie auf **Logits**, Sigmoid und Verlust fusioniert
+/// (letzte Schicht: [`Linear`](crate::activation::Linear)).
+///
+/// Für Logit `z` und Ziel `t ∈ [0, 1]`:
+///
+/// * Verlust: `L = max(z, 0) - t z + ln(1 + e^-|z|)` (Mittel über alle Elemente) –
+///   der überlauffreie Ausdruck für `-t ln σ(z) - (1 - t) ln(1 - σ(z))`.
+/// * Gradient: `dL/dz_i = (σ(z_i) - t_i) / n` bei `n` Elementen – der Verlust ist ein Mittel,
+///   der Gradient trägt dessen Faktor `1/n` (wie bei [`Mse`] und den anderen Verlusten). Bei
+///   einem Ausgang ist das `σ(z) - t`.
+///
+/// Die Ableitung von Sigmoid und Logarithmus kürzt sich analytisch heraus. Der
+/// Gradient bleibt dadurch auch für stark gesättigte Ausgaben `|z| ≫ 17`
+/// vollständig erhalten, wo [`BinaryCrossEntropy`] auf Wahrscheinlichkeiten
+/// einfriert. Bei der Inferenz macht [`math::sigmoid`]
+/// aus den Logits Wahrscheinlichkeiten.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BinaryCrossEntropyWithLogits;
+
+impl Loss for BinaryCrossEntropyWithLogits {
+    fn value(&self, logits: &[f32], target: &[f32]) -> f32 {
+        debug_assert_eq!(logits.len(), target.len());
+        let sum: f32 = logits
+            .iter()
+            .zip(target)
+            .map(|(&z, &t)| z.max(0.0) - t * z + math::ln_1p(math::exp(-math::abs(z))))
+            .sum();
+        sum / logits.len() as f32
+    }
+
+    fn gradient(&self, logits: &[f32], target: &[f32], grad: &mut [f32]) {
+        debug_assert!(logits.len() == target.len() && logits.len() == grad.len());
+        let n = logits.len() as f32;
+        for ((g, &z), &t) in grad.iter_mut().zip(logits).zip(target) {
+            *g = (math::sigmoid(z) - t) / n;
         }
     }
 }
@@ -259,6 +304,11 @@ mod tests {
             &[0.0, 1.0, 1.0],
         );
         check(
+            BinaryCrossEntropyWithLogits,
+            &[-2.0, 0.7, 3.0],
+            &[0.0, 1.0, 0.4],
+        );
+        check(
             SoftmaxCrossEntropy,
             &[0.5, -1.0, 2.0, 0.1],
             &[0.0, 0.0, 1.0, 0.0],
@@ -315,6 +365,99 @@ mod tests {
         let mut g = [9.0; 2];
         Mae.gradient(&[1.0, 2.0], &[1.0, 5.0], &mut g);
         assert_eq!(g, [0.0, -0.5]);
+    }
+
+    #[test]
+    fn bce_with_logits_known_values() {
+        // z = 0: σ = 0.5 -> L = ln 2, unabhängig vom Ziel.
+        for t in [0.0, 0.5, 1.0] {
+            let v = BinaryCrossEntropyWithLogits.value(&[0.0], &[t]);
+            assert!((v - core::f32::consts::LN_2).abs() < 1e-6, "t = {t}: {v}");
+        }
+        // z = 2, t = 1: -ln σ(2) = ln(1 + e^-2) = 0.126928
+        let v = BinaryCrossEntropyWithLogits.value(&[2.0], &[1.0]);
+        assert!((v - 0.126_928).abs() < 1e-5, "{v}");
+        // Gradient σ(z) - t
+        let mut g = [0.0];
+        BinaryCrossEntropyWithLogits.gradient(&[0.0], &[1.0], &mut g);
+        assert!((g[0] + 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn bce_with_logits_agrees_with_bce_on_probabilities() {
+        // Für mäßige Logits ist die fusionierte Form dieselbe Funktion:
+        //  Wert gleich, und dL/dz = dL/dp · σ'(z) = σ(z) - t.
+        for &z in &[-4.0f32, -1.5, -0.2, 0.3, 1.0, 3.5] {
+            for &t in &[0.0f32, 0.3, 1.0] {
+                let p = math::sigmoid(z);
+                let fused = BinaryCrossEntropyWithLogits.value(&[z], &[t]);
+                let plain = BinaryCrossEntropy::default().value(&[p], &[t]);
+                assert!(
+                    (fused - plain).abs() < 1e-5,
+                    "z = {z}, t = {t}: {fused} vs {plain}"
+                );
+
+                let mut g_prob = [0.0];
+                BinaryCrossEntropy::default().gradient(&[p], &[t], &mut g_prob);
+                let mut g_fused = [0.0];
+                BinaryCrossEntropyWithLogits.gradient(&[z], &[t], &mut g_fused);
+                let chained = g_prob[0] * p * (1.0 - p);
+                assert!((g_fused[0] - chained).abs() < 1e-5, "z = {z}, t = {t}");
+            }
+        }
+    }
+
+    #[test]
+    fn bce_with_logits_keeps_the_gradient_when_saturated() {
+        // Genau der Fall, in dem BCE auf Wahrscheinlichkeiten einfriert:
+        // Logit 30, Ziel 0: σ(30) ist in f32 exakt 1.0.
+        let p = math::sigmoid(30.0);
+        assert_eq!(p, 1.0);
+        let mut grad_p = [9.0];
+        BinaryCrossEntropy::default().gradient(&[p], &[0.0], &mut grad_p);
+        // dL/dz = dL/dp · σ'(z) mit σ'(z) = p(1-p) = 0  ->  verschwindet.
+        assert_eq!(grad_p[0] * p * (1.0 - p), 0.0);
+
+        let mut g = [0.0];
+        BinaryCrossEntropyWithLogits.gradient(&[30.0], &[0.0], &mut g);
+        assert_eq!(g[0], 1.0, "voller Gradient trotz Sättigung");
+        let v = BinaryCrossEntropyWithLogits.value(&[30.0], &[0.0]);
+        assert!((v - 30.0).abs() < 1e-4, "Verlust {v}");
+    }
+
+    #[test]
+    fn bce_with_logits_gradient_is_the_mean_gradient_for_several_outputs() {
+        let (z, t) = ([0.0f32, 2.0, -1.0], [1.0f32, 0.0, 0.5]);
+        let mut g = [0.0; 3];
+        BinaryCrossEntropyWithLogits.gradient(&z, &t, &mut g);
+        for i in 0..3 {
+            let expected = (math::sigmoid(z[i]) - t[i]) / 3.0;
+            assert!(
+                (g[i] - expected).abs() < 1e-7,
+                "i = {i}: {} vs {expected}",
+                g[i]
+            );
+        }
+        // Ein Ausgang: genau σ(z) - t.
+        let mut one = [0.0];
+        BinaryCrossEntropyWithLogits.gradient(&[2.0], &[0.0], &mut one);
+        assert!((one[0] - math::sigmoid(2.0)).abs() < 1e-7);
+    }
+
+    #[test]
+    fn bce_with_logits_is_finite_for_extreme_logits() {
+        for &z in &[1e3f32, -1e3, 1e30, -1e30, f32::MAX, -f32::MAX] {
+            for &t in &[0.0f32, 0.5, 1.0] {
+                let v = BinaryCrossEntropyWithLogits.value(&[z], &[t]);
+                let mut g = [0.0];
+                BinaryCrossEntropyWithLogits.gradient(&[z], &[t], &mut g);
+                assert!(
+                    v.is_finite() && g[0].is_finite(),
+                    "z = {z}, t = {t}: {v}, {g:?}"
+                );
+                assert!(v >= 0.0, "z = {z}, t = {t}: Verlust {v} negativ");
+            }
+        }
     }
 
     #[test]

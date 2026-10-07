@@ -154,6 +154,18 @@ fn train_briefly<O: Optimizer>(opt: O) -> f32 {
     sum + t.predict(&XS[0])[0]
 }
 
+/// Trainiert kurz ein kleines Netz mit der gegebenen (statischen) Aktivierung.
+fn train_with_activation<A: Activation + Copy>(act: A) -> f32 {
+    let mut net = Dense::<2, 3, _>::new(act).then(Dense::<3, 1, _>::new(Linear));
+    net.init(&XavierUniform, &mut Pcg32::seeded(2));
+    let mut t = Trainer::new(net, Mse, Sgd::new(0.01));
+    let mut sum = 0.0;
+    for i in 0..20 {
+        sum += t.train_step(&XS[i % 4], &YS[i % 4]);
+    }
+    sum + t.predict(&XS[0])[0]
+}
+
 /// Trainiert kurz mit dem gegebenen Verlust (Softmax-Cross-Entropy braucht Ziele, die
 /// zu einer Verteilung summieren – hier genügt eine feste, gültige Zielverteilung).
 fn train_with_loss<Ls: Loss>(loss: Ls) -> f32 {
@@ -185,6 +197,11 @@ fn every_activation_optimizer_loss_and_schedule_never_touches_the_heap() {
         ActivationKind::Elu(1.0),
         ActivationKind::Softplus,
         ActivationKind::Mish,
+        ActivationKind::Relu6,
+        ActivationKind::HardSigmoid,
+        ActivationKind::HardSwish,
+        ActivationKind::HardTanh,
+        ActivationKind::Softsign,
     ];
     for kind in kinds {
         let mut net =
@@ -196,6 +213,23 @@ fn every_activation_optimizer_loss_and_schedule_never_touches_the_heap() {
         }
         sink += t.predict(&XS[0])[0];
     }
+
+    // Jede Aktivierung als statischer Typ (nicht nur über das Enum).
+    sink += train_with_activation(Linear);
+    sink += train_with_activation(Relu);
+    sink += train_with_activation(LeakyRelu::default());
+    sink += train_with_activation(Sigmoid);
+    sink += train_with_activation(Tanh);
+    sink += train_with_activation(Gelu);
+    sink += train_with_activation(Swish);
+    sink += train_with_activation(Elu::default());
+    sink += train_with_activation(Softplus);
+    sink += train_with_activation(Mish);
+    sink += train_with_activation(Relu6);
+    sink += train_with_activation(HardSigmoid);
+    sink += train_with_activation(HardSwish);
+    sink += train_with_activation(HardTanh);
+    sink += train_with_activation(Softsign);
 
     // Jeder Optimizer (inklusive Weight Decay, Nesterov und Momentum bei RMSprop).
     sink += train_briefly(Sgd::new(0.01));
@@ -211,12 +245,14 @@ fn every_activation_optimizer_loss_and_schedule_never_touches_the_heap() {
     sink += train_briefly(RmsProp::new(0.01));
     sink += train_briefly(RmsProp::new(0.01).with_momentum(0.9));
     sink += train_briefly(Adagrad::new(0.1));
+    sink += train_briefly(Lion::new(0.01).with_weight_decay(0.1));
 
     // Jeder Verlust.
     sink += train_with_loss(Mse);
     sink += train_with_loss(Mae);
     sink += train_with_loss(Huber::new(0.5));
     sink += train_with_loss(BinaryCrossEntropy::default());
+    sink += train_with_loss(BinaryCrossEntropyWithLogits);
     sink += train_with_loss(SoftmaxCrossEntropy);
 
     // Jeder Lernraten-Plan.
@@ -235,4 +271,67 @@ fn every_activation_optimizer_loss_and_schedule_never_touches_the_heap() {
     let used = allocs() - before;
     std::hint::black_box(sink);
     assert_eq!(used, 0, "{used} Heap-Allokationen");
+}
+
+#[test]
+fn model_save_load_inspect_and_fingerprint_never_touch_the_heap() {
+    use neuron::model::{crc32, inspect, model_len};
+    let before = allocs();
+
+    let mut net = Dense::<2, 4, _>::new(Gelu)
+        .then(Dropout::<4>::new(0.1, 1))
+        .then(Dense::<4, 1, _>::new(Linear));
+    net.init(&XavierUniform, &mut Pcg32::seeded(3));
+    let mut bytes = [0u8; model_len(2 * 4 + 4 + 4 + 1)];
+    let written = net.save_model(&mut bytes).unwrap();
+
+    let mut other = Dense::<2, 4, _>::new(Gelu)
+        .then(Dropout::<4>::new(0.1, 2))
+        .then(Dense::<4, 1, _>::new(Linear));
+    other.load_model(&bytes[..written]).unwrap();
+    let header = inspect(&bytes).unwrap();
+    let wrong = other.load_model(&bytes[..10]);
+
+    let used = allocs() - before;
+    assert!(
+        wrong.is_err(),
+        "abgeschnittenes Modell muss abgelehnt werden"
+    );
+    std::hint::black_box((header, crc32(&bytes), other.fingerprint()));
+    assert_eq!(
+        used, 0,
+        "{used} Heap-Allokationen in Modell-Speichern/-Laden"
+    );
+}
+
+static BAKED: InferDense<2, 1, Relu> = InferDense::from_parts([[1.0, -1.0]], [0.5], Relu);
+
+#[test]
+fn inference_conversion_and_forward_never_touch_the_heap() {
+    let before = allocs();
+
+    let mut net = Dense::<2, 8, _>::new(Gelu)
+        .then(Dropout::<8>::new(0.1, 1))
+        .then(Dense::<8, 1, _>::new(Swish));
+    net.init(&XavierUniform, &mut Pcg32::seeded(9));
+    let mut bytes = [0u8; neuron::model::model_len(2 * 8 + 8 + 8 + 1)];
+    net.save_model(&mut bytes).unwrap();
+
+    let mut deployed = net.into_inference();
+    let mut sink = 0.0f32;
+    for x in &XS {
+        sink += deployed.infer(x)[0];
+    }
+    let mut restored = Dense::<2, 8, _>::new(Gelu)
+        .into_inference()
+        .then(Dense::<8, 1, _>::new(Swish).into_inference());
+    restored.load_model(&bytes).unwrap();
+    sink += restored.infer(&XS[1])[0];
+    let mut out = [0.0];
+    BAKED.infer_into(&[3.0, 1.0], &mut out);
+    sink += out[0];
+
+    let used = allocs() - before;
+    std::hint::black_box(sink);
+    assert_eq!(used, 0, "{used} Heap-Allokationen in der Inferenz");
 }

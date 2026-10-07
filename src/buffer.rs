@@ -5,7 +5,7 @@
 //!   (nur mit Feature `alloc`).
 //! * [`Storage`] – legt für einen Layer fest, *welche* Puffertypen er für
 //!   Eingabe, Ausgabe und Gewichtsmatrix verwendet. [`Stack`] bildet die
-//!   Dimensionen als Const Generics ab, [`Heap`] als Laufzeitwerte.
+//!   Dimensionen als Const Generics ab, `Heap` (Feature `alloc`) als Laufzeitwerte.
 //!
 //! Alle Rechenkerne arbeiten ausschließlich auf `&[f32]`-Slices; die Puffertypen
 //! entscheiden nur, *wo* der Speicher liegt.

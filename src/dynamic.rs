@@ -8,11 +8,13 @@ use alloc::vec::Vec;
 
 use crate::activation::ActivationKind;
 use crate::buffer::Heap;
-use crate::dense::{DenseOptState, HeapDense};
+use crate::dense::{DenseOptState, HeapDense, HeapInferenceDense};
 use crate::dropout::HeapDropout;
+use crate::infer::{InferLayer, IntoInference};
 use crate::init::Initializer;
 use crate::layer::{Layer, Mode};
 use crate::optim::Optimizer;
+use crate::params::{LayerSig, Params};
 use crate::rng::Rng;
 
 /// Ein Layer der dynamischen Topologie.
@@ -36,6 +38,21 @@ macro_rules! dispatch {
     };
 }
 
+impl Params for DynLayer {
+    fn param_count(&self) -> usize {
+        dispatch!(self, l => l.param_count())
+    }
+    fn visit_params<F: FnMut(&[f32])>(&self, f: &mut F) {
+        dispatch!(self, l => l.visit_params(f))
+    }
+    fn visit_params_mut<F: FnMut(&mut [f32])>(&mut self, f: &mut F) {
+        dispatch!(self, l => l.visit_params_mut(f))
+    }
+    fn visit_signatures<F: FnMut(LayerSig)>(&self, f: &mut F) {
+        dispatch!(self, l => l.visit_signatures(f))
+    }
+}
+
 impl Layer for DynLayer {
     type Input = Vec<f32>;
     type Output = Vec<f32>;
@@ -46,9 +63,6 @@ impl Layer for DynLayer {
     }
     fn out_dim(&self) -> usize {
         dispatch!(self, l => l.out_dim())
-    }
-    fn param_count(&self) -> usize {
-        dispatch!(self, l => l.param_count())
     }
     fn init<I: Initializer, R: Rng + ?Sized>(&mut self, init: &I, rng: &mut R) {
         dispatch!(self, l => l.init(init, rng))
@@ -64,12 +78,6 @@ impl Layer for DynLayer {
     }
     fn grad_input(&self) -> &[f32] {
         dispatch!(self, l => l.grad_input())
-    }
-    fn visit_params<F: FnMut(&[f32])>(&self, f: &mut F) {
-        dispatch!(self, l => l.visit_params(f))
-    }
-    fn visit_params_mut<F: FnMut(&mut [f32])>(&mut self, f: &mut F) {
-        dispatch!(self, l => l.visit_params_mut(f))
     }
     fn visit_grads<F: FnMut(&[f32])>(&self, f: &mut F) {
         dispatch!(self, l => l.visit_grads(f))
@@ -155,6 +163,27 @@ impl Sequential {
     }
 }
 
+impl Params for Sequential {
+    fn param_count(&self) -> usize {
+        self.layers.iter().map(|l| l.param_count()).sum()
+    }
+    fn visit_params<F: FnMut(&[f32])>(&self, f: &mut F) {
+        for l in &self.layers {
+            l.visit_params(f);
+        }
+    }
+    fn visit_params_mut<F: FnMut(&mut [f32])>(&mut self, f: &mut F) {
+        for l in &mut self.layers {
+            l.visit_params_mut(f);
+        }
+    }
+    fn visit_signatures<F: FnMut(LayerSig)>(&self, f: &mut F) {
+        for l in &self.layers {
+            l.visit_signatures(f);
+        }
+    }
+}
+
 impl Layer for Sequential {
     type Input = Vec<f32>;
     type Output = Vec<f32>;
@@ -166,10 +195,6 @@ impl Layer for Sequential {
     fn out_dim(&self) -> usize {
         self.layers.last().map_or(self.in_dim, |l| l.out_dim())
     }
-    fn param_count(&self) -> usize {
-        self.layers.iter().map(|l| l.param_count()).sum()
-    }
-
     fn init<I: Initializer, R: Rng + ?Sized>(&mut self, init: &I, rng: &mut R) {
         for l in &mut self.layers {
             l.init(init, rng);
@@ -218,16 +243,6 @@ impl Layer for Sequential {
         self.layers[0].grad_input()
     }
 
-    fn visit_params<F: FnMut(&[f32])>(&self, f: &mut F) {
-        for l in &self.layers {
-            l.visit_params(f);
-        }
-    }
-    fn visit_params_mut<F: FnMut(&mut [f32])>(&mut self, f: &mut F) {
-        for l in &mut self.layers {
-            l.visit_params_mut(f);
-        }
-    }
     fn visit_grads<F: FnMut(&[f32])>(&self, f: &mut F) {
         for l in &self.layers {
             l.visit_grads(f);
@@ -250,5 +265,138 @@ impl Layer for Sequential {
         for (l, s) in self.layers.iter_mut().zip(state.iter_mut()) {
             l.step(opt, s);
         }
+    }
+}
+
+/// Inferenz-Gegenstück zu [`Sequential`]: nur die Dense-Layer mit Gewichten und
+/// Biases, ohne Gradienten und ohne Dropout (in der Inferenz die Identität).
+///
+/// Entsteht über [`IntoInference::into_inference`]. Ein Netz ohne Dense-Layer
+/// gibt seine Eingabe unverändert zurück.
+#[derive(Clone, Debug)]
+pub struct InferSequential {
+    in_dim: usize,
+    layers: Vec<HeapInferenceDense<ActivationKind>>,
+}
+
+impl InferSequential {
+    /// Die verbliebenen Dense-Layer in Reihenfolge.
+    pub fn layers(&self) -> &[HeapInferenceDense<ActivationKind>] {
+        &self.layers
+    }
+}
+
+impl Params for InferSequential {
+    fn param_count(&self) -> usize {
+        self.layers.iter().map(|l| l.param_count()).sum()
+    }
+    fn visit_params<F: FnMut(&[f32])>(&self, f: &mut F) {
+        for l in &self.layers {
+            l.visit_params(f);
+        }
+    }
+    fn visit_params_mut<F: FnMut(&mut [f32])>(&mut self, f: &mut F) {
+        for l in &mut self.layers {
+            l.visit_params_mut(f);
+        }
+    }
+    fn visit_signatures<F: FnMut(LayerSig)>(&self, f: &mut F) {
+        for l in &self.layers {
+            l.visit_signatures(f);
+        }
+    }
+}
+
+impl InferLayer for InferSequential {
+    type Input = Vec<f32>;
+    type Output = Vec<f32>;
+
+    fn in_dim(&self) -> usize {
+        self.in_dim
+    }
+    fn out_dim(&self) -> usize {
+        self.layers.last().map_or(self.in_dim, |l| l.out_dim())
+    }
+    fn infer<'a>(&'a mut self, input: &'a [f32]) -> &'a [f32] {
+        assert_eq!(input.len(), self.in_dim, "falsche Eingabelänge");
+        let mut current = input;
+        for layer in self.layers.iter_mut() {
+            current = layer.infer(current);
+        }
+        current
+    }
+}
+
+impl IntoInference for Sequential {
+    type Inference = InferSequential;
+
+    fn into_inference(self) -> InferSequential {
+        let layers = self
+            .layers
+            .into_iter()
+            .filter_map(|layer| match layer {
+                DynLayer::Dense(d) => Some(d.into_inference()),
+                DynLayer::Dropout(_) => None,
+            })
+            .collect();
+        InferSequential {
+            in_dim: self.in_dim,
+            layers,
+        }
+    }
+}
+
+/// Dropout-Ersatz für Heap-Netze in der Inferenz: gibt die Eingabe unverändert zurück.
+///
+/// Das Gegenstück zu [`Passthrough`](crate::infer::Passthrough) für Netze, deren Dimension
+/// erst zur Laufzeit feststeht. Hat keine Parameter und taucht weder im Export noch im
+/// Fingerprint auf. Entsteht über [`IntoInference::into_inference`] aus einem
+/// [`HeapDropout`], etwa in einer `Chain` aus Heap-Layern.
+#[derive(Clone, Copy, Debug)]
+pub struct HeapPassthrough {
+    dim: usize,
+}
+
+impl HeapPassthrough {
+    /// Identität über `dim` Features.
+    ///
+    /// # Panics
+    /// Bei `dim == 0`.
+    pub fn new(dim: usize) -> Self {
+        assert!(dim > 0, "Dimension muss > 0 sein");
+        HeapPassthrough { dim }
+    }
+}
+
+impl Params for HeapPassthrough {
+    fn param_count(&self) -> usize {
+        0
+    }
+    fn visit_params<F: FnMut(&[f32])>(&self, _f: &mut F) {}
+    fn visit_params_mut<F: FnMut(&mut [f32])>(&mut self, _f: &mut F) {}
+    fn visit_signatures<F: FnMut(LayerSig)>(&self, _f: &mut F) {}
+}
+
+impl InferLayer for HeapPassthrough {
+    type Input = Vec<f32>;
+    type Output = Vec<f32>;
+
+    fn in_dim(&self) -> usize {
+        self.dim
+    }
+    fn out_dim(&self) -> usize {
+        self.dim
+    }
+    fn infer<'a>(&'a mut self, input: &'a [f32]) -> &'a [f32] {
+        assert_eq!(input.len(), self.dim, "falsche Eingabelänge");
+        input
+    }
+}
+
+impl IntoInference for HeapDropout {
+    type Inference = HeapPassthrough;
+
+    fn into_inference(self) -> HeapPassthrough {
+        HeapPassthrough::new(self.in_dim())
     }
 }

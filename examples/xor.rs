@@ -13,13 +13,14 @@ const YS: [[f32; 1]; 4] = [[0.0], [1.0], [1.0], [0.0]];
 
 fn main() {
     // Topologie: die Dimensionen stecken im Typ und werden vom Compiler geprüft.
-    let mut net = Dense::<2, 4, _>::new(Tanh).then(Dense::<4, 1, _>::new(Sigmoid));
+    // Linear-Ausgang + Logit-Verlust: kein Einfrieren bei gesättigtem Sigmoid.
+    let mut net = Dense::<2, 4, _>::new(Tanh).then(Dense::<4, 1, _>::new(Linear));
 
     // Initialisierung (deterministisch, ohne Entropiequelle).
     let mut rng = Pcg32::seeded(2024);
     net.init(&XavierUniform, &mut rng);
 
-    let mut trainer = Trainer::new(net, BinaryCrossEntropy::default(), Adam::new(0.05));
+    let mut trainer = Trainer::new(net, BinaryCrossEntropyWithLogits, Adam::new(0.05));
 
     println!(
         "Parameter: {}, Trainer-Größe auf dem Stack: {} Byte",
@@ -37,7 +38,7 @@ fn main() {
 
     println!("\nEingabe  Ziel  Vorhersage");
     for (x, y) in XS.iter().zip(&YS) {
-        let p = trainer.predict(x)[0];
+        let p = sigmoid(trainer.predict(x)[0]); // Sigmoid erst bei der Inferenz
         println!("{:?}   {}    {:.4}", x, y[0], p);
     }
 }

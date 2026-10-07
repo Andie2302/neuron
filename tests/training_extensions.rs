@@ -444,3 +444,151 @@ fn huber_and_mae_resist_an_outlier_that_drags_mse_away() {
     assert!(mae < 0.5, "MAE-Steigungsfehler {mae}");
     assert!(huber < mse / 10.0 && mae < mse / 10.0);
 }
+
+/// Das Netz startet völlig falsch und gesättigt: Logit 30, Ziel 0.
+#[test]
+fn saturated_wrong_output_freezes_with_probability_bce_but_recovers_with_logits_bce() {
+    // Alt: Sigmoid-Ausgang + BCE auf Wahrscheinlichkeiten. σ(30) = 1.0 exakt in f32,
+    // σ' = 0, der Gradient verschwindet – das Netz bleibt für immer so falsch.
+    let mut frozen_net = Dense::<1, 1, _>::new(Sigmoid);
+    *frozen_net.weights_mut() = [[30.0]];
+    let mut frozen = Trainer::new(frozen_net, BinaryCrossEntropy::default(), Sgd::new(0.5));
+    let initial_loss = frozen.evaluate(&[1.0], &[0.0]);
+    for _ in 0..100 {
+        frozen.train_step(&[1.0], &[0.0]);
+    }
+    assert_eq!(
+        frozen.network().weights(),
+        &[[30.0]],
+        "Gewicht hat sich bewegt"
+    );
+    assert_eq!(
+        frozen.evaluate(&[1.0], &[0.0]),
+        initial_loss,
+        "Verlust sank trotz Nullgradient"
+    );
+    assert!(initial_loss > 10.0, "Ausgangsverlust {initial_loss}");
+
+    // Neu: Linear-Ausgang + fusionierter Logit-Verlust. Gradient σ(z) - t = 1 bleibt voll erhalten.
+    let mut net = Dense::<1, 1, _>::new(Linear);
+    *net.weights_mut() = [[30.0]];
+    let mut fixed = Trainer::new(net, BinaryCrossEntropyWithLogits, Sgd::new(0.5));
+    for _ in 0..100 {
+        fixed.train_step(&[1.0], &[0.0]);
+    }
+    // Der Gradient σ(z) schrumpft, sobald der Logit richtig liegt (z fällt dann nur noch
+    // wie -ln t). Nach 30 Schritten ist z ≈ 0 überschritten, nach 100 liegt es bei ≈ -4.
+    let logit = fixed.predict(&[1.0])[0];
+    assert!(
+        logit < -3.0,
+        "Logit {logit} hat sich nicht erholt (Start: 30)"
+    );
+    assert!(fixed.evaluate(&[1.0], &[0.0]) < 0.05);
+    assert!(sigmoid(logit) < 0.05);
+}
+
+#[test]
+fn xor_with_logits_loss_and_sigmoid_only_at_inference() {
+    for seed in [1u64, 2, 3, 4] {
+        let mut net = Dense::<2, 8, _>::new(Gelu).then(Dense::<8, 1, _>::new(Linear));
+        net.init(&XavierUniform, &mut Pcg32::seeded(seed));
+        let mut t = Trainer::new(net, BinaryCrossEntropyWithLogits, AdamW::new(0.03));
+        for _ in 0..1200 {
+            t.train_batch(xor_batch());
+        }
+        for (x, y) in XS.iter().zip(&YS) {
+            let p = sigmoid(t.predict(x)[0]);
+            assert!((p - y[0]).abs() < 0.15, "seed {seed}, x = {x:?}: p = {p}");
+        }
+    }
+}
+
+/// `(w, b)` nach dem Training auf konstantem Ziel 5 bei Eingabe 0: das Gewicht
+/// beeinflusst den Verlust nicht (x = 0), es kann also nur zerfallen; der Bias
+/// muss das Ziel erreichen.
+fn fit_constant_target<O: Optimizer>(opt: O, steps: usize) -> (f32, f32) {
+    let mut net = Dense::<1, 1, _>::new(Linear);
+    net.init(&Constant(1.0), &mut Pcg32::seeded(0));
+    let mut t = Trainer::new(net, Mse, opt);
+    for _ in 0..steps {
+        t.train_step(&[0.0], &[5.0]);
+    }
+    (
+        t.network().weights_as_slice()[0],
+        t.network().bias_as_slice()[0],
+    )
+}
+
+#[test]
+fn weight_decay_shrinks_the_weight_but_leaves_the_bias_alone() {
+    // Sgd: ohne Bias-Ausnahme läge das Gleichgewicht bei b = 2·5/(2 + wd) = 4.
+    let (w, b) = fit_constant_target(Sgd::new(0.1).with_weight_decay(0.5), 400);
+    assert!(w.abs() < 1e-3, "Gewicht müsste zerfallen sein: {w}");
+    assert!((b - 5.0).abs() < 1e-3, "Bias wurde mit zerfallen: {b}");
+
+    let (w, b) = fit_constant_target(Momentum::new(0.05, 0.9).with_weight_decay(0.5), 600);
+    assert!(w.abs() < 1e-2, "Momentum: Gewicht {w}");
+    assert!((b - 5.0).abs() < 1e-2, "Momentum: Bias {b}");
+
+    // AdamW: mit Bias-Zerfall läge das Gleichgewicht bei ≈ 1/wd = 1.
+    let (w, b) = fit_constant_target(AdamW::new(0.05).with_weight_decay(1.0), 2000);
+    assert!(w.abs() < 0.05, "AdamW: Gewicht {w}");
+    assert!((b - 5.0).abs() < 0.1, "AdamW: Bias {b}");
+}
+
+#[test]
+fn xor_with_hard_activations() {
+    // Alle ohne exp/tanh. Stückweise lineare Funktionen brauchen etwas mehr Zeit.
+    // HardSigmoid fehlt hier bewusst: als *versteckte* Schicht ist sie im Bereich (-3, 3)
+    // linear, ein fast lineares Netz kann XOR nicht lernen. Sie ist für Gates und Ausgänge
+    // gedacht (siehe `hard_sigmoid_recovers_its_own_parameters`).
+    assert_learns_xor("HardSwish+AdamW", HardSwish, AdamW::new(0.03), 1500);
+    assert_learns_xor("Relu6+AdamW", Relu6, AdamW::new(0.03), 1500);
+    assert_learns_xor("HardTanh+AdamW", HardTanh, AdamW::new(0.03), 1500);
+    assert_learns_xor("Softsign+AdamW", Softsign, AdamW::new(0.03), 1500);
+}
+
+#[test]
+fn hard_sigmoid_recovers_its_own_parameters() {
+    // y = HardSigmoid(x/3 + 0.25) auf x ∈ [-3, 3]: Vor-Aktivierung bleibt in (-3, 3), wo die
+    // Ableitung 1/6 ist. Das Training muss die Parameter (1/3, 0.25) aus einem falschen Start finden.
+    let mut net = Dense::<1, 1, _>::new(HardSigmoid);
+    *net.weights_mut() = [[1.0]];
+    *net.bias_mut() = [-0.5];
+    let mut t = Trainer::new(net, Mse, Adam::new(0.05));
+    let mut samples = [([0.0f32; 1], [0.0f32; 1]); 25];
+    for (i, s) in samples.iter_mut().enumerate() {
+        let x = -3.0 + 0.25 * i as f32;
+        *s = ([x], [HardSigmoid.apply(x / 3.0 + 0.25)]);
+    }
+    for _ in 0..1500 {
+        t.train_batch(samples.iter().map(|(x, y)| (&x[..], &y[..])));
+    }
+    let (w, b) = (
+        t.network().weights_as_slice()[0],
+        t.network().bias_as_slice()[0],
+    );
+    assert!((w - 1.0 / 3.0).abs() < 0.01, "w = {w}");
+    assert!((b - 0.25).abs() < 0.02, "b = {b}");
+}
+
+#[test]
+fn xor_with_lion() {
+    // Lion macht Schritte der Länge lr: kleine Rate, dafür gleichmäßiger Fortschritt.
+    assert_learns_xor("Gelu+Lion", Gelu, Lion::new(0.01), 1200);
+    assert_learns_xor(
+        "HardSwish+Lion",
+        HardSwish,
+        Lion::new(0.01).with_weight_decay(0.1),
+        1500,
+    );
+}
+
+#[test]
+fn lion_with_weight_decay_leaves_the_bias_alone_end_to_end() {
+    // Wie bei den anderen Optimizern: das Gewicht zerfällt, der Bias erreicht das Ziel.
+    // Lion oszilliert in einem Band der Breite ~lr um das Optimum.
+    let (w, b) = fit_constant_target(Lion::new(0.01).with_weight_decay(1.0), 3000);
+    assert!(w.abs() < 0.05, "Gewicht müsste zerfallen sein: {w}");
+    assert!((b - 5.0).abs() < 0.1, "Bias wurde mit zerfallen: {b}");
+}

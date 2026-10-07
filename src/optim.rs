@@ -6,7 +6,7 @@
 //! *generisches assoziiertes Typ* über den Puffertyp des Tensors:
 //!
 //! ```text
-//! type State<B: Buffer>;   // Sgd: ()   Momentum: B   Adam/AdamW: AdamState<B>   RmsProp: RmsPropState<B>
+//! type State<B: Buffer>;   // Sgd: ()   Momentum/Adagrad/RmsProp/Lion: B   Adam/AdamW: AdamState<B>   RmsPropMomentum: RmsPropState<B>
 //! ```
 //!
 //! Für ein Gewichts-Array `[[f32; IN]; OUT]` ist der Zustand also wieder ein
@@ -21,11 +21,34 @@
 //!   Gradienten noch Adams adaptive Skalierung:
 //!   `p ← p - lr · weight_decay · p - lr · m̂ / (√v̂ + ε)`.
 //!
-//! Weight Decay wirkt auf **alle** Parameter-Tensoren, also auch auf Biases
-//! (so macht es auch PyTorch standardmäßig).
+//! Weight Decay wirkt **nur auf Gewichte** ([`ParamKind::Weight`]); Biases
+//! ([`ParamKind::Bias`]) bleiben verschont. Ein Bias verschiebt nur die
+//! Lage der Aktivierung und trägt nicht zur Überanpassung bei. Ihn zu
+//! verkleinern zöge die Ausgabe unnötig in Richtung `0`.
 
 use crate::buffer::Buffer;
 use crate::math;
+
+/// Art eines Parameter-Tensors. Der Optimizer entscheidet damit, ob Weight Decay
+/// greift (nur bei Gewichten).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParamKind {
+    /// Gewichtsmatrix: wird regularisiert (Weight Decay).
+    Weight,
+    /// Bias-Vektor: bleibt vom Weight Decay verschont.
+    Bias,
+}
+
+impl ParamKind {
+    /// `decay` für Gewichte, sonst `0.0`.
+    #[inline]
+    fn decay(self, decay: f32) -> f32 {
+        match self {
+            ParamKind::Weight => decay,
+            ParamKind::Bias => 0.0,
+        }
+    }
+}
 
 /// Aktualisiert Parameter anhand ihrer Gradienten.
 pub trait Optimizer {
@@ -39,8 +62,15 @@ pub trait Optimizer {
     /// gerufen (z. B. Schrittzähler für Adams Bias-Korrektur).
     fn begin_step(&mut self) {}
 
-    /// Wendet den Gradienten `grads` auf `params` an.
-    fn update<B: Buffer>(&self, state: &mut Self::State<B>, params: &mut B, grads: &B);
+    /// Wendet den Gradienten `grads` auf `params` an. `kind` sagt, ob es sich um
+    /// Gewichte oder einen Bias handelt (Weight Decay wirkt nur auf Gewichte).
+    fn update<B: Buffer>(
+        &self,
+        state: &mut Self::State<B>,
+        params: &mut B,
+        grads: &B,
+        kind: ParamKind,
+    );
 
     /// Aktuelle Lernrate.
     fn learning_rate(&self) -> f32;
@@ -90,9 +120,10 @@ impl Optimizer for Sgd {
 
     fn init_state<B: Buffer>(&self, _len: usize) -> Self::State<B> {}
 
-    fn update<B: Buffer>(&self, _state: &mut (), params: &mut B, grads: &B) {
+    fn update<B: Buffer>(&self, _state: &mut (), params: &mut B, grads: &B, kind: ParamKind) {
+        let decay = kind.decay(self.weight_decay);
         for (p, g) in params.as_mut_slice().iter_mut().zip(grads.as_slice()) {
-            let g = g + self.weight_decay * *p;
+            let g = g + decay * *p;
             *p -= self.lr * g;
         }
     }
@@ -157,14 +188,15 @@ impl Optimizer for Momentum {
         B::zeroed(len)
     }
 
-    fn update<B: Buffer>(&self, velocity: &mut B, params: &mut B, grads: &B) {
+    fn update<B: Buffer>(&self, velocity: &mut B, params: &mut B, grads: &B, kind: ParamKind) {
+        let decay = kind.decay(self.weight_decay);
         let it = params
             .as_mut_slice()
             .iter_mut()
             .zip(grads.as_slice())
             .zip(velocity.as_mut_slice());
         for ((p, g), v) in it {
-            let g = g + self.weight_decay * *p;
+            let g = g + decay * *p;
             *v = self.beta * *v + g;
             let step = if self.nesterov {
                 g + self.beta * *v
@@ -299,7 +331,13 @@ impl Optimizer for Adam {
         self.clock.tick(self.beta1, self.beta2);
     }
 
-    fn update<B: Buffer>(&self, state: &mut AdamState<B>, params: &mut B, grads: &B) {
+    fn update<B: Buffer>(
+        &self,
+        state: &mut AdamState<B>,
+        params: &mut B,
+        grads: &B,
+        _kind: ParamKind,
+    ) {
         AdamStep {
             lr: self.lr,
             beta1: self.beta1,
@@ -387,13 +425,19 @@ impl Optimizer for AdamW {
         self.clock.tick(self.beta1, self.beta2);
     }
 
-    fn update<B: Buffer>(&self, state: &mut AdamState<B>, params: &mut B, grads: &B) {
+    fn update<B: Buffer>(
+        &self,
+        state: &mut AdamState<B>,
+        params: &mut B,
+        grads: &B,
+        kind: ParamKind,
+    ) {
         AdamStep {
             lr: self.lr,
             beta1: self.beta1,
             beta2: self.beta2,
             eps: self.eps,
-            decay: self.weight_decay,
+            decay: kind.decay(self.weight_decay),
             clock: self.clock,
         }
         .apply(state, params, grads);
@@ -407,25 +451,18 @@ impl Optimizer for AdamW {
     }
 }
 
-/// Zustand von [`RmsProp`]: gleitendes Mittel der quadrierten Gradienten und
-/// Momentum-Puffer.
-#[derive(Clone, Debug)]
-pub struct RmsPropState<B: Buffer> {
-    v: B,
-    buf: B,
-}
-
-/// RMSprop mit optionalem Momentum (Semantik wie PyTorch, nicht zentriert):
+/// RMSprop **ohne** Momentum (Semantik wie PyTorch, nicht zentriert):
 ///
 /// ```text
-/// v   ← α v + (1 - α) g²
-/// ohne Momentum:  p ← p - lr · g / (√v + ε)
-/// mit  Momentum:  b ← μ b + g / (√v + ε);  p ← p - lr · b
+/// v ← α v + (1 - α) g²
+/// p ← p - lr · g / (√v + ε)
 /// ```
 ///
-/// **Speicher:** Der Momentum-Puffer `b` wird auch bei `momentum = 0` angelegt
-/// (der Zustandstyp steht zur Compilezeit fest) – der Zustand ist also doppelt
-/// so groß wie die Parameter. Das Ergebnis bleibt davon unberührt.
+/// Der Zustand ist ein einzelner Puffer `v`. Mit [`with_momentum`](Self::with_momentum)
+/// wechselt man zum Typ [`RmsPropMomentum`], dessen Zustand zusätzlich den
+/// Momentum-Puffer enthält. Dadurch wird der zweite Puffer **nur** angelegt,
+/// wenn Momentum tatsächlich verwendet wird – auch auf dem Stack, wo ein
+/// `Option<B>` den Platz trotzdem belegen würde.
 #[derive(Clone, Copy, Debug)]
 pub struct RmsProp {
     /// Lernrate.
@@ -434,8 +471,6 @@ pub struct RmsProp {
     pub alpha: f32,
     /// Stabilisierung gegen Division durch 0 (Standard `1e-8`).
     pub eps: f32,
-    /// Momentum `μ` (Standard `0.0` = aus).
-    pub momentum: f32,
 }
 
 impl RmsProp {
@@ -445,7 +480,100 @@ impl RmsProp {
             lr,
             alpha: 0.99,
             eps: 1e-8,
-            momentum: 0.0,
+        }
+    }
+
+    /// Setzt den Glättungsfaktor `α`.
+    pub fn with_alpha(mut self, alpha: f32) -> Self {
+        self.alpha = alpha;
+        self
+    }
+
+    /// Setzt `ε`.
+    pub fn with_eps(mut self, eps: f32) -> Self {
+        self.eps = eps;
+        self
+    }
+
+    /// Schaltet Momentum `μ` ein und wechselt zum Typ [`RmsPropMomentum`] (mit
+    /// zusätzlichem Zustandspuffer).
+    ///
+    /// # Panics
+    /// Wenn `momentum` nicht endlich und `> 0` ist. Ohne Momentum bleibt man
+    /// einfach bei [`RmsProp`].
+    pub fn with_momentum(self, momentum: f32) -> RmsPropMomentum {
+        RmsPropMomentum::new(self.lr, self.alpha, self.eps, momentum)
+    }
+}
+
+impl Optimizer for RmsProp {
+    /// Gleitendes Mittel `v` der quadrierten Gradienten.
+    type State<B: Buffer> = B;
+
+    fn init_state<B: Buffer>(&self, len: usize) -> B {
+        B::zeroed(len)
+    }
+
+    fn update<B: Buffer>(&self, v: &mut B, params: &mut B, grads: &B, _kind: ParamKind) {
+        let it = params
+            .as_mut_slice()
+            .iter_mut()
+            .zip(grads.as_slice())
+            .zip(v.as_mut_slice());
+        for ((p, &g), v) in it {
+            *v = self.alpha * *v + (1.0 - self.alpha) * g * g;
+            *p -= self.lr * (g / (math::sqrt(*v) + self.eps));
+        }
+    }
+
+    fn learning_rate(&self) -> f32 {
+        self.lr
+    }
+    fn set_learning_rate(&mut self, lr: f32) {
+        self.lr = lr;
+    }
+}
+
+/// Zustand von [`RmsPropMomentum`]: gleitendes Mittel der quadrierten Gradienten
+/// und Momentum-Puffer.
+#[derive(Clone, Debug)]
+pub struct RmsPropState<B: Buffer> {
+    v: B,
+    buf: B,
+}
+
+/// RMSprop **mit** Momentum, erzeugt über [`RmsProp::with_momentum`]:
+///
+/// ```text
+/// v ← α v + (1 - α) g²
+/// b ← μ b + g / (√v + ε)
+/// p ← p - lr · b
+/// ```
+///
+/// Der Zustand besteht aus zwei Puffern (`v` und `b`).
+#[derive(Clone, Copy, Debug)]
+pub struct RmsPropMomentum {
+    /// Lernrate.
+    pub lr: f32,
+    /// Glättungsfaktor `α` des quadrierten Gradienten.
+    pub alpha: f32,
+    /// Stabilisierung gegen Division durch 0.
+    pub eps: f32,
+    /// Momentum `μ` (`> 0`).
+    pub momentum: f32,
+}
+
+impl RmsPropMomentum {
+    fn new(lr: f32, alpha: f32, eps: f32, momentum: f32) -> Self {
+        assert!(
+            momentum.is_finite() && momentum > 0.0,
+            "momentum muss endlich und > 0 sein (ohne Momentum RmsProp verwenden)"
+        );
+        RmsPropMomentum {
+            lr,
+            alpha,
+            eps,
+            momentum,
         }
     }
 
@@ -462,13 +590,15 @@ impl RmsProp {
     }
 
     /// Setzt das Momentum `μ`.
-    pub fn with_momentum(mut self, momentum: f32) -> Self {
-        self.momentum = momentum;
-        self
+    ///
+    /// # Panics
+    /// Wenn `momentum` nicht endlich und `> 0` ist.
+    pub fn with_momentum(self, momentum: f32) -> Self {
+        Self::new(self.lr, self.alpha, self.eps, momentum)
     }
 }
 
-impl Optimizer for RmsProp {
+impl Optimizer for RmsPropMomentum {
     type State<B: Buffer> = RmsPropState<B>;
 
     fn init_state<B: Buffer>(&self, len: usize) -> RmsPropState<B> {
@@ -478,7 +608,13 @@ impl Optimizer for RmsProp {
         }
     }
 
-    fn update<B: Buffer>(&self, state: &mut RmsPropState<B>, params: &mut B, grads: &B) {
+    fn update<B: Buffer>(
+        &self,
+        state: &mut RmsPropState<B>,
+        params: &mut B,
+        grads: &B,
+        _kind: ParamKind,
+    ) {
         let it = params
             .as_mut_slice()
             .iter_mut()
@@ -487,13 +623,8 @@ impl Optimizer for RmsProp {
             .zip(state.buf.as_mut_slice());
         for (((p, &g), v), buf) in it {
             *v = self.alpha * *v + (1.0 - self.alpha) * g * g;
-            let step = g / (math::sqrt(*v) + self.eps);
-            if self.momentum != 0.0 {
-                *buf = self.momentum * *buf + step;
-                *p -= self.lr * *buf;
-            } else {
-                *p -= self.lr * step;
-            }
+            *buf = self.momentum * *buf + g / (math::sqrt(*v) + self.eps);
+            *p -= self.lr * *buf;
         }
     }
 
@@ -531,7 +662,7 @@ impl Optimizer for Adagrad {
         B::zeroed(len)
     }
 
-    fn update<B: Buffer>(&self, sum_sq: &mut B, params: &mut B, grads: &B) {
+    fn update<B: Buffer>(&self, sum_sq: &mut B, params: &mut B, grads: &B, _kind: ParamKind) {
         let it = params
             .as_mut_slice()
             .iter_mut()
@@ -540,6 +671,105 @@ impl Optimizer for Adagrad {
         for ((p, &g), acc) in it {
             *acc += g * g;
             *p -= self.lr * g / (math::sqrt(*acc) + self.eps);
+        }
+    }
+
+    fn learning_rate(&self) -> f32 {
+        self.lr
+    }
+    fn set_learning_rate(&mut self, lr: f32) {
+        self.lr = lr;
+    }
+}
+
+/// Lion (EvoLved Sign Momentum, Chen et al. 2023): Aktualisierung über das
+/// **Vorzeichen** eines geglätteten Gradienten.
+///
+/// ```text
+/// c ← β₁ m + (1 - β₁) g
+/// p ← p - lr · (sign(c) + weight_decay · p)      // Zerfall entkoppelt, nur bei Gewichten
+/// m ← β₂ m + (1 - β₂) g
+/// ```
+///
+/// **Speicher:** Lion braucht nur einen Zustandspuffer `m` je Tensor, Adam zwei
+/// (`m` und `v`) – bei knappem RAM spart das die Hälfte des Optimizer-Zustands.
+/// Jeder Schritt hat die Länge `lr` (unabhängig von der Gradientengröße), daher
+/// braucht Lion eine ca. 3- bis 10-mal kleinere Lernrate und einen entsprechend
+/// größeren Weight Decay als Adam/AdamW. `sign(0) = 0`; `NaN` bleibt `NaN` und
+/// zeigt sich dadurch in den Parametern.
+#[derive(Clone, Copy, Debug)]
+pub struct Lion {
+    /// Lernrate (üblich: 3- bis 10-mal kleiner als bei Adam).
+    pub lr: f32,
+    /// Glättung für die Update-Richtung (Standard `0.9`).
+    pub beta1: f32,
+    /// Glättung des Impulses `m` (Standard `0.99`).
+    pub beta2: f32,
+    /// Entkoppelter Weight Decay (Standard `0.0`).
+    pub weight_decay: f32,
+}
+
+impl Lion {
+    /// Lion mit `β₁ = 0.9`, `β₂ = 0.99`, ohne Weight Decay.
+    pub fn new(lr: f32) -> Self {
+        Lion {
+            lr,
+            beta1: 0.9,
+            beta2: 0.99,
+            weight_decay: 0.0,
+        }
+    }
+
+    /// Überschreibt `β₁` und `β₂`.
+    pub fn with_betas(mut self, beta1: f32, beta2: f32) -> Self {
+        self.beta1 = beta1;
+        self.beta2 = beta2;
+        self
+    }
+
+    /// Setzt den Weight Decay (entkoppelt, nur auf Gewichte).
+    ///
+    /// # Panics
+    /// Wenn `weight_decay` negativ oder nicht endlich ist.
+    pub fn with_weight_decay(mut self, weight_decay: f32) -> Self {
+        check_weight_decay(weight_decay);
+        self.weight_decay = weight_decay;
+        self
+    }
+}
+
+/// `sign(x)` mit `sign(0) = 0` und `sign(NaN) = NaN`.
+#[inline]
+fn sign(x: f32) -> f32 {
+    if x > 0.0 {
+        1.0
+    } else if x < 0.0 {
+        -1.0
+    } else {
+        // 0.0 -> 0.0, NaN -> NaN
+        x * 0.0
+    }
+}
+
+impl Optimizer for Lion {
+    /// Impuls `m`, gleiche Form wie der Parameter: **ein** Puffer.
+    type State<B: Buffer> = B;
+
+    fn init_state<B: Buffer>(&self, len: usize) -> B {
+        B::zeroed(len)
+    }
+
+    fn update<B: Buffer>(&self, momentum: &mut B, params: &mut B, grads: &B, kind: ParamKind) {
+        let decay = kind.decay(self.weight_decay);
+        let it = params
+            .as_mut_slice()
+            .iter_mut()
+            .zip(grads.as_slice())
+            .zip(momentum.as_mut_slice());
+        for ((p, &g), m) in it {
+            let direction = sign(self.beta1 * *m + (1.0 - self.beta1) * g);
+            *p -= self.lr * (direction + decay * *p);
+            *m = self.beta2 * *m + (1.0 - self.beta2) * g;
         }
     }
 
@@ -562,7 +792,7 @@ mod tests {
         for _ in 0..steps {
             let g = [2.0 * (x[0] - 3.0)];
             opt.begin_step();
-            opt.update(&mut st, &mut x, &g);
+            opt.update(&mut st, &mut x, &g, ParamKind::Weight);
         }
         x[0]
     }
@@ -571,7 +801,7 @@ mod tests {
     fn sgd_step() {
         let opt = Sgd::new(0.1);
         let mut p = [1.0, 2.0];
-        opt.update(&mut (), &mut p, &[10.0, -10.0]);
+        opt.update(&mut (), &mut p, &[10.0, -10.0], ParamKind::Weight);
         assert_eq!(p, [0.0, 3.0]);
     }
 
@@ -580,14 +810,14 @@ mod tests {
         // g = 0: p ← p - lr·wd·p = 1 - 0.1·0.5·1
         let opt = Sgd::new(0.1).with_weight_decay(0.5);
         let mut p = [1.0, -2.0];
-        opt.update(&mut (), &mut p, &[0.0, 0.0]);
+        opt.update(&mut (), &mut p, &[0.0, 0.0], ParamKind::Weight);
         assert!(
             (p[0] - 0.95).abs() < 1e-7 && (p[1] + 1.9).abs() < 1e-6,
             "{p:?}"
         );
         // Mit Gradient: p ← p - lr·(g + wd·p) = 1 - 0.1·(2 + 0.5)
         let mut q = [1.0];
-        opt.update(&mut (), &mut q, &[2.0]);
+        opt.update(&mut (), &mut q, &[2.0], ParamKind::Weight);
         assert!((q[0] - 0.75).abs() < 1e-7, "{q:?}");
     }
 
@@ -597,10 +827,10 @@ mod tests {
         assert_eq!(Momentum::new(0.1, 0.9).weight_decay, 0.0);
         let mut a = [1.0];
         let mut b = [1.0];
-        Sgd::new(0.1).update(&mut (), &mut a, &[3.0]);
+        Sgd::new(0.1).update(&mut (), &mut a, &[3.0], ParamKind::Weight);
         Sgd::new(0.1)
             .with_weight_decay(0.0)
-            .update(&mut (), &mut b, &[3.0]);
+            .update(&mut (), &mut b, &[3.0], ParamKind::Weight);
         assert_eq!(a, b);
     }
 
@@ -615,8 +845,8 @@ mod tests {
         let opt = Momentum::new(1.0, 0.5);
         let mut v = opt.init_state::<[f32; 1]>(1);
         let mut p = [0.0];
-        opt.update(&mut v, &mut p, &[1.0]); // v = 1,   p = -1
-        opt.update(&mut v, &mut p, &[1.0]); // v = 1.5, p = -2.5
+        opt.update(&mut v, &mut p, &[1.0], ParamKind::Weight); // v = 1,   p = -1
+        opt.update(&mut v, &mut p, &[1.0], ParamKind::Weight); // v = 1.5, p = -2.5
         assert_eq!(v, [1.5]);
         assert_eq!(p, [-2.5]);
     }
@@ -627,12 +857,12 @@ mod tests {
         let opt = Momentum::new(0.1, 0.5).with_weight_decay(1.0);
         let mut v = opt.init_state::<[f32; 1]>(1);
         let mut p = [2.0];
-        opt.update(&mut v, &mut p, &[0.0]); // g' = 2, v = 2,   p = 2 - 0.2   = 1.8
+        opt.update(&mut v, &mut p, &[0.0], ParamKind::Weight); // g' = 2, v = 2,   p = 2 - 0.2   = 1.8
         assert!(
             (v[0] - 2.0).abs() < 1e-6 && (p[0] - 1.8).abs() < 1e-6,
             "{v:?} {p:?}"
         );
-        opt.update(&mut v, &mut p, &[0.0]); // g' = 1.8, v = 2.8, p = 1.8 - 0.28 = 1.52
+        opt.update(&mut v, &mut p, &[0.0], ParamKind::Weight); // g' = 1.8, v = 2.8, p = 1.8 - 0.28 = 1.52
         assert!(
             (v[0] - 2.8).abs() < 1e-6 && (p[0] - 1.52).abs() < 1e-6,
             "{v:?} {p:?}"
@@ -645,9 +875,9 @@ mod tests {
         let opt = Momentum::new(1.0, 0.5).with_nesterov(true);
         let mut v = opt.init_state::<[f32; 1]>(1);
         let mut p = [0.0];
-        opt.update(&mut v, &mut p, &[1.0]); // v = 1,   Schritt 1 + 0.5·1   = 1.5
+        opt.update(&mut v, &mut p, &[1.0], ParamKind::Weight); // v = 1,   Schritt 1 + 0.5·1   = 1.5
         assert_eq!((v[0], p[0]), (1.0, -1.5));
-        opt.update(&mut v, &mut p, &[1.0]); // v = 1.5, Schritt 1 + 0.5·1.5 = 1.75
+        opt.update(&mut v, &mut p, &[1.0], ParamKind::Weight); // v = 1.5, Schritt 1 + 0.5·1.5 = 1.75
         assert_eq!((v[0], p[0]), (1.5, -3.25));
     }
 
@@ -658,7 +888,7 @@ mod tests {
         let mut st = opt.init_state::<[f32; 2]>(2);
         let mut p = [0.0, 0.0];
         opt.begin_step();
-        opt.update(&mut st, &mut p, &[5.0, -0.2]);
+        opt.update(&mut st, &mut p, &[5.0, -0.2], ParamKind::Weight);
         assert!((p[0] + 0.01).abs() < 1e-5, "p0 = {}", p[0]);
         assert!((p[1] - 0.01).abs() < 1e-5, "p1 = {}", p[1]);
     }
@@ -677,11 +907,11 @@ mod tests {
         let mut st = opt.init_state::<[f32; 1]>(1);
         let mut p = [2.0];
         opt.begin_step();
-        opt.update(&mut st, &mut p, &[0.0]);
+        opt.update(&mut st, &mut p, &[0.0], ParamKind::Weight);
         assert!((p[0] - 1.98).abs() < 1e-6, "p = {}", p[0]);
         for _ in 0..9 {
             opt.begin_step();
-            opt.update(&mut st, &mut p, &[0.0]);
+            opt.update(&mut st, &mut p, &[0.0], ParamKind::Weight);
         }
         // 2 · 0.99¹⁰ = 1.80876415
         assert!((p[0] - 1.808_764_1).abs() < 1e-5, "p = {}", p[0]);
@@ -692,7 +922,7 @@ mod tests {
         let mut st = adam.init_state::<[f32; 1]>(1);
         let mut q = [2.0];
         adam.begin_step();
-        adam.update(&mut st, &mut q, &[0.1 * 2.0]);
+        adam.update(&mut st, &mut q, &[0.1 * 2.0], ParamKind::Weight);
         assert!((2.0 - q[0] - 0.1).abs() < 1e-4, "q = {}", q[0]);
     }
 
@@ -703,7 +933,7 @@ mod tests {
         let mut st = opt.init_state::<[f32; 1]>(1);
         let mut p = [1.0];
         opt.begin_step();
-        opt.update(&mut st, &mut p, &[5.0]);
+        opt.update(&mut st, &mut p, &[5.0], ParamKind::Weight);
         assert!(
             (p[0] - (1.0 - 0.01 * 0.1 * 1.0 - 0.01)).abs() < 1e-6,
             "p = {}",
@@ -727,8 +957,8 @@ mod tests {
             ];
             adam.begin_step();
             adamw.begin_step();
-            adam.update(&mut sa, &mut pa, &g);
-            adamw.update(&mut sw, &mut pw, &g);
+            adam.update(&mut sa, &mut pa, &g, ParamKind::Weight);
+            adamw.update(&mut sw, &mut pw, &g, ParamKind::Weight);
         }
         assert_eq!(pa, pw);
     }
@@ -751,7 +981,7 @@ mod tests {
         opt.begin_step();
         let mut st = opt.init_state::<[f32; 1]>(1);
         let mut p = [0.0];
-        opt.update(&mut st, &mut p, &[2.0]);
+        opt.update(&mut st, &mut p, &[2.0], ParamKind::Weight);
         assert!((p[0] + 0.316_227_77).abs() < 1e-6, "p = {}", p[0]);
     }
 
@@ -764,27 +994,92 @@ mod tests {
             .with_momentum(0.5);
         let mut st = opt.init_state::<[f32; 1]>(1);
         let mut p = [0.0];
-        opt.update(&mut st, &mut p, &[4.0]); // buf = 1,   p = -1
-        opt.update(&mut st, &mut p, &[4.0]); // buf = 1.5, p = -2.5
+        opt.update(&mut st, &mut p, &[4.0], ParamKind::Weight); // buf = 1,   p = -1
+        opt.update(&mut st, &mut p, &[4.0], ParamKind::Weight); // buf = 1.5, p = -2.5
         assert_eq!(p, [-2.5]);
     }
 
     #[test]
-    fn rmsprop_momentum_zero_ignores_the_buffer() {
-        let a = RmsProp::new(0.1);
-        let b = RmsProp::new(0.1).with_momentum(0.0);
-        let mut sa = a.init_state::<[f32; 2]>(2);
-        let mut sb = b.init_state::<[f32; 2]>(2);
-        let (mut pa, mut pb) = ([1.0, 2.0], [1.0, 2.0]);
-        for _ in 0..5 {
-            a.update(&mut sa, &mut pa, &[0.3, -0.7]);
-            b.update(&mut sb, &mut pb, &[0.3, -0.7]);
-        }
-        assert_eq!(pa, pb);
+    fn rmsprop_momentum_buffer_exists_only_when_momentum_is_enabled() {
+        use core::mem::size_of;
+        type Plain = <RmsProp as Optimizer>::State<[f32; 8]>;
+        type WithMomentum = <RmsPropMomentum as Optimizer>::State<[f32; 8]>;
+        // Ohne Momentum: ein Puffer. Mit Momentum: zwei. Auf dem Stack, zur Compilezeit.
+        assert_eq!(size_of::<Plain>(), 8 * 4);
+        assert_eq!(size_of::<WithMomentum>(), 2 * 8 * 4);
+        // Zum Vergleich: Adam braucht ebenfalls zwei, Momentum/Adagrad einen.
+        assert_eq!(size_of::<<Adam as Optimizer>::State<[f32; 8]>>(), 2 * 8 * 4);
+        assert_eq!(size_of::<<Momentum as Optimizer>::State<[f32; 8]>>(), 8 * 4);
+    }
+
+    #[test]
+    fn rmsprop_with_and_without_momentum_agree_on_the_first_step() {
+        // Im ersten Schritt gilt b = g/(√v+ε): beide Varianten machen denselben Schritt.
+        let plain = RmsProp::new(0.1).with_alpha(0.9);
+        let mom = RmsProp::new(0.1).with_alpha(0.9).with_momentum(0.5);
+        let mut sp = plain.init_state::<[f32; 2]>(2);
+        let mut sm = mom.init_state::<[f32; 2]>(2);
+        let (mut pp, mut pm) = ([1.0, -2.0], [1.0, -2.0]);
+        plain.update(&mut sp, &mut pp, &[0.7, -0.3], ParamKind::Weight);
+        mom.update(&mut sm, &mut pm, &[0.7, -0.3], ParamKind::Weight);
+        assert_eq!(pp, pm);
+    }
+
+    #[test]
+    #[should_panic(expected = "momentum")]
+    fn rmsprop_with_zero_momentum_is_rejected() {
+        let _ = RmsProp::new(0.1).with_momentum(0.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "momentum")]
+    fn rmsprop_with_nan_momentum_is_rejected() {
+        let _ = RmsProp::new(0.1).with_momentum(f32::NAN);
+    }
+
+    #[test]
+    fn weight_decay_skips_biases() {
+        // g = 0: Gewichte schrumpfen, ein Bias darf sich nicht bewegen.
+        let sgd = Sgd::new(0.1).with_weight_decay(0.5);
+        let (mut w, mut b) = ([2.0], [2.0]);
+        sgd.update(&mut (), &mut w, &[0.0], ParamKind::Weight);
+        sgd.update(&mut (), &mut b, &[0.0], ParamKind::Bias);
+        assert!((w[0] - 1.9).abs() < 1e-6 && b == [2.0], "Sgd: {w:?} {b:?}");
+
+        let mom = Momentum::new(0.1, 0.5)
+            .with_weight_decay(1.0)
+            .with_nesterov(true);
+        let (mut sw, mut sb) = (mom.init_state::<[f32; 1]>(1), mom.init_state::<[f32; 1]>(1));
+        let (mut w, mut b) = ([2.0], [2.0]);
+        mom.update(&mut sw, &mut w, &[0.0], ParamKind::Weight);
+        mom.update(&mut sb, &mut b, &[0.0], ParamKind::Bias);
         assert!(
-            sa.buf.iter().all(|&b| b == 0.0),
-            "Puffer bleibt bei μ = 0 ungenutzt"
+            (w[0] - 1.7).abs() < 1e-6 && b == [2.0] && sb == [0.0],
+            "Momentum: {w:?} {b:?}"
         );
+
+        let mut adamw = AdamW::new(0.1).with_weight_decay(0.1);
+        adamw.begin_step();
+        let (mut sw, mut sb) = (
+            adamw.init_state::<[f32; 1]>(1),
+            adamw.init_state::<[f32; 1]>(1),
+        );
+        let (mut w, mut b) = ([2.0], [2.0]);
+        adamw.update(&mut sw, &mut w, &[0.0], ParamKind::Weight);
+        adamw.update(&mut sb, &mut b, &[0.0], ParamKind::Bias);
+        assert!(
+            (w[0] - 1.98).abs() < 1e-6 && b == [2.0],
+            "AdamW: {w:?} {b:?}"
+        );
+    }
+
+    #[test]
+    fn bias_gradient_still_updates_the_bias() {
+        // Nicht verwechseln: ParamKind::Bias schaltet nur den Zerfall ab, nicht den Gradienten.
+        let sgd = Sgd::new(0.1).with_weight_decay(0.5);
+        let mut b = [2.0];
+        sgd.update(&mut (), &mut b, &[1.0], ParamKind::Bias);
+        assert!((b[0] - 1.9).abs() < 1e-6, "{b:?}");
     }
 
     #[test]
@@ -802,7 +1097,7 @@ mod tests {
         let opt = Adagrad::new(0.5);
         let mut g2 = opt.init_state::<[f32; 1]>(1);
         let mut p = [0.0];
-        opt.update(&mut g2, &mut p, &[4.0]);
+        opt.update(&mut g2, &mut p, &[4.0], ParamKind::Weight);
         assert!((p[0] + 0.5).abs() < 1e-6, "p = {}", p[0]);
         assert_eq!(g2, [16.0]);
         let x = minimise_quadratic(Adagrad::new(1.0), 2000);
@@ -817,12 +1112,12 @@ mod tests {
             .with_nesterov(true);
         let mut v = opt.init_state::<[f32; 1]>(1);
         let mut p = [2.0];
-        opt.update(&mut v, &mut p, &[0.0]); // g' = 2,   v = 2,   Schritt 2 + 1    = 3    -> p = 1.7
+        opt.update(&mut v, &mut p, &[0.0], ParamKind::Weight); // g' = 2,   v = 2,   Schritt 2 + 1    = 3    -> p = 1.7
         assert!(
             (v[0] - 2.0).abs() < 1e-6 && (p[0] - 1.7).abs() < 1e-6,
             "{v:?} {p:?}"
         );
-        opt.update(&mut v, &mut p, &[0.0]); // g' = 1.7, v = 2.7, Schritt 1.7 + 1.35 = 3.05 -> p = 1.395
+        opt.update(&mut v, &mut p, &[0.0], ParamKind::Weight); // g' = 1.7, v = 2.7, Schritt 1.7 + 1.35 = 3.05 -> p = 1.395
         assert!(
             (v[0] - 2.7).abs() < 1e-6 && (p[0] - 1.395).abs() < 1e-6,
             "{v:?} {p:?}"
@@ -830,7 +1125,7 @@ mod tests {
         // Mit echtem Gradienten: weder die Vorausschau noch der Zerfall dürfen den Gradienten verlieren.
         let mut v = opt.init_state::<[f32; 1]>(1);
         let mut p = [2.0];
-        opt.update(&mut v, &mut p, &[1.0]); // g' = 3, v = 3, Schritt 3 + 1.5 = 4.5 -> p = 1.55
+        opt.update(&mut v, &mut p, &[1.0], ParamKind::Weight); // g' = 3, v = 3, Schritt 3 + 1.5 = 4.5 -> p = 1.55
         assert!((p[0] - 1.55).abs() < 1e-6, "{p:?}");
     }
 
@@ -840,13 +1135,13 @@ mod tests {
         let rms = RmsProp::new(1.0).with_alpha(0.0).with_eps(1.0);
         let mut st = rms.init_state::<[f32; 1]>(1);
         let mut p = [0.0];
-        rms.update(&mut st, &mut p, &[2.0]);
+        rms.update(&mut st, &mut p, &[2.0], ParamKind::Weight);
         assert!((p[0] + 2.0 / 3.0).abs() < 1e-6, "RMSprop: {p:?}");
 
         let ada = Adagrad { lr: 1.0, eps: 1.0 };
         let mut g2 = ada.init_state::<[f32; 1]>(1);
         let mut q = [0.0];
-        ada.update(&mut g2, &mut q, &[2.0]);
+        ada.update(&mut g2, &mut q, &[2.0], ParamKind::Weight);
         assert!((q[0] + 2.0 / 3.0).abs() < 1e-6, "Adagrad: {q:?}");
     }
 
@@ -862,10 +1157,137 @@ mod tests {
         let w = AdamW::new(0.1).with_betas(0.8, 0.9);
         assert_eq!((w.beta1, w.beta2), (0.8, 0.9));
         let r = RmsProp::new(0.1);
-        assert_eq!((r.alpha, r.eps, r.momentum), (0.99, 1e-8, 0.0));
+        assert_eq!((r.alpha, r.eps), (0.99, 1e-8));
+        assert_eq!(r.with_momentum(0.9).momentum, 0.9);
         assert_eq!(Adagrad::new(0.1).eps, 1e-10);
         let m = Momentum::new(0.1, 0.9);
         assert!(!m.nesterov && m.weight_decay == 0.0);
+    }
+
+    #[test]
+    fn lion_first_step_known_values() {
+        // m = 0: c = (1-β₁) g = 0.2 > 0 -> sign +1, p = 1 - 0.1 = 0.9; m = (1-β₂) g = 0.02
+        let opt = Lion::new(0.1);
+        let mut m = opt.init_state::<[f32; 1]>(1);
+        let mut p = [1.0];
+        opt.update(&mut m, &mut p, &[2.0], ParamKind::Weight);
+        assert!((p[0] - 0.9).abs() < 1e-7, "{p:?}");
+        assert!((m[0] - 0.02).abs() < 1e-7, "{m:?}");
+        // Negativer Gradient: p wächst um lr.
+        let mut q = [1.0];
+        let mut mq = opt.init_state::<[f32; 1]>(1);
+        opt.update(&mut mq, &mut q, &[-2.0], ParamKind::Weight);
+        assert!((q[0] - 1.1).abs() < 1e-7, "{q:?}");
+    }
+
+    #[test]
+    fn lion_step_length_is_independent_of_the_gradient_scale() {
+        let opt = Lion::new(0.01);
+        for &g in &[1e-6f32, 1e-2, 1.0, 1e6, 1e20] {
+            let mut m = opt.init_state::<[f32; 1]>(1);
+            let mut p = [0.0];
+            opt.update(&mut m, &mut p, &[g], ParamKind::Weight);
+            assert_eq!(p[0], -0.01, "g = {g}");
+        }
+    }
+
+    #[test]
+    fn lion_momentum_keeps_the_direction_after_the_gradient_vanishes() {
+        // Nach einem Schritt mit g > 0 ist m > 0: auch bei g = 0 zeigt c = β₁ m weiter nach oben.
+        let opt = Lion::new(0.1);
+        let mut m = opt.init_state::<[f32; 1]>(1);
+        let mut p = [0.0];
+        opt.update(&mut m, &mut p, &[1.0], ParamKind::Weight);
+        opt.update(&mut m, &mut p, &[0.0], ParamKind::Weight);
+        assert!((p[0] + 0.2).abs() < 1e-6, "{p:?}");
+        // Ohne Impuls und ohne Gradient: sign(0) = 0, kein Schritt.
+        let mut m0 = opt.init_state::<[f32; 1]>(1);
+        let mut p0 = [5.0];
+        opt.update(&mut m0, &mut p0, &[0.0], ParamKind::Weight);
+        assert_eq!(p0, [5.0]);
+    }
+
+    #[test]
+    fn lion_weight_decay_is_decoupled_and_skips_biases() {
+        // c = 0 -> nur der Zerfall: p ← p (1 - lr·wd) = 2 · (1 - 0.05) = 1.9
+        let opt = Lion::new(0.1).with_weight_decay(0.5);
+        let (mut mw, mut mb) = (opt.init_state::<[f32; 1]>(1), opt.init_state::<[f32; 1]>(1));
+        let (mut w, mut b) = ([2.0], [2.0]);
+        opt.update(&mut mw, &mut w, &[0.0], ParamKind::Weight);
+        opt.update(&mut mb, &mut b, &[0.0], ParamKind::Bias);
+        assert!((w[0] - 1.9).abs() < 1e-6, "{w:?}");
+        assert_eq!(b, [2.0]);
+        // Der Gradient bewegt den Bias trotzdem.
+        let mut mb = opt.init_state::<[f32; 1]>(1);
+        opt.update(&mut mb, &mut b, &[1.0], ParamKind::Bias);
+        assert!((b[0] - 1.9).abs() < 1e-6, "{b:?}");
+    }
+
+    #[test]
+    fn lion_propagates_nan_instead_of_hiding_it() {
+        let opt = Lion::new(0.1);
+        let mut m = opt.init_state::<[f32; 1]>(1);
+        let mut p = [1.0];
+        opt.update(&mut m, &mut p, &[f32::NAN], ParamKind::Weight);
+        assert!(p[0].is_nan());
+    }
+
+    #[test]
+    fn lion_needs_one_state_buffer_where_adam_needs_two() {
+        use core::mem::size_of;
+        assert_eq!(size_of::<<Lion as Optimizer>::State<[f32; 100]>>(), 100 * 4);
+        assert_eq!(size_of::<<Adam as Optimizer>::State<[f32; 100]>>(), 200 * 4);
+        assert_eq!(
+            size_of::<<AdamW as Optimizer>::State<[f32; 100]>>(),
+            200 * 4
+        );
+        // Bei einem Dense<16,16>: Lion spart gegenüber Adam 272 · 4 Byte Zustand.
+        let weights = size_of::<<Lion as Optimizer>::State<[[f32; 16]; 16]>>();
+        let adam = size_of::<<Adam as Optimizer>::State<[[f32; 16]; 16]>>();
+        assert_eq!(adam - weights, 16 * 16 * 4);
+    }
+
+    #[test]
+    fn lion_uses_beta1_for_the_direction_and_beta2_for_the_momentum() {
+        // β₁ = 0.2, β₂ = 0.9, lr = 1. Drei Schritte, in denen sich die Rollen unterscheiden lassen:
+        //   1) g = +1:   c = 0.8·1 = 0.8 > 0 -> p -= 1;         m = 0.1·1 = 0.1
+        //   2) g = -0.5: c = β₁·m + (1-β₁)·g = 0.02 - 0.4 = -0.38 < 0 -> p += 1;
+        //                (mit β₂ in c: 0.09 - 0.05 = +0.04 > 0, also das Gegenteil)
+        //                m = β₂·m + (1-β₂)·g = 0.09 - 0.05 = 0.04
+        //   3) g = 0:    c = β₁·m = 0.008 > 0 -> p -= 1
+        //                (mit β₁ in m wäre m = 0.2·0.1 + 0.8·(-0.5) = -0.38, c < 0)
+        let opt = Lion::new(1.0).with_betas(0.2, 0.9);
+        let mut m = opt.init_state::<[f32; 1]>(1);
+        let mut p = [0.0];
+        opt.update(&mut m, &mut p, &[1.0], ParamKind::Weight);
+        assert_eq!(p, [-1.0]);
+        assert!((m[0] - 0.1).abs() < 1e-6, "m = {m:?}");
+        opt.update(&mut m, &mut p, &[-0.5], ParamKind::Weight);
+        assert_eq!(p, [0.0], "Richtung nutzt β₁ und den alten Impuls");
+        assert!((m[0] - 0.04).abs() < 1e-6, "Impuls nutzt β₂: m = {m:?}");
+        opt.update(&mut m, &mut p, &[0.0], ParamKind::Weight);
+        assert_eq!(p, [-1.0], "der Impuls trägt die Richtung weiter");
+    }
+
+    #[test]
+    fn lion_minimises_a_quadratic_up_to_its_step_size() {
+        // Jeder Schritt hat die Länge lr, Lion oszilliert also in einem Band um das Optimum.
+        let x = minimise_quadratic(Lion::new(0.01), 1500);
+        assert!((x - 3.0).abs() < 0.15, "x = {x}");
+    }
+
+    #[test]
+    fn lion_default_hyperparameters_are_pinned() {
+        let l = Lion::new(0.1);
+        assert_eq!((l.beta1, l.beta2, l.weight_decay), (0.9, 0.99, 0.0));
+        let l = l.with_betas(0.8, 0.95).with_weight_decay(0.3);
+        assert_eq!((l.beta1, l.beta2, l.weight_decay), (0.8, 0.95, 0.3));
+    }
+
+    #[test]
+    #[should_panic(expected = "weight_decay")]
+    fn lion_rejects_negative_weight_decay() {
+        let _ = Lion::new(0.1).with_weight_decay(-1.0);
     }
 
     #[test]
@@ -881,5 +1303,6 @@ mod tests {
         roundtrip(AdamW::new(0.2), 0.2);
         roundtrip(RmsProp::new(0.1), 0.1);
         roundtrip(Adagrad::new(0.05), 0.05);
+        roundtrip(Lion::new(0.02), 0.02);
     }
 }
