@@ -1,5 +1,19 @@
 name: CI
 
+# Pflege der Pins
+# ---------------
+# Actions: Jede Action ist auf einen 40-stelligen Commit-SHA gepinnt, nicht auf ein Tag, das
+# nachträglich verschoben werden könnte. Der Kommentar dahinter nennt die Version (`# vX.Y.Z`).
+# Dependabot (.github/dependabot.yml) schlägt Anhebungen wöchentlich vor und aktualisiert SHA und
+# Versionskommentar gemeinsam. Von Hand pinnt man den COMMIT, bei annotierten Tags also
+# `git ls-remote <repo> 'refs/tags/<tag>^{}'` (nicht das Tag-Objekt ohne `^{}`).
+#
+# Toolchain: Alle Jobs außer MSRV bauen mit der festen Version `RUST_TOOLCHAIN`, damit `-D warnings`
+# nicht an einer neuen Clippy-/Rustdoc-Lint von `stable` bricht. Eine Anhebung geschieht in ZWEI
+# Dateien: `RUST_TOOLCHAIN` unten und `channel` in rust-toolchain.toml. Der Job `toolchain-pin`
+# schlägt fehl, wenn beide auseinanderlaufen. Danach lokal `cargo clippy --all-targets -- -D warnings`,
+# `cargo doc` und `cargo test` laufen lassen.
+
 on:
   push:
     branches: [main]
@@ -15,15 +29,50 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Feste Rust-Version für fmt, clippy, test, bare-metal und docs.
+  # Muss mit `channel` in rust-toolchain.toml übereinstimmen (Job `toolchain-pin`).
+  RUST_TOOLCHAIN: "1.99.0"
 
 jobs:
+  # Schnell und ohne Rust: stellt sicher, dass rust-toolchain.toml (lokale Entwicklung) und
+  # RUST_TOOLCHAIN (CI) dieselbe Version nennen.
+  toolchain-pin:
+    name: toolchain pin
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: channel in rust-toolchain.toml == RUST_TOOLCHAIN
+        run: |
+          set -euo pipefail
+          file=rust-toolchain.toml
+          if [ ! -f "$file" ]; then
+            echo "::error title=Toolchain-Pin::$file fehlt im Repository-Wurzelverzeichnis."
+            exit 1
+          fi
+          channel="$(sed -n -E "s/^[[:space:]]*channel[[:space:]]*=[[:space:]]*[\"']([^\"']+)[\"'][[:space:]]*(#.*)?$/\1/p" "$file")"
+          if [ -z "$channel" ] || [ "$(printf '%s\n' "$channel" | wc -l)" -ne 1 ]; then
+            found="$(printf '%s' "$channel" | tr '\n' ' ')"
+            echo "::error file=$file,title=Toolchain-Pin::Genau ein Eintrag 'channel = \"...\"' erwartet, gefunden: '${found:-keiner}'."
+            exit 1
+          fi
+          if [ "$channel" != "$RUST_TOOLCHAIN" ]; then
+            echo "::error file=$file,title=Toolchain-Pin::channel in $file ist '$channel', RUST_TOOLCHAIN in .github/workflows/ci.yml ist '$RUST_TOOLCHAIN'. Beide Dateien müssen dieselbe Version nennen."
+            exit 1
+          fi
+          echo "OK: channel = $channel stimmt mit RUST_TOOLCHAIN überein."
+
   fmt:
     name: cargo fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt
       - run: cargo fmt --check
 
@@ -39,11 +88,14 @@ jobs:
           - name: alloc
             features: "--features alloc"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo clippy --all-targets ${{ matrix.features }} -- -D warnings
 
   test:
@@ -58,10 +110,26 @@ jobs:
           - name: alloc
             features: "--features alloc"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo test ${{ matrix.features }}
+      # Die Beispiele laufen schnell (Sekunden) und deterministisch (fester Seed); so fallen
+      # Panics und Rechenfehler in ihnen auf, die `cargo test` (baut sie nur) nicht ausführt.
+      - name: Beispiel xor
+        run: cargo run --release --example xor ${{ matrix.features }}
+      - name: Beispiel classifier
+        run: cargo run --release --example classifier ${{ matrix.features }}
+      - name: Beispiel gelu_adamw
+        run: cargo run --release --example gelu_adamw ${{ matrix.features }}
+      # dynamic_xor benötigt das Feature `alloc` (required-features in Cargo.toml).
+      - name: Beispiel dynamic_xor
+        if: matrix.name == 'alloc'
+        run: cargo run --release --example dynamic_xor ${{ matrix.features }}
 
   # Beweist `no_std`: Ziel ohne std, ohne Betriebssystem (Cortex-M4F).
   # Schlägt fehl, sobald irgendwo std/alloc ohne Feature-Gate verwendet wird.
@@ -77,17 +145,28 @@ jobs:
           - name: alloc
             features: "--features alloc"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: thumbv7em-none-eabihf
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo build --lib --target thumbv7em-none-eabihf ${{ matrix.features }}
 
   # Die in Cargo.toml versprochene Mindestversion (nur die Bibliothek).
+  # Die Version 1.80.0 steht bewusst hier und nicht in RUST_TOOLCHAIN: rust-toolchain.toml im
+  # Repository-Wurzelverzeichnis würde sonst die von der Action gesetzte Standard-Toolchain
+  # überstimmen, und der Job prüfte stillschweigend 1.99.0 statt 1.80. Deshalb wählt
+  # `cargo +1.80.0` die Version ausdrücklich (hat Vorrang vor der Datei). RUSTUP_TOOLCHAIN gilt
+  # zusätzlich für alle anderen Schritte, die rustc/cargo im Repository aufrufen (rust-cache
+  # fragt `rustc -vV` ab und träfe sonst auf die Datei, also auf eine nicht installierte 1.99.0).
   msrv:
     name: MSRV 1.80 (${{ matrix.name }})
     runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: "1.80.0"
     strategy:
       fail-fast: false
       matrix:
@@ -97,10 +176,14 @@ jobs:
           - name: alloc
             features: "--features alloc"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.80.0
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --lib ${{ matrix.features }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: 1.80.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo +1.80.0 build --lib ${{ matrix.features }}
 
   docs:
     name: cargo doc (${{ matrix.name }})
@@ -114,9 +197,13 @@ jobs:
           - name: alloc
             features: "--features alloc"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo doc --no-deps ${{ matrix.features }}
         env:
           RUSTDOCFLAGS: -D warnings

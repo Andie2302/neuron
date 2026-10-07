@@ -1,0 +1,14 @@
+# Dependabot hält die in .github/workflows/ci.yml auf Commit-SHAs gepinnten Actions aktuell.
+# Er erkennt die Form `uses: <owner>/<repo>@<sha> # vX.Y.Z` und aktualisiert SHA und den
+# Versionskommentar gemeinsam. Die vorgeschlagenen Anhebungen laufen als normale Pull Requests
+# durch die CI.
+#
+# Bewusst kein Eintrag für `cargo`: Die einzige Abhängigkeit (`libm`) wird von Hand gepflegt.
+# Die Rust-Toolchain (rust-toolchain.toml und RUST_TOOLCHAIN in der CI) hebt man ebenfalls
+# von Hand an; Dependabot kennt diese Dateien nicht.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

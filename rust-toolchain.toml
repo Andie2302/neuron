@@ -1,0 +1,16 @@
+# Feste Toolchain für reproduzierbare Builds. Auf dem beweglichen `stable` bricht `-D warnings`
+# (Clippy, Rustdoc), sobald eine neue Lint erscheint; mit der festen Version passiert das nur
+# dann, wenn man sie bewusst anhebt.
+#
+# Aktualisieren: `channel` hier UND `RUST_TOOLCHAIN` in .github/workflows/ci.yml gemeinsam ändern
+# (der CI-Job `toolchain-pin` prüft, dass beide übereinstimmen), danach lokal
+# `cargo clippy --all-targets -- -D warnings`, `cargo doc` und `cargo test` laufen lassen.
+#
+# Unabhängig davon prüft die CI die Mindestversion der Bibliothek (`rust-version` in Cargo.toml,
+# 1.80) explizit mit `cargo +1.80.0 build --lib`; die ausdrückliche `+toolchain`-Angabe hat
+# Vorrang vor dieser Datei.
+[toolchain]
+channel = "1.99.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
+targets = ["thumbv7em-none-eabihf"]
