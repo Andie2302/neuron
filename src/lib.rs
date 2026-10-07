@@ -13,10 +13,11 @@
 //! |---------------|------------------------------------------|-----------------------------------------------------|
 //! | [`Buffer`]    | `f32`-Speicher (Stack/Heap)              | `[f32; N]`, `[[f32; C]; R]`, `Vec<f32>` (`alloc`)   |
 //! | [`Storage`]   | Puffertypen eines Dense-Layers           | [`Stack`], `Heap` (`alloc`)                         |
-//! | [`Activation`]| Aktivierung + Ableitung                  | [`Linear`], [`Relu`], [`LeakyRelu`], [`Sigmoid`], [`Tanh`], [`ActivationKind`] |
-//! | [`Loss`]      | Verlust + Gradient                       | [`Mse`], [`BinaryCrossEntropy`], [`SoftmaxCrossEntropy`] |
+//! | [`Activation`]| Aktivierung + Ableitung                  | [`Linear`], [`Relu`], [`LeakyRelu`], [`Sigmoid`], [`Tanh`], [`Gelu`], [`Swish`], [`Elu`], [`Softplus`], [`Mish`], [`ActivationKind`] |
+//! | [`Loss`]      | Verlust + Gradient                       | [`Mse`], [`Mae`], [`Huber`], [`BinaryCrossEntropy`], [`SoftmaxCrossEntropy`] |
 //! | [`Initializer`]| Gewichtsinitialisierung                 | [`Constant`], [`XavierUniform`], [`XavierNormal`], [`HeUniform`], [`HeNormal`] |
-//! | [`Optimizer`] | Parameter-Update (+ Zustand je Tensor)   | [`Sgd`], [`Momentum`], [`Adam`]                     |
+//! | [`Optimizer`] | Parameter-Update (+ Zustand je Tensor)   | [`Sgd`], [`Momentum`], [`Adam`], [`AdamW`], [`RmsProp`], [`Adagrad`] |
+//! | [`LrSchedule`]| Lernrate je Schritt                      | [`ConstantLr`], [`StepDecay`], [`ExponentialDecay`], [`CosineAnnealing`], [`Warmup`] |
 //! | [`Layer`]     | Baustein mit Forward/Backward            | [`Dense`], [`Dropout`], [`Chain`], `Sequential` (`alloc`) |
 //!
 //! ## Stack und Heap hinter denselben Traits
@@ -69,22 +70,28 @@ pub mod layer;
 pub mod loss;
 pub mod optim;
 pub mod rng;
+pub mod schedule;
 pub mod trainer;
 
 #[cfg(feature = "alloc")]
 pub mod dynamic;
 
-mod math;
+pub mod math;
 
-pub use activation::{Activation, ActivationKind, LeakyRelu, Linear, Relu, Sigmoid, Tanh};
+pub use activation::{
+    Activation, ActivationKind, Elu, Gelu, LeakyRelu, Linear, Mish, Relu, Sigmoid, Softplus, Swish,
+    Tanh,
+};
 pub use buffer::{Buffer, Stack, Storage};
 pub use dense::{Dense, DenseLayer};
 pub use dropout::{Dropout, DropoutLayer};
 pub use init::{Constant, HeNormal, HeUniform, Initializer, XavierNormal, XavierUniform};
-pub use layer::{Chain, Layer, Mode};
-pub use loss::{BinaryCrossEntropy, Loss, Mse, SoftmaxCrossEntropy};
-pub use optim::{Adam, Momentum, Optimizer, Sgd};
+pub use layer::{Chain, Layer, Mode, ParamError};
+pub use loss::{BinaryCrossEntropy, Huber, Loss, Mae, Mse, SoftmaxCrossEntropy};
+pub use math::{argmax, softmax_inplace};
+pub use optim::{Adagrad, Adam, AdamW, Momentum, Optimizer, RmsProp, Sgd};
 pub use rng::{Pcg32, Rng};
+pub use schedule::{ConstantLr, CosineAnnealing, ExponentialDecay, LrSchedule, StepDecay, Warmup};
 pub use trainer::Trainer;
 
 #[cfg(feature = "alloc")]
@@ -99,10 +106,12 @@ pub use dynamic::{DynLayer, Sequential};
 /// Alles Wichtige auf einmal importieren.
 pub mod prelude {
     pub use crate::{
-        Activation, ActivationKind, Adam, BinaryCrossEntropy, Buffer, Chain, Constant, Dense,
-        Dropout, HeNormal, HeUniform, Initializer, Layer, LeakyRelu, Linear, Loss, Mode, Momentum,
-        Mse, Optimizer, Pcg32, Relu, Rng, Sgd, Sigmoid, SoftmaxCrossEntropy, Tanh, Trainer,
-        XavierNormal, XavierUniform,
+        argmax, softmax_inplace, Activation, ActivationKind, Adagrad, Adam, AdamW,
+        BinaryCrossEntropy, Buffer, Chain, Constant, ConstantLr, CosineAnnealing, Dense, Dropout,
+        Elu, ExponentialDecay, Gelu, HeNormal, HeUniform, Huber, Initializer, Layer, LeakyRelu,
+        Linear, Loss, LrSchedule, Mae, Mish, Mode, Momentum, Mse, Optimizer, ParamError, Pcg32,
+        Relu, RmsProp, Rng, Sgd, Sigmoid, SoftmaxCrossEntropy, Softplus, StepDecay, Swish, Tanh,
+        Trainer, Warmup, XavierNormal, XavierUniform,
     };
 
     #[cfg(feature = "alloc")]

@@ -39,6 +39,82 @@ impl Loss for Mse {
     }
 }
 
+/// Mittlerer absoluter Fehler (L1): `L = 1/n Σ |p - t|`.
+///
+/// Robuster gegen Ausreißer als [`Mse`]. Der Gradient ist `sign(p - t) / n`
+/// (an der Knickstelle `p == t` gilt `0`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Mae;
+
+impl Loss for Mae {
+    fn value(&self, pred: &[f32], target: &[f32]) -> f32 {
+        debug_assert_eq!(pred.len(), target.len());
+        let sum: f32 = pred.iter().zip(target).map(|(p, t)| math::abs(p - t)).sum();
+        sum / pred.len() as f32
+    }
+
+    fn gradient(&self, pred: &[f32], target: &[f32], grad: &mut [f32]) {
+        debug_assert!(pred.len() == target.len() && pred.len() == grad.len());
+        let n = pred.len() as f32;
+        for ((g, p), t) in grad.iter_mut().zip(pred).zip(target) {
+            let d = p - t;
+            *g = if d > 0.0 {
+                1.0 / n
+            } else if d < 0.0 {
+                -1.0 / n
+            } else {
+                0.0
+            };
+        }
+    }
+}
+
+/// Huber-Verlust: quadratisch nahe `0`, linear in den Flanken.
+///
+/// Mit `d = p - t`: `l(d) = ½ d²` für `|d| <= delta`, sonst
+/// `delta (|d| - ½ delta)`; `L` ist der Mittelwert über alle Elemente.
+/// Verbindet die glatte Optimierung von [`Mse`] mit der Ausreißer-Robustheit
+/// von [`Mae`].
+#[derive(Clone, Copy, Debug)]
+pub struct Huber {
+    /// Übergang zwischen quadratischem und linearem Bereich (Standard `1.0`).
+    pub delta: f32,
+}
+
+impl Default for Huber {
+    fn default() -> Self {
+        Huber { delta: 1.0 }
+    }
+}
+
+impl Loss for Huber {
+    fn value(&self, pred: &[f32], target: &[f32]) -> f32 {
+        debug_assert_eq!(pred.len(), target.len());
+        let sum: f32 = pred
+            .iter()
+            .zip(target)
+            .map(|(p, t)| {
+                let d = math::abs(p - t);
+                if d <= self.delta {
+                    0.5 * d * d
+                } else {
+                    self.delta * (d - 0.5 * self.delta)
+                }
+            })
+            .sum();
+        sum / pred.len() as f32
+    }
+
+    fn gradient(&self, pred: &[f32], target: &[f32], grad: &mut [f32]) {
+        debug_assert!(pred.len() == target.len() && pred.len() == grad.len());
+        let n = pred.len() as f32;
+        for ((g, p), t) in grad.iter_mut().zip(pred).zip(target) {
+            let d = p - t;
+            *g = d.clamp(-self.delta, self.delta) / n;
+        }
+    }
+}
+
 /// Binäre Kreuzentropie auf **Wahrscheinlichkeiten** (Ausgabe einer
 /// [`Sigmoid`](crate::activation::Sigmoid)-Schicht):
 /// `L = -1/n Σ [t ln p + (1-t) ln(1-p)]`.
@@ -157,6 +233,10 @@ mod tests {
     #[test]
     fn gradients_match_finite_differences() {
         check(Mse, &[0.2, 0.9, -0.4], &[0.0, 1.0, 0.5]);
+        // Abseits der Knicke von MAE (d = 0) und Huber (|d| = delta).
+        check(Mae, &[0.2, 0.9, -0.4], &[0.0, 1.0, 0.5]);
+        check(Huber { delta: 0.5 }, &[0.2, 0.9, -0.4], &[0.0, 1.0, 0.5]);
+        check(Huber::default(), &[2.5, 0.9, -0.4], &[0.0, 1.0, 0.5]);
         check(
             BinaryCrossEntropy::default(),
             &[0.3, 0.8, 0.6],
@@ -167,6 +247,35 @@ mod tests {
             &[0.5, -1.0, 2.0, 0.1],
             &[0.0, 0.0, 1.0, 0.0],
         );
+    }
+
+    #[test]
+    fn mae_and_huber_known_values() {
+        assert_eq!(Mae.value(&[1.0, -3.0], &[0.0, 1.0]), (1.0 + 4.0) / 2.0);
+        // |d| = 0.5 ≤ δ: ½·0.25 = 0.125; |d| = 3 > δ = 1: 1·(3 - 0.5) = 2.5
+        let h = Huber::default().value(&[0.5, 4.0], &[0.0, 1.0]);
+        assert!((h - (0.125 + 2.5) / 2.0).abs() < 1e-6, "h = {h}");
+    }
+
+    #[test]
+    fn huber_interpolates_between_mse_and_mae() {
+        let (p, t) = ([0.3f32], [0.0f32]);
+        // Im quadratischen Bereich: Huber = ½·MSE.
+        assert!((Huber::default().value(&p, &t) - 0.5 * Mse.value(&p, &t)).abs() < 1e-7);
+        // Weit draußen wächst Huber linear, MSE quadratisch.
+        let (p, t) = ([100.0f32], [0.0f32]);
+        assert!(Huber::default().value(&p, &t) < 0.02 * Mse.value(&p, &t));
+        // Der Gradient ist durch delta begrenzt.
+        let mut g = [0.0];
+        Huber { delta: 2.0 }.gradient(&p, &t, &mut g);
+        assert_eq!(g, [2.0]);
+    }
+
+    #[test]
+    fn mae_gradient_is_zero_at_the_kink() {
+        let mut g = [9.0; 2];
+        Mae.gradient(&[1.0, 2.0], &[1.0, 5.0], &mut g);
+        assert_eq!(g, [0.0, -0.5]);
     }
 
     #[test]

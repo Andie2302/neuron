@@ -109,4 +109,40 @@ fn sgd_momentum_and_adam_state_work_with_heap_buffers() {
     assert!(fit_linear(Sgd::new(0.2)) < 1e-3);
     assert!(fit_linear(Momentum::new(0.05, 0.9)) < 1e-3);
     assert!(fit_linear(Adam::new(0.05)) < 1e-3);
+    // Neue Optimizer: ihr Zustand ist hier ein Vec<f32>.
+    assert!(fit_linear(AdamW::new(0.05).with_weight_decay(0.0)) < 1e-3);
+    assert!(fit_linear(Momentum::new(0.05, 0.9).with_nesterov(true)) < 1e-3);
+    assert!(fit_linear(RmsProp::new(0.01).with_alpha(0.9).with_momentum(0.9)) < 1e-2);
+    assert!(fit_linear(Adagrad::new(0.5)) < 1e-2);
+}
+
+/// Neue Optimizer, Aktivierungen und Verluste im Heap-Zweig bitgleich zum Stack-Zweig.
+#[test]
+fn new_features_are_bit_identical_between_stack_and_heap() {
+    let mut stack = Dense::<2, 6, _>::new(Gelu)
+        .then(Dense::<6, 4, _>::new(Swish))
+        .then(Dense::<4, 1, _>::new(Sigmoid));
+    stack.init(&XavierUniform, &mut Pcg32::seeded(14));
+    let mut heap = Sequential::new(2)
+        .dense(6, ActivationKind::Gelu)
+        .dense(4, ActivationKind::Swish)
+        .dense(1, ActivationKind::Sigmoid);
+    heap.init(&XavierUniform, &mut Pcg32::seeded(14));
+
+    let opt = || AdamW::new(0.03).with_weight_decay(0.02);
+    let mut ts = Trainer::new(stack, Huber::default(), opt()).with_grad_clip_norm(0.5);
+    let mut th = Trainer::new(heap, Huber::default(), opt()).with_grad_clip_norm(0.5);
+    for step in 0..40 {
+        let rate = 0.03 / (1.0 + step as f32);
+        ts.set_learning_rate(rate);
+        th.set_learning_rate(rate);
+        assert_eq!(
+            ts.train_batch(batch()),
+            th.train_batch(batch()),
+            "Schritt {step}"
+        );
+    }
+    for x in &XS {
+        assert_eq!(ts.predict(x)[0], th.predict(x)[0]);
+    }
 }

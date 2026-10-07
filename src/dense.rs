@@ -20,7 +20,7 @@
 use crate::activation::Activation;
 use crate::buffer::{Buffer, Stack, Storage};
 use crate::init::Initializer;
-use crate::layer::{Layer, Mode};
+use crate::layer::{Layer, Mode, ParamError};
 use crate::optim::Optimizer;
 use crate::rng::Rng;
 
@@ -103,6 +103,54 @@ impl<S: Storage, A: Activation> DenseLayer<S, A> {
     /// Die Aktivierungsfunktion.
     pub fn activation(&self) -> &A {
         &self.act
+    }
+
+    /// Gewichte als **flacher** Slice, zeilenmajor `OUT × IN`
+    /// (`w[o * IN + i]`) – unabhängig davon, ob der Speicher ein verschachteltes
+    /// Array (Stack) oder ein `Vec` (Heap) ist.
+    ///
+    /// Gewichte und Bias liegen in getrennten Puffern (ein gemeinsamer Puffer
+    /// hätte auf dem Stack die Länge `IN·OUT + OUT`, was ohne
+    /// `generic_const_exprs` nicht als Array-Typ ausdrückbar ist). Der Bias
+    /// steht deshalb unter [`bias_as_slice`](Self::bias_as_slice); beides
+    /// zusammen exportiert [`Layer::copy_params_to_slice`].
+    pub fn weights_as_slice(&self) -> &[f32] {
+        self.w.as_slice()
+    }
+
+    /// Bias-Vektor als Slice (Länge `OUT`).
+    pub fn bias_as_slice(&self) -> &[f32] {
+        self.b.as_slice()
+    }
+
+    /// Kopiert die Gewichte (flach, zeilenmajor `OUT × IN`) aus `src`.
+    ///
+    /// Bei falscher Länge wird nichts verändert.
+    pub fn copy_weights_from_slice(&mut self, src: &[f32]) -> Result<(), ParamError> {
+        let expected = self.w.as_slice().len();
+        if src.len() != expected {
+            return Err(ParamError {
+                expected,
+                got: src.len(),
+            });
+        }
+        self.w.as_mut_slice().copy_from_slice(src);
+        Ok(())
+    }
+
+    /// Kopiert den Bias aus `src` (Länge `OUT`).
+    ///
+    /// Bei falscher Länge wird nichts verändert.
+    pub fn copy_bias_from_slice(&mut self, src: &[f32]) -> Result<(), ParamError> {
+        let expected = self.b.as_slice().len();
+        if src.len() != expected {
+            return Err(ParamError {
+                expected,
+                got: src.len(),
+            });
+        }
+        self.b.as_mut_slice().copy_from_slice(src);
+        Ok(())
     }
 }
 
@@ -219,6 +267,21 @@ impl<S: Storage, A: Activation> Layer for DenseLayer<S, A> {
     fn scale_grads(&mut self, factor: f32) {
         self.gw.as_mut_slice().iter_mut().for_each(|g| *g *= factor);
         self.gb.as_mut_slice().iter_mut().for_each(|g| *g *= factor);
+    }
+
+    fn visit_params<F: FnMut(&[f32])>(&self, f: &mut F) {
+        f(self.w.as_slice());
+        f(self.b.as_slice());
+    }
+
+    fn visit_params_mut<F: FnMut(&mut [f32])>(&mut self, f: &mut F) {
+        f(self.w.as_mut_slice());
+        f(self.b.as_mut_slice());
+    }
+
+    fn grad_sq_norm(&self) -> f32 {
+        let sum_sq = |g: &[f32]| g.iter().map(|x| x * x).sum::<f32>();
+        sum_sq(self.gw.as_slice()) + sum_sq(self.gb.as_slice())
     }
 
     fn init_opt_state<O: Optimizer>(&self, opt: &O) -> Self::OptState<O> {
