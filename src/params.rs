@@ -11,7 +11,7 @@
 //!   Aktivierung), aus der ein [`fingerprint`](Params::fingerprint) der
 //!   Architektur entsteht,
 //! * Kopieren von und in `&[f32]`-Slices sowie das Speichern/Laden im
-//!   Modellformat ([`model`](crate::model)) – ohne `serde` und ohne Heap.
+//!   Modellformat ([`model`]) – ohne `serde` und ohne Heap.
 //!
 //! Layer ohne Parameter (Dropout) tauchen weder im Export noch im Fingerprint
 //! auf: Ein mit Dropout trainiertes Netz lässt sich daher in dasselbe Netz ohne

@@ -2,7 +2,7 @@
 //!
 //! [`DenseLayer`] ist über [`Storage`] generisch: dieselbe Implementierung
 //! arbeitet mit Stack-Arrays ([`Dense`]) und – mit Feature `alloc` – mit
-//! `Vec<f32>` ([`HeapDense`]).
+//! `Vec<f32>` (`HeapDense`, Feature `alloc`).
 //!
 //! ## Speicherbedarf (Stack-Variante, in `f32`)
 //!
@@ -115,7 +115,7 @@ impl<S: Storage, A: Activation> DenseLayer<S, A> {
     /// hätte auf dem Stack die Länge `IN·OUT + OUT`, was ohne
     /// `generic_const_exprs` nicht als Array-Typ ausdrückbar ist). Der Bias
     /// steht deshalb unter [`bias_as_slice`](Self::bias_as_slice); beides
-    /// zusammen exportiert [`Layer::copy_params_to_slice`].
+    /// zusammen exportiert [`Params::copy_params_to_slice`].
     pub fn weights_as_slice(&self) -> &[f32] {
         self.w.as_slice()
     }

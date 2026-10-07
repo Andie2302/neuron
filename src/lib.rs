@@ -4,7 +4,7 @@
 //!   Gradienten und Zwischenwerte sind Arrays (`[f32; N]`) und liegen in den
 //!   Layer-Strukturen selbst – also auf dem Stack oder in einem `static`.
 //! * **Feature `alloc`** (Opt-In): zusätzlich `Vec<f32>`-Puffer und
-//!   zur Laufzeit konfigurierbare Netze ([`dynamic`]).
+//!   zur Laufzeit konfigurierbare Netze (Modul `dynamic`).
 //! * Einzige Abhängigkeit: `libm`.
 //!
 //! ## Architektur

@@ -190,7 +190,7 @@ impl Loss for BinaryCrossEntropy {
 /// Die Ableitung von Sigmoid und Logarithmus kürzt sich analytisch heraus. Der
 /// Gradient bleibt dadurch auch für stark gesättigte Ausgaben `|z| ≫ 17`
 /// vollständig erhalten, wo [`BinaryCrossEntropy`] auf Wahrscheinlichkeiten
-/// einfriert. Bei der Inferenz macht [`math::sigmoid`](crate::math::sigmoid)
+/// einfriert. Bei der Inferenz macht [`math::sigmoid`]
 /// aus den Logits Wahrscheinlichkeiten.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BinaryCrossEntropyWithLogits;
