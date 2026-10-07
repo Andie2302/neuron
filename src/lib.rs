@@ -14,7 +14,7 @@
 //! | [`Buffer`]    | `f32`-Speicher (Stack/Heap)              | `[f32; N]`, `[[f32; C]; R]`, `Vec<f32>` (`alloc`)   |
 //! | [`Storage`]   | Puffertypen eines Dense-Layers           | [`Stack`], `Heap` (`alloc`)                         |
 //! | [`Activation`]| Aktivierung + Ableitung                  | [`Linear`], [`Relu`], [`LeakyRelu`], [`Sigmoid`], [`Tanh`], [`Gelu`], [`Swish`], [`Elu`], [`Softplus`], [`Mish`], [`ActivationKind`] |
-//! | [`Loss`]      | Verlust + Gradient                       | [`Mse`], [`Mae`], [`Huber`], [`BinaryCrossEntropy`], [`SoftmaxCrossEntropy`] |
+//! | [`Loss`]      | Verlust + Gradient                       | [`Mse`], [`Mae`], [`Huber`], [`BinaryCrossEntropy`], [`BinaryCrossEntropyWithLogits`], [`SoftmaxCrossEntropy`] |
 //! | [`Initializer`]| Gewichtsinitialisierung                 | [`Constant`], [`XavierUniform`], [`XavierNormal`], [`HeUniform`], [`HeNormal`] |
 //! | [`Optimizer`] | Parameter-Update (+ Zustand je Tensor)   | [`Sgd`], [`Momentum`], [`Adam`], [`AdamW`], [`RmsProp`], [`Adagrad`] |
 //! | [`LrSchedule`]| Lernrate je Schritt                      | [`ConstantLr`], [`StepDecay`], [`ExponentialDecay`], [`CosineAnnealing`], [`Warmup`] |
@@ -87,8 +87,10 @@ pub use dense::{Dense, DenseLayer};
 pub use dropout::{Dropout, DropoutLayer};
 pub use init::{Constant, HeNormal, HeUniform, Initializer, XavierNormal, XavierUniform};
 pub use layer::{Chain, Layer, Mode, ParamError};
-pub use loss::{BinaryCrossEntropy, Huber, Loss, Mae, Mse, SoftmaxCrossEntropy};
-pub use math::{argmax, softmax_inplace};
+pub use loss::{
+    BinaryCrossEntropy, BinaryCrossEntropyWithLogits, Huber, Loss, Mae, Mse, SoftmaxCrossEntropy,
+};
+pub use math::{argmax, sigmoid, softmax_inplace};
 pub use optim::{Adagrad, Adam, AdamW, Momentum, Optimizer, RmsProp, Sgd};
 pub use rng::{Pcg32, Rng};
 pub use schedule::{ConstantLr, CosineAnnealing, ExponentialDecay, LrSchedule, StepDecay, Warmup};
@@ -106,12 +108,12 @@ pub use dynamic::{DynLayer, Sequential};
 /// Alles Wichtige auf einmal importieren.
 pub mod prelude {
     pub use crate::{
-        argmax, softmax_inplace, Activation, ActivationKind, Adagrad, Adam, AdamW,
-        BinaryCrossEntropy, Buffer, Chain, Constant, ConstantLr, CosineAnnealing, Dense, Dropout,
-        Elu, ExponentialDecay, Gelu, HeNormal, HeUniform, Huber, Initializer, Layer, LeakyRelu,
-        Linear, Loss, LrSchedule, Mae, Mish, Mode, Momentum, Mse, Optimizer, ParamError, Pcg32,
-        Relu, RmsProp, Rng, Sgd, Sigmoid, SoftmaxCrossEntropy, Softplus, StepDecay, Swish, Tanh,
-        Trainer, Warmup, XavierNormal, XavierUniform,
+        argmax, sigmoid, softmax_inplace, Activation, ActivationKind, Adagrad, Adam, AdamW,
+        BinaryCrossEntropy, BinaryCrossEntropyWithLogits, Buffer, Chain, Constant, ConstantLr,
+        CosineAnnealing, Dense, Dropout, Elu, ExponentialDecay, Gelu, HeNormal, HeUniform, Huber,
+        Initializer, Layer, LeakyRelu, Linear, Loss, LrSchedule, Mae, Mish, Mode, Momentum, Mse,
+        Optimizer, ParamError, Pcg32, Relu, RmsProp, Rng, Sgd, Sigmoid, SoftmaxCrossEntropy,
+        Softplus, StepDecay, Swish, Tanh, Trainer, Warmup, XavierNormal, XavierUniform,
     };
 
     #[cfg(feature = "alloc")]

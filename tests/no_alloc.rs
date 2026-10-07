@@ -217,6 +217,7 @@ fn every_activation_optimizer_loss_and_schedule_never_touches_the_heap() {
     sink += train_with_loss(Mae);
     sink += train_with_loss(Huber::new(0.5));
     sink += train_with_loss(BinaryCrossEntropy::default());
+    sink += train_with_loss(BinaryCrossEntropyWithLogits);
     sink += train_with_loss(SoftmaxCrossEntropy);
 
     // Jeder Lernraten-Plan.

@@ -444,3 +444,61 @@ fn huber_and_mae_resist_an_outlier_that_drags_mse_away() {
     assert!(mae < 0.5, "MAE-Steigungsfehler {mae}");
     assert!(huber < mse / 10.0 && mae < mse / 10.0);
 }
+
+/// Das Netz startet völlig falsch und gesättigt: Logit 30, Ziel 0.
+#[test]
+fn saturated_wrong_output_freezes_with_probability_bce_but_recovers_with_logits_bce() {
+    // Alt: Sigmoid-Ausgang + BCE auf Wahrscheinlichkeiten. σ(30) = 1.0 exakt in f32,
+    // σ' = 0, der Gradient verschwindet – das Netz bleibt für immer so falsch.
+    let mut frozen_net = Dense::<1, 1, _>::new(Sigmoid);
+    *frozen_net.weights_mut() = [[30.0]];
+    let mut frozen = Trainer::new(frozen_net, BinaryCrossEntropy::default(), Sgd::new(0.5));
+    let initial_loss = frozen.evaluate(&[1.0], &[0.0]);
+    for _ in 0..100 {
+        frozen.train_step(&[1.0], &[0.0]);
+    }
+    assert_eq!(
+        frozen.network().weights(),
+        &[[30.0]],
+        "Gewicht hat sich bewegt"
+    );
+    assert_eq!(
+        frozen.evaluate(&[1.0], &[0.0]),
+        initial_loss,
+        "Verlust sank trotz Nullgradient"
+    );
+    assert!(initial_loss > 10.0, "Ausgangsverlust {initial_loss}");
+
+    // Neu: Linear-Ausgang + fusionierter Logit-Verlust. Gradient σ(z) - t = 1 bleibt voll erhalten.
+    let mut net = Dense::<1, 1, _>::new(Linear);
+    *net.weights_mut() = [[30.0]];
+    let mut fixed = Trainer::new(net, BinaryCrossEntropyWithLogits, Sgd::new(0.5));
+    for _ in 0..100 {
+        fixed.train_step(&[1.0], &[0.0]);
+    }
+    // Der Gradient σ(z) schrumpft, sobald der Logit richtig liegt (z fällt dann nur noch
+    // wie -ln t). Nach 30 Schritten ist z ≈ 0 überschritten, nach 100 liegt es bei ≈ -4.
+    let logit = fixed.predict(&[1.0])[0];
+    assert!(
+        logit < -3.0,
+        "Logit {logit} hat sich nicht erholt (Start: 30)"
+    );
+    assert!(fixed.evaluate(&[1.0], &[0.0]) < 0.05);
+    assert!(sigmoid(logit) < 0.05);
+}
+
+#[test]
+fn xor_with_logits_loss_and_sigmoid_only_at_inference() {
+    for seed in [1u64, 2, 3, 4] {
+        let mut net = Dense::<2, 8, _>::new(Gelu).then(Dense::<8, 1, _>::new(Linear));
+        net.init(&XavierUniform, &mut Pcg32::seeded(seed));
+        let mut t = Trainer::new(net, BinaryCrossEntropyWithLogits, AdamW::new(0.03));
+        for _ in 0..1200 {
+            t.train_batch(xor_batch());
+        }
+        for (x, y) in XS.iter().zip(&YS) {
+            let p = sigmoid(t.predict(x)[0]);
+            assert!((p - y[0]).abs() < 0.15, "seed {seed}, x = {x:?}: p = {p}");
+        }
+    }
+}

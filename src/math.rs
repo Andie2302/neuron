@@ -52,6 +52,23 @@ pub(crate) fn abs(x: f32) -> f32 {
     libm::fabsf(x)
 }
 
+/// Logistische Funktion `σ(x) = 1 / (1 + e^-x)`.
+///
+/// Für sehr negative `x` läuft `e^-x` auf `+inf` und `1/inf = 0`; das Ergebnis
+/// liegt immer in `[0, 1]` (nie `NaN` für endliche `x`). Praktisch, um die
+/// Logits eines Netzes, das mit
+/// [`BinaryCrossEntropyWithLogits`](crate::loss::BinaryCrossEntropyWithLogits)
+/// trainiert wurde, bei der Inferenz in Wahrscheinlichkeiten umzurechnen.
+///
+/// ```
+/// assert_eq!(neuron::math::sigmoid(0.0), 0.5);
+/// assert_eq!(neuron::math::sigmoid(-1000.0), 0.0);
+/// ```
+#[inline]
+pub fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + exp(-x))
+}
+
 /// Numerisch stabile Softmax **in place**: `x[i] ← exp(x[i]) / Σ exp(x[j])`.
 ///
 /// Vor dem `exp` wird das Maximum abgezogen, damit selbst Logits wie `1000.0`

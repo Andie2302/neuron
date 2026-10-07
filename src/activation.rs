@@ -104,7 +104,7 @@ impl Activation for Sigmoid {
     #[inline]
     fn apply(&self, x: f32) -> f32 {
         // Für x << 0 läuft exp(-x) gegen +inf, 1/inf = 0 – kein NaN.
-        1.0 / (1.0 + math::exp(-x))
+        math::sigmoid(x)
     }
     #[inline]
     fn derivative(&self, _x: f32, y: f32) -> f32 {
