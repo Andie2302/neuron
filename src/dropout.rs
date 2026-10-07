@@ -147,6 +147,10 @@ impl<V: Buffer> Layer for DropoutLayer<V> {
         self.grad_in.as_slice()
     }
 
+    fn visit_params<F: FnMut(&[f32])>(&self, _f: &mut F) {}
+    fn visit_params_mut<F: FnMut(&mut [f32])>(&mut self, _f: &mut F) {}
+    fn visit_grads<F: FnMut(&[f32])>(&self, _f: &mut F) {}
+
     fn zero_grad(&mut self) {}
     fn scale_grads(&mut self, _factor: f32) {}
     fn init_opt_state<O: Optimizer>(&self, _opt: &O) -> Self::OptState<O> {}

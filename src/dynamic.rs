@@ -65,6 +65,15 @@ impl Layer for DynLayer {
     fn grad_input(&self) -> &[f32] {
         dispatch!(self, l => l.grad_input())
     }
+    fn visit_params<F: FnMut(&[f32])>(&self, f: &mut F) {
+        dispatch!(self, l => l.visit_params(f))
+    }
+    fn visit_params_mut<F: FnMut(&mut [f32])>(&mut self, f: &mut F) {
+        dispatch!(self, l => l.visit_params_mut(f))
+    }
+    fn visit_grads<F: FnMut(&[f32])>(&self, f: &mut F) {
+        dispatch!(self, l => l.visit_grads(f))
+    }
     fn zero_grad(&mut self) {
         dispatch!(self, l => l.zero_grad())
     }
@@ -207,6 +216,22 @@ impl Layer for Sequential {
     fn grad_input(&self) -> &[f32] {
         self.assert_not_empty();
         self.layers[0].grad_input()
+    }
+
+    fn visit_params<F: FnMut(&[f32])>(&self, f: &mut F) {
+        for l in &self.layers {
+            l.visit_params(f);
+        }
+    }
+    fn visit_params_mut<F: FnMut(&mut [f32])>(&mut self, f: &mut F) {
+        for l in &mut self.layers {
+            l.visit_params_mut(f);
+        }
+    }
+    fn visit_grads<F: FnMut(&[f32])>(&self, f: &mut F) {
+        for l in &self.layers {
+            l.visit_grads(f);
+        }
     }
 
     fn zero_grad(&mut self) {

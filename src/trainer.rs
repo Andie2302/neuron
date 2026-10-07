@@ -3,6 +3,7 @@
 use crate::buffer::Buffer;
 use crate::layer::{Layer, Mode};
 use crate::loss::Loss;
+use crate::math;
 use crate::optim::Optimizer;
 
 /// Trainingsschleife ohne Allokation: der Verlust-Gradient liegt in einem
@@ -14,6 +15,8 @@ pub struct Trainer<L: Layer, Ls: Loss, O: Optimizer> {
     state: L::OptState<O>,
     /// `dL/dpred` des aktuellen Samples.
     loss_grad: L::Output,
+    /// Obergrenze für die globale Gradientennorm (`None` = kein Clipping).
+    clip_norm: Option<f32>,
 }
 
 impl<L: Layer, Ls: Loss, O: Optimizer> Trainer<L, Ls, O> {
@@ -27,6 +30,7 @@ impl<L: Layer, Ls: Loss, O: Optimizer> Trainer<L, Ls, O> {
             opt,
             state,
             loss_grad,
+            clip_norm: None,
         }
     }
 
@@ -43,6 +47,96 @@ impl<L: Layer, Ls: Loss, O: Optimizer> Trainer<L, Ls, O> {
     /// Der Optimizer (z. B. um die Lernrate zu ändern).
     pub fn optimizer_mut(&mut self) -> &mut O {
         &mut self.opt
+    }
+
+    /// Aktuelle Lernrate des Optimizers.
+    pub fn learning_rate(&self) -> f32 {
+        self.opt.learning_rate()
+    }
+
+    /// Setzt die Lernrate, z. B. aus einem [`LrSchedule`](crate::schedule::LrSchedule).
+    pub fn set_learning_rate(&mut self, lr: f32) {
+        self.opt.set_learning_rate(lr);
+    }
+
+    /// Schaltet Gradient-Clipping nach globaler L2-Norm ein (`Some(max_norm)`)
+    /// oder aus (`None`).
+    ///
+    /// In [`apply`](Self::apply) werden die über den Batch **gemittelten**
+    /// Gradienten aller Layer gemeinsam so skaliert, dass ihre Norm höchstens
+    /// `max_norm` beträgt (erst `1/n`, dann Clipping). Die Richtung bleibt
+    /// erhalten. Das stabilisiert das Training bei großen Lernraten oder
+    /// Ausreißern. Die Norm wird überlauffrei berechnet, das Clipping wirkt also
+    /// auch bei sehr großen, aber endlichen Gradienten.
+    ///
+    /// **Nicht endliche Gradienten** (`inf` oder `NaN`): Solange Clipping aktiv
+    /// ist, entfällt der gesamte Schritt. Die Gradienten werden verworfen,
+    /// Parameter *und* Optimizer-Zustand (z. B. Adams Schrittzähler und Momente)
+    /// bleiben unverändert. Ohne Clipping werden sie unverändert weitergereicht.
+    ///
+    /// # Panics
+    /// Wenn `max_norm` nicht endlich und `> 0` ist.
+    pub fn set_grad_clip_norm(&mut self, max_norm: Option<f32>) {
+        if let Some(m) = max_norm {
+            assert!(
+                m.is_finite() && m > 0.0,
+                "max_norm muss endlich und > 0 sein"
+            );
+        }
+        self.clip_norm = max_norm;
+    }
+
+    /// Wie [`set_grad_clip_norm`](Self::set_grad_clip_norm), als Builder.
+    pub fn with_grad_clip_norm(mut self, max_norm: f32) -> Self {
+        self.set_grad_clip_norm(Some(max_norm));
+        self
+    }
+
+    /// Zerlegt die globale L2-Norm der akkumulierten Gradienten überlauffrei in
+    /// `(m, s)` mit `norm = m · s`, wobei `m = max |g|` und `s = √Σ (g/m)²`
+    /// (`1 <= s <= √n`).
+    ///
+    /// Die naive Summe `Σ g²` läuft für `|g| > 1,8e19` in `f32` über, obwohl die
+    /// Gradienten selbst noch endlich sind. Sonderfälle: kein Gradient ungleich
+    /// `0` gibt `(0, 0)`; enthält ein Gradient `NaN`, ist `m = NaN`; ein
+    /// unendlicher Gradient ergibt `m = inf`.
+    fn grad_norm_parts(&self) -> (f32, f32) {
+        let mut max = 0.0f32;
+        let mut has_nan = false;
+        self.net.visit_grads(&mut |g: &[f32]| {
+            for &v in g {
+                if v.is_nan() {
+                    has_nan = true;
+                } else {
+                    max = max.max(math::abs(v));
+                }
+            }
+        });
+        if has_nan {
+            return (f32::NAN, 1.0);
+        }
+        if max == 0.0 {
+            return (0.0, 0.0);
+        }
+        if max == f32::INFINITY {
+            return (max, 1.0);
+        }
+        let mut sum = 0.0f32;
+        self.net.visit_grads(&mut |g: &[f32]| {
+            for &v in g {
+                let scaled = v / max;
+                sum += scaled * scaled;
+            }
+        });
+        (max, math::sqrt(sum))
+    }
+
+    /// Globale L2-Norm der aktuell akkumulierten Gradienten.
+    ///
+    /// Liegt die Norm außerhalb des `f32`-Bereichs, ist das Ergebnis `inf`.
+    pub fn grad_norm(&self) -> f32 {
+        let (m, s) = self.grad_norm_parts();
+        m * s
     }
 
     /// Forward im [`Mode::Inference`].
@@ -67,13 +161,30 @@ impl<L: Layer, Ls: Loss, O: Optimizer> Trainer<L, Ls, O> {
         value
     }
 
-    /// Optimizer-Schritt mit dem Mittel über `samples` akkumulierte Samples,
-    /// danach werden die Gradienten zurückgesetzt.
+    /// Optimizer-Schritt mit dem Mittel über `samples` akkumulierte Samples
+    /// (optional mit Gradient-Clipping, siehe
+    /// [`set_grad_clip_norm`](Self::set_grad_clip_norm)), danach werden die
+    /// Gradienten zurückgesetzt.
     pub fn apply(&mut self, samples: usize) {
         if samples == 0 {
             return;
         }
         self.net.scale_grads(1.0 / samples as f32);
+        if let Some(max_norm) = self.clip_norm {
+            let (m, s) = self.grad_norm_parts();
+            if !m.is_finite() {
+                // inf/NaN: kein Schritt. Weder Parameter noch Optimizer-Zustand
+                // (begin_step zählt sonst z. B. Adams t weiter) dürfen sich ändern.
+                self.net.zero_grad();
+                return;
+            }
+            // norm = m·s > max_norm  <=>  s > max_norm / m. Beide Seiten bleiben endlich;
+            // die Norm selbst wird nie gebildet (m·s kann den f32-Bereich verlassen).
+            let limit = max_norm / m;
+            if s > limit {
+                self.net.scale_grads(limit / s);
+            }
+        }
         self.opt.begin_step();
         self.net.step(&self.opt, &mut self.state);
         self.net.zero_grad();
