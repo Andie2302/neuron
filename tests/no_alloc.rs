@@ -335,3 +335,112 @@ fn inference_conversion_and_forward_never_touch_the_heap() {
     std::hint::black_box(sink);
     assert_eq!(used, 0, "{used} Heap-Allokationen in der Inferenz");
 }
+
+#[test]
+fn losses_optimizers_and_helpers_added_later_never_touch_the_heap() {
+    use neuron::average::ParamEma;
+    let before = allocs();
+    let mut sink = 0.0f32;
+
+    // Neue Verluste (mit Adam, 20 Schritte).
+    sink += train_with_loss(LogCosh);
+    sink += train_with_loss(Hinge);
+    sink += train_with_loss(SquaredHinge);
+    sink += train_with_loss(WeightedBinaryCrossEntropyWithLogits::new(3.0));
+    sink += train_with_loss(FocalLossWithLogits::new(2.0).with_alpha(0.25));
+    sink += train_with_loss(FocalLossWithLogits::default());
+    sink += train_with_loss(LabelSmoothingCrossEntropy::new(0.1));
+
+    // Neue Optimizer, auch umhüllt.
+    sink += train_briefly(NAdam::new(0.01));
+    sink += train_briefly(NAdam::new(0.01).with_weight_decay(0.1));
+    sink += train_briefly(RAdam::new(0.01));
+    sink += train_briefly(RAdam::new(0.01).with_betas(0.9, 0.9).with_weight_decay(0.1));
+    sink += train_briefly(Lookahead::new(Adam::new(0.01)).with_sync_period(3));
+    sink += train_briefly(Lookahead::new(Momentum::new(0.01, 0.9)).with_alpha(0.8));
+    sink += train_briefly(Lookahead::new(Sgd::new(0.01)));
+
+    // Epochen-Training mit Mischen, Validierung, Early Stopping, EMA, Standardisierung.
+    let scaler = Standardizer::fit(&XS);
+    let mut inputs = XS;
+    for x in inputs.iter_mut() {
+        scaler.transform(x);
+    }
+    let mut net = Dense::<2, 4, _>::new(Tanh).then(Dense::<4, 1, _>::new(Linear));
+    net.init(&XavierUniform, &mut Pcg32::seeded(6));
+    let mut trainer = Trainer::new(
+        net,
+        BinaryCrossEntropyWithLogits,
+        Lookahead::new(AdamW::new(0.03)),
+    );
+    let mut ema = ParamEma::<[f32; 2 * 4 + 4 + 4 + 1]>::for_params(trainer.network(), 0.9);
+    let mut order: [usize; 4] = core::array::from_fn(|i| i);
+    let mut rng = Pcg32::seeded(2);
+    let mut stopper = EarlyStopping::new(5).with_min_delta(1e-4);
+    for _ in 0..40 {
+        sink += trainer.train_epoch(&inputs, &YS, 3, &mut order, &mut rng);
+        ema.update(trainer.network()).unwrap();
+        let valid = trainer.evaluate_batch(inputs.iter().zip(&YS).map(|(x, y)| (&x[..], &y[..])));
+        sink += valid;
+        if stopper.update(valid) == StopStatus::Stop {
+            break;
+        }
+    }
+    let mut deployed = trainer.network().clone().into_inference();
+    ema.copy_to(&mut deployed).unwrap();
+    sink += ema.averaged()[0];
+
+    // Zufall, Metriken, Datenvorbereitung.
+    let mut shuffled: [usize; 16] = core::array::from_fn(|i| i);
+    neuron::rng::shuffle(&mut rng, &mut shuffled);
+    sink += shuffled[0] as f32 + rng.below(10) as f32;
+    let mut cm = ConfusionMatrix::<3>::new();
+    cm.record(0, 1);
+    cm.record(2, 2);
+    cm.record_scores(1, &[0.1, 0.8, 0.1]);
+    sink += cm.accuracy() + cm.macro_f1() + cm.precision(1) + cm.recall(1) + cm.f1(2);
+    sink += r2_score(&[1.0, 2.0, 3.5], &[1.0, 2.0, 3.0]);
+    let mut onehot = [0.0f32; 4];
+    one_hot(2, &mut onehot);
+    let mut stats = RunningStats::<2>::new();
+    for x in &XS {
+        stats.update(x);
+    }
+    let mut z = [0.5f32, 0.5];
+    stats.standardizer().transform(&mut z);
+    stats.standardizer().inverse(&mut z);
+    sink += onehot[2] + z[0] + stats.std()[1];
+
+    // Inferenz-Helfer.
+    let mut logits_net = Dense::<2, 3, _>::new(Linear).into_inference();
+    logits_net
+        .load_model(&{
+            let mut src = Dense::<2, 3, _>::new(Linear);
+            src.init(&XavierUniform, &mut Pcg32::seeded(8));
+            let mut buf = [0u8; neuron::model::model_len(2 * 3 + 3)];
+            src.save_model(&mut buf).unwrap();
+            buf
+        })
+        .unwrap();
+    for x in &XS {
+        sink += logits_net.classify(x).unwrap_or(0) as f32;
+        sink += logits_net
+            .classify_with_confidence(x)
+            .map_or(0.0, |(_, p)| p);
+        sink += logits_net.classify_confident(x, 0.5).unwrap_or(0) as f32;
+        let mut probs = [0.0f32; 3];
+        logits_net.probabilities(x, &mut probs);
+        let mut best = [0usize; 2];
+        sink += probs[0] + logits_net.top_k(x, &mut best) as f32;
+    }
+    sink += logits_net.accuracy(&XS, &[0, 1, 2, 0]);
+    let mut single = Dense::<2, 1, _>::new(Linear).into_inference();
+    sink += single.positive_probability(&XS[1]);
+
+    let used = allocs() - before;
+    std::hint::black_box(sink);
+    assert_eq!(
+        used, 0,
+        "{used} Heap-Allokationen in den späteren Ergänzungen"
+    );
+}

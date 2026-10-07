@@ -5,6 +5,7 @@ use crate::layer::{Layer, Mode};
 use crate::loss::Loss;
 use crate::math;
 use crate::optim::Optimizer;
+use crate::rng::{self, Rng};
 
 /// Trainingsschleife ohne Allokation: der Verlust-Gradient liegt in einem
 /// Puffer vom Typ `L::Output` (bei Stack-Netzen ein `[f32; OUT]`).
@@ -150,6 +151,22 @@ impl<L: Layer, Ls: Loss, O: Optimizer> Trainer<L, Ls, O> {
         self.loss.value(pred, target)
     }
 
+    /// Mittlerer Verlust über einen ganzen Datensatz im [`Mode::Inference`] (kein Dropout, keine
+    /// Gradienten), z. B. auf Validierungsdaten für
+    /// [`EarlyStopping`](crate::stopping::EarlyStopping). Ein leerer Datensatz ergibt `0.0`
+    /// (wie bei [`train_batch`](Self::train_batch)).
+    pub fn evaluate_batch<'a, I>(&mut self, batch: I) -> f32
+    where
+        I: IntoIterator<Item = (&'a [f32], &'a [f32])>,
+    {
+        // Laufendes Mittel statt Summe: bleibt auch bei sehr vielen Samples genau und endlich.
+        let mut mean = 0.0f32;
+        for (n, (x, y)) in batch.into_iter().enumerate() {
+            mean += (self.evaluate(x, y) - mean) / (n + 1) as f32;
+        }
+        mean
+    }
+
     /// Forward (Training) + Backward für ein Sample; die Gradienten werden
     /// **akkumuliert**. Gibt den Verlust des Samples zurück.
     pub fn accumulate(&mut self, input: &[f32], target: &[f32]) -> f32 {
@@ -219,5 +236,79 @@ impl<L: Layer, Ls: Loss, O: Optimizer> Trainer<L, Ls, O> {
         } else {
             total / n as f32
         }
+    }
+
+    /// Eine **Epoche**: mischt die Reihenfolge der Samples und trainiert sie in Mini-Batches der
+    /// Größe `batch_size` (der letzte Batch darf kleiner sein). Gibt den mittleren Verlust über
+    /// die Epoche zurück – gemessen *während* des Trainings, also vor dem jeweiligen Update und
+    /// bei aktivem Dropout (ein Validierungsverlust im Inferenzmodus kommt von
+    /// [`evaluate_batch`](Self::evaluate_batch)).
+    ///
+    /// `order` ist ein vom Aufrufer gestellter Index-Puffer – so bleibt alles ohne Heap. Er muss
+    /// eine **Permutation** von `0..inputs.len()` enthalten (jeder Index genau einmal), z. B.
+    /// `core::array::from_fn(|i| i)`; er wird in jeder Epoche an Ort und Stelle neu gemischt
+    /// ([`shuffle`](crate::rng::shuffle)), und bei gleichem Seed ist der Ablauf reproduzierbar.
+    /// Die Samples selbst bleiben unberührt.
+    ///
+    /// ```
+    /// use neuron::prelude::*;
+    ///
+    /// let xs = [[0.0f32, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]];
+    /// let ys = [[0.0f32], [1.0], [1.0], [0.0]];
+    /// let mut net = Dense::<2, 6, _>::new(Tanh).then(Dense::<6, 1, _>::new(Linear));
+    /// net.init(&XavierUniform, &mut Pcg32::seeded(1));
+    /// let mut trainer = Trainer::new(net, BinaryCrossEntropyWithLogits, Adam::new(0.05));
+    ///
+    /// let mut order: [usize; 4] = core::array::from_fn(|i| i);
+    /// let mut rng = Pcg32::seeded(7);
+    /// let first = trainer.train_epoch(&xs, &ys, 2, &mut order, &mut rng);
+    /// let mut last = first;
+    /// for _ in 0..300 {
+    ///     last = trainer.train_epoch(&xs, &ys, 2, &mut order, &mut rng);
+    /// }
+    /// assert!(last < first);
+    /// ```
+    ///
+    /// # Panics
+    /// Wenn `batch_size == 0`, die Längen von `inputs`, `targets` und `order` nicht übereinstimmen
+    /// oder `order` einen Index `>= inputs.len()` enthält.
+    pub fn train_epoch<X, Y, R>(
+        &mut self,
+        inputs: &[X],
+        targets: &[Y],
+        batch_size: usize,
+        order: &mut [usize],
+        rng: &mut R,
+    ) -> f32
+    where
+        X: AsRef<[f32]>,
+        Y: AsRef<[f32]>,
+        R: Rng + ?Sized,
+    {
+        assert!(batch_size > 0, "batch_size muss > 0 sein");
+        assert_eq!(
+            inputs.len(),
+            targets.len(),
+            "Eingaben und Ziele verschieden lang"
+        );
+        assert_eq!(
+            order.len(),
+            inputs.len(),
+            "order muss eine Permutation von 0..n sein"
+        );
+        rng::shuffle(rng, order);
+        let mut mean = 0.0f32;
+        let mut seen = 0usize;
+        for chunk in order.chunks(batch_size) {
+            let batch_loss = self.train_batch(
+                chunk
+                    .iter()
+                    .map(|&i| (inputs[i].as_ref(), targets[i].as_ref())),
+            );
+            // Gewichtetes laufendes Mittel: der letzte, kleinere Batch zählt anteilig.
+            seen += chunk.len();
+            mean += (batch_loss - mean) * chunk.len() as f32 / seen as f32;
+        }
+        mean
     }
 }

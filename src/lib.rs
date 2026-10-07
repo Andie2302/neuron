@@ -14,13 +14,19 @@
 //! | [`Buffer`]    | `f32`-Speicher (Stack/Heap)              | `[f32; N]`, `[[f32; C]; R]`, `Vec<f32>` (`alloc`)   |
 //! | [`Storage`]   | Puffertypen eines Dense-Layers           | [`Stack`], `Heap` (`alloc`)                         |
 //! | [`Activation`]| Aktivierung + Ableitung + Kennung        | [`Linear`], [`Relu`], [`LeakyRelu`], [`Sigmoid`], [`Tanh`], [`Gelu`], [`Swish`], [`Elu`], [`Softplus`], [`Mish`]; ohne `exp`/`tanh`: [`Relu6`], [`HardSigmoid`], [`HardSwish`], [`HardTanh`], [`Softsign`]; [`ActivationKind`] |
-//! | [`Loss`]      | Verlust + Gradient                       | [`Mse`], [`Mae`], [`Huber`], [`BinaryCrossEntropy`], [`BinaryCrossEntropyWithLogits`], [`SoftmaxCrossEntropy`] |
+//! | [`Loss`]      | Verlust + Gradient                       | [`Mse`], [`Mae`], [`Huber`], [`LogCosh`], [`Hinge`], [`SquaredHinge`], [`BinaryCrossEntropy`], [`BinaryCrossEntropyWithLogits`], [`WeightedBinaryCrossEntropyWithLogits`], [`FocalLossWithLogits`], [`SoftmaxCrossEntropy`], [`LabelSmoothingCrossEntropy`] |
 //! | [`Initializer`]| Gewichtsinitialisierung                 | [`Constant`], [`XavierUniform`], [`XavierNormal`], [`HeUniform`], [`HeNormal`] |
-//! | [`Optimizer`] | Parameter-Update (+ Zustand je Tensor)   | [`Sgd`], [`Momentum`], [`Adam`], [`AdamW`], [`Lion`], [`RmsProp`], [`RmsPropMomentum`], [`Adagrad`] |
+//! | [`Optimizer`] | Parameter-Update (+ Zustand je Tensor)   | [`Sgd`], [`Momentum`], [`Adam`], [`AdamW`], [`NAdam`], [`RAdam`], [`Lion`], [`RmsProp`], [`RmsPropMomentum`], [`Adagrad`]; Wrapper [`Lookahead`] |
 //! | [`LrSchedule`]| Lernrate je Schritt                      | [`ConstantLr`], [`StepDecay`], [`ExponentialDecay`], [`CosineAnnealing`], [`Warmup`] |
 //! | [`Params`]    | Parameter lesen/schreiben, Fingerprint, Modell speichern/laden | alle Layer und Inferenz-Layer |
 //! | [`Layer`]     | Baustein mit Forward/Backward            | [`Dense`], [`Dropout`], [`Chain`], `Sequential` (`alloc`) |
 //! | [`InferLayer`]| Baustein nur zum Rechnen (kein Training) | [`InferDense`], [`InferChain`], [`Passthrough`], `InferSequential` (`alloc`); erzeugt über [`IntoInference`] |
+//! | [`InferExt`]  | Entscheidungshilfen für jeden `InferLayer` | `classify`, `classify_confident`, `probabilities`, `top_k`, `accuracy` |
+//!
+//! Rund ums Training (alles ohne Heap): [`Trainer::train_epoch`] (gemischte Mini-Batches),
+//! [`Trainer::evaluate_batch`], [`Standardizer`] / [`RunningStats`] (Merkmale skalieren),
+//! [`one_hot`], [`EarlyStopping`], [`ParamEma`] (gleitendes Mittel der Gewichte),
+//! [`ConfusionMatrix`] und [`r2_score`].
 //!
 //! ## Stack und Heap hinter denselben Traits
 //!
@@ -64,18 +70,22 @@
 extern crate alloc;
 
 pub mod activation;
+pub mod average;
 pub mod buffer;
+pub mod data;
 pub mod dense;
 pub mod dropout;
 pub mod infer;
 pub mod init;
 pub mod layer;
 pub mod loss;
+pub mod metrics;
 pub mod model;
 pub mod optim;
 pub mod params;
 pub mod rng;
 pub mod schedule;
+pub mod stopping;
 pub mod trainer;
 
 #[cfg(feature = "alloc")]
@@ -87,23 +97,30 @@ pub use activation::{
     Activation, ActivationKind, Elu, Gelu, HardSigmoid, HardSwish, HardTanh, LeakyRelu, Linear,
     Mish, Relu, Relu6, Sigmoid, Softplus, Softsign, Swish, Tanh,
 };
+pub use average::ParamEma;
 pub use buffer::{Buffer, Stack, Storage};
+pub use data::{one_hot, RunningStats, Standardizer};
 pub use dense::{Dense, DenseLayer, InferDense, InferenceDense};
 pub use dropout::{Dropout, DropoutLayer};
-pub use infer::{InferChain, InferLayer, IntoInference, Passthrough};
+pub use infer::{InferChain, InferExt, InferLayer, IntoInference, Passthrough};
 pub use init::{Constant, HeNormal, HeUniform, Initializer, XavierNormal, XavierUniform};
 pub use layer::{Chain, Layer, Mode};
 pub use loss::{
-    BinaryCrossEntropy, BinaryCrossEntropyWithLogits, Huber, Loss, Mae, Mse, SoftmaxCrossEntropy,
+    BinaryCrossEntropy, BinaryCrossEntropyWithLogits, FocalLossWithLogits, Hinge, Huber,
+    LabelSmoothingCrossEntropy, LogCosh, Loss, Mae, Mse, SoftmaxCrossEntropy, SquaredHinge,
+    WeightedBinaryCrossEntropyWithLogits,
 };
-pub use math::{argmax, sigmoid, softmax_inplace};
+pub use math::{argmax, sigmoid, softmax_confidence, softmax_inplace, top_k};
+pub use metrics::{r2_score, ConfusionMatrix};
 pub use model::{crc32, Crc32, ModelError, ModelHeader};
 pub use optim::{
-    Adagrad, Adam, AdamW, Lion, Momentum, Optimizer, ParamKind, RmsProp, RmsPropMomentum, Sgd,
+    Adagrad, Adam, AdamW, Lion, Lookahead, Momentum, NAdam, Optimizer, ParamKind, RAdam, RmsProp,
+    RmsPropMomentum, Sgd,
 };
 pub use params::{LayerKind, LayerSig, ParamError, Params};
-pub use rng::{Pcg32, Rng};
+pub use rng::{shuffle, Pcg32, Rng};
 pub use schedule::{ConstantLr, CosineAnnealing, ExponentialDecay, LrSchedule, StepDecay, Warmup};
+pub use stopping::{EarlyStopping, StopStatus};
 pub use trainer::Trainer;
 
 #[cfg(feature = "alloc")]
@@ -118,14 +135,17 @@ pub use dynamic::{DynLayer, HeapPassthrough, InferSequential, Sequential};
 /// Alles Wichtige auf einmal importieren.
 pub mod prelude {
     pub use crate::{
-        argmax, sigmoid, softmax_inplace, Activation, ActivationKind, Adagrad, Adam, AdamW,
-        BinaryCrossEntropy, BinaryCrossEntropyWithLogits, Buffer, Chain, Constant, ConstantLr,
-        CosineAnnealing, Dense, Dropout, Elu, ExponentialDecay, Gelu, HardSigmoid, HardSwish,
-        HardTanh, HeNormal, HeUniform, Huber, InferDense, InferLayer, Initializer, IntoInference,
-        Layer, LeakyRelu, Linear, Lion, Loss, LrSchedule, Mae, Mish, Mode, ModelError, Momentum,
-        Mse, Optimizer, ParamError, ParamKind, Params, Pcg32, Relu, Relu6, RmsProp,
-        RmsPropMomentum, Rng, Sgd, Sigmoid, SoftmaxCrossEntropy, Softplus, Softsign, StepDecay,
-        Swish, Tanh, Trainer, Warmup, XavierNormal, XavierUniform,
+        argmax, one_hot, r2_score, sigmoid, softmax_inplace, Activation, ActivationKind, Adagrad,
+        Adam, AdamW, BinaryCrossEntropy, BinaryCrossEntropyWithLogits, Buffer, Chain,
+        ConfusionMatrix, Constant, ConstantLr, CosineAnnealing, Dense, Dropout, EarlyStopping, Elu,
+        ExponentialDecay, FocalLossWithLogits, Gelu, HardSigmoid, HardSwish, HardTanh, HeNormal,
+        HeUniform, Hinge, Huber, InferDense, InferExt, InferLayer, Initializer, IntoInference,
+        LabelSmoothingCrossEntropy, Layer, LeakyRelu, Linear, Lion, LogCosh, Lookahead, Loss,
+        LrSchedule, Mae, Mish, Mode, ModelError, Momentum, Mse, NAdam, Optimizer, ParamEma,
+        ParamError, ParamKind, Params, Pcg32, RAdam, Relu, Relu6, RmsProp, RmsPropMomentum, Rng,
+        RunningStats, Sgd, Sigmoid, SoftmaxCrossEntropy, Softplus, Softsign, SquaredHinge,
+        Standardizer, StepDecay, StopStatus, Swish, Tanh, Trainer, Warmup,
+        WeightedBinaryCrossEntropyWithLogits, XavierNormal, XavierUniform,
     };
 
     #[cfg(feature = "alloc")]

@@ -2,8 +2,8 @@
 //!
 //! * Dünne Wrapper um `libm` (crate-intern) – `f32::exp` & Co. existieren in
 //!   `core` nicht, daher läuft alles über `libm`.
-//! * Öffentliche Helfer für Inferenz und Auswertung: [`softmax_inplace`] und
-//!   [`argmax`]. Beide kommen ohne Hilfspuffer aus.
+//! * Öffentliche Helfer für Inferenz und Auswertung: [`softmax_inplace`], [`argmax`],
+//!   [`softmax_confidence`] und [`top_k`]. Alle kommen ohne Hilfspuffer aus.
 
 #[inline]
 pub(crate) fn exp(x: f32) -> f32 {
@@ -144,6 +144,87 @@ pub fn argmax(x: &[f32]) -> Option<usize> {
     best.map(|(i, _)| i)
 }
 
+/// Index des größten Eintrags **und** dessen Softmax-Wahrscheinlichkeit – ohne den Softmax
+/// zu materialisieren (kein Hilfspuffer, kein zweiter Durchlauf über einen Ausgabepuffer).
+///
+/// Die Wahrscheinlichkeit des Siegers ist `1 / Σ exp(xᵢ - max)`. Das ist die „Sicherheit“ des
+/// Netzes und taugt als Schwelle, um unsichere Entscheidungen zu verwerfen (siehe
+/// [`InferExt::classify_confident`](crate::infer::InferExt::classify_confident)).
+///
+/// Ergebnis stimmt mit [`softmax_inplace`] überein, inklusive der Randfälle: alle Einträge `-inf`
+/// ergeben Gleichverteilung (Index `0`, Wahrscheinlichkeit `1/n`), `+inf`-Einträge teilen sich die
+/// Wahrscheinlichkeit (erster Treffer, `1/Anzahl`). Gibt `None` zurück, wenn der Slice leer ist
+/// oder irgendein Eintrag `NaN` ist – ein Netz mit `NaN` am Ausgang hat keine verlässliche
+/// Entscheidung.
+///
+/// ```
+/// let (class, p) = neuron::math::softmax_confidence(&[0.0, 3.0, 0.0]).unwrap();
+/// assert_eq!(class, 1);
+/// assert!((p - 0.909_44).abs() < 1e-4); // e³ / (e³ + 2)
+/// assert_eq!(neuron::math::softmax_confidence(&[f32::NAN, 1.0]), None);
+/// ```
+pub fn softmax_confidence(x: &[f32]) -> Option<(usize, f32)> {
+    if x.iter().any(|v| v.is_nan()) {
+        return None;
+    }
+    let best = argmax(x)?;
+    let max = x[best];
+    if max == f32::NEG_INFINITY {
+        return Some((best, 1.0 / x.len() as f32));
+    }
+    if max == f32::INFINITY {
+        let hits = x.iter().filter(|&&v| v == f32::INFINITY).count() as f32;
+        return Some((best, 1.0 / hits));
+    }
+    // Das Maximum trägt exp(0) = 1 bei, die Summe ist also >= 1.
+    let sum: f32 = x.iter().map(|&v| exp(v - max)).sum();
+    Some((best, 1.0 / sum))
+}
+
+/// Indizes der `out.len()` größten Einträge von `scores`, absteigend sortiert, nach `out`.
+/// Gibt zurück, wie viele Indizes geschrieben wurden: `min(out.len(), Anzahl der Nicht-NaN)`.
+///
+/// Bei Gleichstand kommt der kleinere Index zuerst (wie bei [`argmax`]); `NaN` wird übersprungen.
+/// Allokiert nichts, Aufwand `O(n · k)` – gedacht für kleine `k` (Top-3-Klassen), nicht zum
+/// Sortieren großer Felder. Einträge von `out` hinter dem zurückgegebenen Wert bleiben unverändert.
+///
+/// ```
+/// let mut best = [0usize; 2];
+/// let n = neuron::math::top_k(&[0.1, 0.7, 0.2, 0.7], &mut best);
+/// assert_eq!((n, best), (2, [1, 3])); // Gleichstand: der frühere Index zuerst
+/// ```
+pub fn top_k(scores: &[f32], out: &mut [usize]) -> usize {
+    let k = out.len();
+    let mut len = 0;
+    if k == 0 {
+        return 0;
+    }
+    for (i, &v) in scores.iter().enumerate() {
+        if v.is_nan() {
+            continue;
+        }
+        // Einfügeposition: hinter allen Einträgen, die mindestens so groß sind (Stabilität).
+        let mut pos = len;
+        while pos > 0 && scores[out[pos - 1]] < v {
+            pos -= 1;
+        }
+        if pos == k {
+            continue; // nicht unter den besten k
+        }
+        // Verschieben; ist die Liste voll, fällt der letzte Eintrag heraus.
+        let mut j = if len < k { len } else { k - 1 };
+        while j > pos {
+            out[j] = out[j - 1];
+            j -= 1;
+        }
+        out[pos] = i;
+        if len < k {
+            len += 1;
+        }
+    }
+    len
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,5 +334,121 @@ mod tests {
             "NaN wird übersprungen"
         );
         assert_eq!(argmax(&[f32::NAN, f32::NAN]), None);
+    }
+
+    #[test]
+    fn confidence_known_values() {
+        // softmax([1, 2, 3])[2] = 0.66524096
+        let (class, p) = softmax_confidence(&[1.0, 2.0, 3.0]).unwrap();
+        assert_eq!(class, 2);
+        assert!((p - 0.665_240_96).abs() < 1e-6, "{p}");
+        // Gleichstand: erster Index, Wahrscheinlichkeit ½.
+        assert_eq!(softmax_confidence(&[4.0, 4.0]), Some((0, 0.5)));
+        // Ein Eintrag: sicher.
+        assert_eq!(softmax_confidence(&[-7.5]), Some((0, 1.0)));
+    }
+
+    #[test]
+    fn confidence_agrees_with_softmax_inplace_everywhere() {
+        let cases: [&[f32]; 10] = [
+            &[0.3, -1.2, 2.0, 0.0],
+            &[1000.0, 1000.0, 0.0],
+            &[-1000.0, -1001.0],
+            &[f32::NEG_INFINITY, 1.0, f32::NEG_INFINITY],
+            &[f32::NEG_INFINITY; 4],
+            &[f32::INFINITY, 3.0, f32::INFINITY],
+            &[f32::INFINITY, f32::NEG_INFINITY],
+            &[0.0; 7],
+            &[5.0],
+            &[1e30, -1e30, 3.0],
+        ];
+        for case in cases {
+            let (class, p) = softmax_confidence(case).unwrap();
+            let mut probs = [0.0f32; 8];
+            let probs = &mut probs[..case.len()];
+            probs.copy_from_slice(case);
+            softmax_inplace(probs);
+            assert_eq!(Some(class), argmax(case), "{case:?}");
+            assert_eq!(p, probs[class], "{case:?}");
+        }
+    }
+
+    #[test]
+    fn confidence_rejects_nan_and_empty_input() {
+        assert_eq!(softmax_confidence(&[]), None);
+        assert_eq!(softmax_confidence(&[1.0, f32::NAN]), None);
+        assert_eq!(softmax_confidence(&[f32::NAN]), None);
+    }
+
+    #[test]
+    fn confidence_is_stable_for_huge_logits() {
+        let (class, p) = softmax_confidence(&[1000.0, 0.0, -1000.0]).unwrap();
+        assert_eq!((class, p), (0, 1.0));
+        let (_, p) = softmax_confidence(&[-1000.0, -1000.5]).unwrap();
+        assert!(p.is_finite() && p > 0.5 && p < 1.0, "{p}");
+    }
+
+    #[test]
+    fn top_k_orders_descending_and_breaks_ties_by_index() {
+        let scores = [0.1, 0.9, 0.5, 0.9, 0.3, 0.5];
+        let mut out = [usize::MAX; 4];
+        let n = top_k(&scores, &mut out);
+        assert_eq!((n, out), (4, [1, 3, 2, 5]));
+        let mut out = [usize::MAX; 1];
+        assert_eq!(top_k(&scores, &mut out), 1);
+        assert_eq!(Some(out[0]), argmax(&scores), "k = 1 ist argmax");
+    }
+
+    #[test]
+    fn top_k_handles_short_input_nan_and_zero_k() {
+        // Unterscheidbare Platzhalter: verschobener Müll würde sonst nicht auffallen.
+        let mut out = [100, 101, 102, 103, 104];
+        // Weniger Kandidaten als Plätze: nur n Einträge geschrieben, der Rest bleibt.
+        assert_eq!(top_k(&[2.0, 1.0], &mut out), 2);
+        assert_eq!(out, [0, 1, 102, 103, 104]);
+        let mut out = [100, 101, 102, 103, 104];
+        assert_eq!(top_k(&[1.0, 2.0, 3.0], &mut out), 3);
+        assert_eq!(out, [2, 1, 0, 103, 104]);
+        // NaN wird übersprungen.
+        let mut out = [usize::MAX; 3];
+        assert_eq!(top_k(&[f32::NAN, 1.0, f32::NAN, 2.0], &mut out), 2);
+        assert_eq!(out[..2], [3, 1]);
+        // Nur NaN / leer / k = 0.
+        assert_eq!(top_k(&[f32::NAN; 3], &mut out), 0);
+        assert_eq!(top_k(&[], &mut out), 0);
+        assert_eq!(top_k(&[1.0, 2.0], &mut []), 0);
+        // Unendliche Werte sortieren sich ein.
+        let mut out = [usize::MAX; 3];
+        assert_eq!(
+            top_k(&[0.0, f32::INFINITY, f32::NEG_INFINITY, 5.0], &mut out),
+            3
+        );
+        assert_eq!(out, [1, 3, 0]);
+    }
+
+    #[test]
+    fn top_k_matches_a_full_sort_on_pseudo_random_data() {
+        // Referenz: stabiles Sortieren der Indizes nach (-Wert, Index).
+        let mut state = 12345u32;
+        for len in [1usize, 2, 5, 17, 40] {
+            let mut scores = [0.0f32; 40];
+            for s in scores[..len].iter_mut() {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                // Wenige verschiedene Werte, damit Gleichstände häufig sind.
+                *s = (state >> 24) as f32 % 7.0;
+            }
+            let scores = &scores[..len];
+            let mut idx = [0usize; 40];
+            for (i, slot) in idx[..len].iter_mut().enumerate() {
+                *slot = i;
+            }
+            idx[..len].sort_by(|&a, &b| scores[b].partial_cmp(&scores[a]).unwrap());
+            for k in [1usize, 3, 8] {
+                let mut out = [usize::MAX; 8];
+                let n = top_k(scores, &mut out[..k]);
+                assert_eq!(n, k.min(len));
+                assert_eq!(out[..n], idx[..n], "len = {len}, k = {k}, {scores:?}");
+            }
+        }
     }
 }

@@ -1,7 +1,8 @@
 # TODO – Ideen und offene Punkte
 
 Stand: nach den Runden „Priorität 1–3" (BCE-Logits, `ParamKind`, Modellformat,
-Inferenz-Typen, Hard-Aktivierungen, Lion, CI). Reihenfolge innerhalb einer Gruppe
+Inferenz-Typen, Hard-Aktivierungen, Lion, CI) und der Runde „Verluste, Optimizer,
+Trainings-Hilfen, Inferenz-Entscheidungen". Reihenfolge innerhalb einer Gruppe
 = empfohlene Reihenfolge. `[ ]` offen, `[x]` erledigt.
 
 ## Erledigt
@@ -12,6 +13,13 @@ Inferenz-Typen, Hard-Aktivierungen, Lion, CI). Reihenfolge innerhalb einer Grupp
 - [x] `ParamKind` (Weight Decay nur auf Gewichte), `RmsProp` ohne unnötigen Momentum-Puffer
 - [x] `Relu6`, `HardSigmoid`, `HardSwish`, `HardTanh`, `Softsign`; `Lion`
 - [x] CI-Workflow (fmt, clippy, tests, Bare-Metal-Build, MSRV, Doku)
+- [x] Verluste: `LogCosh`, `Hinge`, `SquaredHinge`, `WeightedBinaryCrossEntropyWithLogits` (`pos_weight`),
+      `FocalLossWithLogits`, `LabelSmoothingCrossEntropy`
+- [x] Optimizer: `NAdam`, `RAdam`, `Lookahead<O>` (Wrapper um jeden Optimizer); Adam/AdamW per Golden-Test bitgleich
+- [x] Training ohne Heap: `Trainer::train_epoch` (Mischen + Mini-Batches), `evaluate_batch`, `Rng::below`, `rng::shuffle`,
+      `Standardizer`/`RunningStats`, `one_hot`, `EarlyStopping`, `ParamEma`, `ConfusionMatrix`, `r2_score`
+- [x] Inferenz: `InferExt` (`classify`, `classify_confident`, `probabilities`, `top_k`, `accuracy`), `math::softmax_confidence`,
+      `math::top_k`; Beispiel `examples/classifier.rs`
 
 ## Sofort / Qualität der Basis
 
@@ -66,19 +74,40 @@ Inferenz-Typen, Hard-Aktivierungen, Lion, CI). Reihenfolge innerhalb einer Grupp
 
 ## Verluste
 
-- [ ] Label Smoothing für `SoftmaxCrossEntropy`; Klassengewichte
-- [ ] `pos_weight` für `BinaryCrossEntropyWithLogits` (unausgewogene Klassen)
-- [ ] Focal Loss, Hinge/Squared Hinge, KL-Divergenz, Log-Cosh
+- [ ] Klassengewichte für `SoftmaxCrossEntropy` (Mehrklassen-Gegenstück zu `pos_weight`)
+- [ ] KL-Divergenz (Destillation: Ziele sind bereits weiche Verteilungen); Multi-Label-Fokalverlust auf Softmax
+- [ ] Ein einheitlicher Konstruktor-Stil: `WeightedBinaryCrossEntropyWithLogits`, `FocalLossWithLogits` und
+      `LabelSmoothingCrossEntropy` haben `new` mit Prüfung; die älteren Verluste sind Einheits-Structs
+      (bewusst nicht angefasst, um nichts zu brechen – bei einer 0.2 vereinheitlichen)
 
 ## Optimizer und Training
 
-- [ ] `AMSGrad`, `NAdam`/`RAdam`, `Adafactor` (speicherarm), `Lookahead`
-- [ ] Gewichtsmittel (EMA) für die Inferenz; Clipping nach Wert; L1-Regularisierung
+- [ ] `AMSGrad` (dritter Puffer – nur als eigener Typ, damit er nur anfällt, wenn man ihn braucht)
+- [ ] **`Adafactor`** (speicherarm): braucht die Matrixform des Tensors (Zeilen-/Spaltenstatistik), der
+      `Optimizer::update`-Aufruf liefert aber nur einen flachen Puffer. Erst möglich, wenn `ParamKind`
+      oder `update` die Form (`rows`, `cols`) mitbekommt.
+- [ ] **Clipping nach Wert** (`Trainer::set_grad_clip_value`): braucht einen schreibenden Gradienten-Besucher am
+      `Layer`-Trait (`visit_grads_mut`) – eine neue Pflichtmethode, die jede externe `Layer`-Implementierung bricht.
+      Zusammen mit anderen Trait-Änderungen einführen (oder mit Standard-Implementierung `unimplemented`).
+- [ ] L1-Regularisierung
+- [ ] `Lookahead`: Zustand zurücksetzen (nach `load_model` mitten im Training sind die langsamen Gewichte veraltet);
+      derzeit hilft nur ein neuer `Trainer`
+- [ ] `ParamEma` mit Aufwärmen des Zerfalls (`min(d, (1+n)/(10+n))`), falls das Mittel nicht aus den aktuellen Werten starten soll
 - [ ] **Parametergruppen** (verschiedene Lernraten/Decay je Layer) – `ParamKind` hat bisher nur
       `Weight`/`Bias`; LayerNorm-Parameter bräuchten eine eigene Art.
-- [ ] Trainings-Hilfen: Shuffle (Fisher–Yates mit `Pcg32`), Mini-Batch-Iterator,
-      Standardisierung, One-Hot, Metriken (Accuracy, Konfusionsmatrix, R²), Early Stopping,
-      Learning-Rate-Finder. Der `Trainer` ist bewusst klein; vermutlich ein separates Modul.
+- [ ] Learning-Rate-Finder (Lernrate exponentiell steigern, Verlust aufzeichnen) – braucht einen Puffer fester Größe
+      für die Messpunkte oder einen Rückruf
+- [ ] `Standardizer` im Modellformat mitspeichern (Version 2 mit Flags): Skalierungskonstanten gehören zum Modell,
+      derzeit muss der Aufrufer sie getrennt ablegen
+- [ ] `ConfusionMatrix` mit Laufzeit-`K` (Feature `alloc`), Genauigkeit je Klasse als Iterator, ROC/AUC für binäre Ausgaben
+- [ ] Metriken für Regression über Mittel hinaus (MAE/RMSE als Funktionen neben `r2_score`)
+
+## Inferenz-Entscheidungen (Folgearbeit)
+
+- [ ] Kalibrierung der Sicherheit (Temperatur-Skalierung `softmax(l / T)`): `T` auf Validierungsdaten bestimmen und in
+      `classify_with_confidence` einrechnen – ohne Kalibrierung sind die Sicherheiten eines trainierten Netzes meist zu hoch
+- [ ] Batch-Variante von `InferExt::accuracy`, die zusätzlich die `ConfusionMatrix` füllt
+- [ ] `InferExt` für `static` im Flash: braucht das zustandslose `infer_into` am Trait (siehe „Modellformat und Embedded")
 
 ## Layer
 
