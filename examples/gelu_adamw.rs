@@ -37,7 +37,7 @@ fn main() {
     // AdamW mit entkoppeltem Weight Decay, Lernrate nach Anlauf + Kosinus-Abkühlung.
     let schedule = Warmup::new(10, CosineAnnealing::new(0.02, 0.0005, EPOCHS));
     let optimizer = AdamW::new(schedule.lr(0)).with_weight_decay(0.01);
-    let mut trainer = Trainer::new(build(7), Mse, optimizer).with_grad_clip_norm(1.0);
+    let mut trainer = Trainer::new(build(7), Mse::new(), optimizer).with_grad_clip_norm(1.0);
     println!(
         "Parameter: {}, Trainer auf dem Stack: {} Byte",
         N_PARAMS,

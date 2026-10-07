@@ -15,7 +15,7 @@ fn main() {
 
     let mut net = net;
     net.init(&XavierUniform, &mut Pcg32::seeded(2024));
-    let mut trainer = Trainer::new(net, BinaryCrossEntropyWithLogits, Adam::new(0.05));
+    let mut trainer = Trainer::new(net, BinaryCrossEntropyWithLogits::new(), Adam::new(0.05));
 
     let xs: [[f32; 2]; 4] = [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]];
     let ys: [[f32; 1]; 4] = [[0.0], [1.0], [1.0], [0.0]];

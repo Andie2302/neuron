@@ -60,7 +60,7 @@ fn check_single_layer<A: Activation + Copy>(name: &str, act: A, scale: f32, knot
             );
         }
     }
-    let mut t = Trainer::new(layer, Mse, Sgd::new(0.0));
+    let mut t = Trainer::new(layer, Mse::new(), Sgd::new(0.0));
     t.accumulate(&x_in, &Y);
 
     let gw = t.network().weights_as_slice().len();
@@ -151,7 +151,7 @@ fn check_hidden<A: Activation + Copy>(name: &str, act: A) {
     let mut net = Dense::<3, 5, _>::new(act).then(Dense::<5, 2, _>::new(Sigmoid));
     net.init(&XavierUniform, &mut Pcg32::seeded(8));
     let y = [1.0, 0.0];
-    let mut t = Trainer::new(net, Mse, Sgd::new(0.0));
+    let mut t = Trainer::new(net, Mse::new(), Sgd::new(0.0));
     t.accumulate(&X, &y);
     let analytic = t.network().first().weight_grads().as_flattened().to_vec();
 

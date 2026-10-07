@@ -112,19 +112,36 @@ fn visited_tensors_add_up_to_param_count_even_with_dropout() {
 
 #[test]
 fn trained_network_roundtrips_bit_exactly() {
-    let mut t = Trainer::new(net(3), BinaryCrossEntropy::default(), Adam::new(0.05));
+    // Training auf Logits: Linear-Ausgangsschicht + BinaryCrossEntropyWithLogits.
+    // Das Parameterformat ist identisch zum Sigmoid-Netz `XorNet` (die Aktivierung
+    // besitzt keine Parameter); die Wahrscheinlichkeit entsteht per `sigmoid`.
+    fn logit_net(seed: u64) -> Chain<Dense<2, 4, Tanh>, Dense<4, 1, Linear>> {
+        let mut n = Dense::<2, 4, _>::new(Tanh).then(Dense::<4, 1, _>::new(Linear));
+        n.init(&XavierUniform, &mut Pcg32::seeded(seed));
+        n
+    }
+
+    let mut t = Trainer::new(
+        logit_net(3),
+        BinaryCrossEntropyWithLogits::new(),
+        Adam::new(0.05),
+    );
     for _ in 0..600 {
         t.train_batch(XS.iter().zip(&YS).map(|(x, y)| (&x[..], &y[..])));
     }
     let trained = predictions(t.network_mut());
-    for (p, y) in trained.iter().zip(&YS) {
-        assert!((p - y[0]).abs() < 0.1, "Netz nicht trainiert: {trained:?}");
+    for (z, y) in trained.iter().zip(&YS) {
+        let p = sigmoid(*z);
+        assert!(
+            (p - y[0]).abs() < 0.1,
+            "Netz nicht trainiert: Logits {trained:?}"
+        );
     }
 
     let mut saved = [0.0f32; N_PARAMS]; // z. B. in einem `static` oder Flash-Puffer
     t.network().copy_params_to_slice(&mut saved).unwrap();
 
-    let mut fresh = net(999);
+    let mut fresh = logit_net(999);
     assert_ne!(
         predictions(&mut fresh),
         trained,

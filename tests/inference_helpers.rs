@@ -160,7 +160,7 @@ fn positive_probability_is_the_sigmoid_of_the_single_logit() {
     let ys = [[0.0f32], [1.0], [1.0], [0.0]];
     let mut net = Dense::<2, 8, _>::new(Tanh).then(Dense::<8, 1, _>::new(Linear));
     net.init(&XavierUniform, &mut Pcg32::seeded(1));
-    let mut t = Trainer::new(net, BinaryCrossEntropyWithLogits, Adam::new(0.05));
+    let mut t = Trainer::new(net, BinaryCrossEntropyWithLogits::new(), Adam::new(0.05));
     for _ in 0..1000 {
         t.train_batch(xs.iter().zip(&ys).map(|(x, y)| (&x[..], &y[..])));
     }
@@ -235,7 +235,7 @@ mod heap {
             .dense(8, ActivationKind::Tanh)
             .dense(3, ActivationKind::Linear);
         net.init(&XavierUniform, &mut Pcg32::seeded(2));
-        let mut t = Trainer::new(net, SoftmaxCrossEntropy, Adam::new(0.03));
+        let mut t = Trainer::new(net, SoftmaxCrossEntropy::new(), Adam::new(0.03));
         let mut order: Vec<usize> = (0..xs.len()).collect();
         let mut rng = Pcg32::seeded(3);
         for _ in 0..120 {

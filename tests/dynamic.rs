@@ -27,14 +27,15 @@ fn batch() -> impl Iterator<Item = (&'static [f32], &'static [f32])> {
 fn dynamic_xor_converges() {
     let mut net = Sequential::new(2)
         .dense(4, ActivationKind::Tanh)
-        .dense(1, ActivationKind::Sigmoid);
+        .dense(1, ActivationKind::Linear);
     net.init(&XavierUniform, &mut Pcg32::seeded(2024));
-    let mut t = Trainer::new(net, BinaryCrossEntropy::default(), Adam::new(0.05));
+    let mut t = Trainer::new(net, BinaryCrossEntropyWithLogits::new(), Adam::new(0.05));
     for _ in 0..1000 {
         t.train_batch(batch());
     }
     for (x, y) in XS.iter().zip(&YS) {
-        let p = t.predict(x)[0];
+        // Das Netz liefert rohe Logits; die Wahrscheinlichkeit entsteht erst hier.
+        let p = sigmoid(t.predict(x)[0]);
         assert!((p - y[0]).abs() < 0.1, "x = {x:?}: {p}");
     }
 }
@@ -54,7 +55,7 @@ fn heap_dense_works_inside_chain_too() {
     // Heap-Layer in der statischen Chain: Typ Vec<f32> == Vec<f32>, Laufzeitprüfung der Dimensionen.
     let mut net = HeapDense::<Tanh>::new(2, 4, Tanh).then(HeapDense::new(4, 1, Sigmoid));
     net.init(&XavierUniform, &mut Pcg32::seeded(2024));
-    let mut t = Trainer::new(net, Mse, Adam::new(0.05));
+    let mut t = Trainer::new(net, Mse::new(), Adam::new(0.05));
     for _ in 0..1500 {
         t.train_batch(batch());
     }
@@ -75,19 +76,19 @@ fn heap_chain_checks_dimensions_at_runtime() {
 fn stack_and_heap_are_bit_identical() {
     let mut stack = Dense::<2, 6, _>::new(Tanh)
         .then(Dropout::<6>::new(0.25, 77))
-        .then(Dense::<6, 1, _>::new(Sigmoid));
+        .then(Dense::<6, 1, _>::new(Linear));
     stack.init(&HeNormal, &mut Pcg32::seeded(8));
 
     let mut heap = Sequential::new(2)
         .dense(6, ActivationKind::Tanh)
         .dropout(0.25, 77)
-        .dense(1, ActivationKind::Sigmoid);
+        .dense(1, ActivationKind::Linear);
     heap.init(&HeNormal, &mut Pcg32::seeded(8));
 
     assert_eq!(stack.param_count(), heap.param_count());
 
-    let mut ts = Trainer::new(stack, BinaryCrossEntropy::default(), Adam::new(0.03));
-    let mut th = Trainer::new(heap, BinaryCrossEntropy::default(), Adam::new(0.03));
+    let mut ts = Trainer::new(stack, BinaryCrossEntropyWithLogits::new(), Adam::new(0.03));
+    let mut th = Trainer::new(heap, BinaryCrossEntropyWithLogits::new(), Adam::new(0.03));
 
     for step in 0..50 {
         let ls = ts.train_batch(batch());
@@ -95,7 +96,9 @@ fn stack_and_heap_are_bit_identical() {
         assert_eq!(ls, lh, "Verlust weicht in Schritt {step} ab");
     }
     for x in &XS {
-        assert_eq!(ts.predict(x)[0], th.predict(x)[0]);
+        let (zs, zh) = (ts.predict(x)[0], th.predict(x)[0]);
+        assert_eq!(zs, zh);
+        assert_eq!(sigmoid(zs), sigmoid(zh));
     }
 }
 
@@ -108,7 +111,7 @@ fn fit_linear<O: Optimizer>(opt: O) -> f32 {
         let x = [rng.uniform(-1.0, 1.0), rng.uniform(-1.0, 1.0)];
         *s = (x, [x[0] - x[1]]);
     }
-    let mut t = Trainer::new(net, Mse, opt);
+    let mut t = Trainer::new(net, Mse::new(), opt);
     let mut last = f32::MAX;
     for _ in 0..200 {
         last = t.train_batch(samples.iter().map(|(x, y)| (&x[..], &y[..])));
@@ -204,7 +207,7 @@ fn sequential_clipping_covers_every_layer() {
         .dropout(0.0, 1)
         .dense(1, ActivationKind::Linear);
     net.init(&XavierUniform, &mut Pcg32::seeded(9));
-    let mut t = Trainer::new(net, Mse, Sgd::new(1.0));
+    let mut t = Trainer::new(net, Mse::new(), Sgd::new(1.0));
     t.accumulate(&[0.5, -1.0], &[2.0]);
 
     // Unabhängige Referenz aus den Dense-Accessoren der Layer.

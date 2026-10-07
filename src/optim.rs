@@ -745,7 +745,7 @@ pub struct LookaheadState<S, B: Buffer> {
 /// // Lookahead um Adam: k = 5 Schritte, α = 0.5.
 /// let opt = Lookahead::new(Adam::new(0.01));
 /// let net = Dense::<2, 4, _>::new(Tanh).then(Dense::<4, 1, _>::new(Linear));
-/// let trainer = Trainer::new(net, Mse, opt);
+/// let trainer = Trainer::new(net, Mse::new(), opt);
 /// assert_eq!(trainer.learning_rate(), 0.01);
 /// ```
 #[derive(Clone, Copy, Debug)]

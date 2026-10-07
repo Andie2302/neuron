@@ -257,7 +257,7 @@ impl<L: Layer, Ls: Loss, O: Optimizer> Trainer<L, Ls, O> {
     /// let ys = [[0.0f32], [1.0], [1.0], [0.0]];
     /// let mut net = Dense::<2, 6, _>::new(Tanh).then(Dense::<6, 1, _>::new(Linear));
     /// net.init(&XavierUniform, &mut Pcg32::seeded(1));
-    /// let mut trainer = Trainer::new(net, BinaryCrossEntropyWithLogits, Adam::new(0.05));
+    /// let mut trainer = Trainer::new(net, BinaryCrossEntropyWithLogits::new(), Adam::new(0.05));
     ///
     /// let mut order: [usize; 4] = core::array::from_fn(|i| i);
     /// let mut rng = Pcg32::seeded(7);

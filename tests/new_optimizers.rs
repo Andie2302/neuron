@@ -13,7 +13,7 @@ fn xor_batch() -> impl Iterator<Item = (&'static [f32], &'static [f32])> {
 fn xor_worst_error<O: Optimizer>(opt: O, epochs: usize, seed: u64) -> f32 {
     let mut net = Dense::<2, 8, _>::new(Tanh).then(Dense::<8, 1, _>::new(Linear));
     net.init(&XavierUniform, &mut Pcg32::seeded(seed));
-    let mut t = Trainer::new(net, BinaryCrossEntropyWithLogits, opt);
+    let mut t = Trainer::new(net, BinaryCrossEntropyWithLogits::new(), opt);
     for _ in 0..epochs {
         t.train_batch(xor_batch());
     }
@@ -65,7 +65,7 @@ fn lookahead_composes_with_clipping_and_schedules() {
     net.init(&XavierUniform, &mut Pcg32::seeded(5));
     let mut t = Trainer::new(
         net,
-        BinaryCrossEntropyWithLogits,
+        BinaryCrossEntropyWithLogits::new(),
         Lookahead::new(AdamW::new(0.03).with_weight_decay(0.001)),
     )
     .with_grad_clip_norm(1.0);
@@ -92,7 +92,7 @@ fn lookahead_damps_the_noise_of_an_aggressive_inner_optimizer() {
     fn tail_weight_variance<O: Optimizer>(opt: O) -> f32 {
         let mut net = Dense::<1, 1, _>::new(Linear);
         net.init(&Constant(0.0), &mut Pcg32::seeded(0));
-        let mut t = Trainer::new(net, Mse, opt);
+        let mut t = Trainer::new(net, Mse::new(), opt);
         // y = 3x + 1 mit Rauschen; Minibatches aus zwei Punkten erzeugen Gradientenrauschen.
         let mut rng = Pcg32::seeded(9);
         let points: Vec<([f32; 1], [f32; 1])> = (0..64)
@@ -146,16 +146,22 @@ mod heap {
             };
             let err = match name {
                 "nadam" => {
-                    let mut t =
-                        Trainer::new(build(), BinaryCrossEntropyWithLogits, NAdam::new(0.03));
+                    let mut t = Trainer::new(
+                        build(),
+                        BinaryCrossEntropyWithLogits::new(),
+                        NAdam::new(0.03),
+                    );
                     (0..1000).for_each(|_| {
                         t.train_batch(xor_batch());
                     });
                     worst(&mut |x| t.predict(x)[0])
                 }
                 "radam" => {
-                    let mut t =
-                        Trainer::new(build(), BinaryCrossEntropyWithLogits, RAdam::new(0.03));
+                    let mut t = Trainer::new(
+                        build(),
+                        BinaryCrossEntropyWithLogits::new(),
+                        RAdam::new(0.03),
+                    );
                     (0..1200).for_each(|_| {
                         t.train_batch(xor_batch());
                     });
@@ -163,7 +169,7 @@ mod heap {
                 }
                 _ => {
                     let opt = Lookahead::new(Adam::new(0.03));
-                    let mut t = Trainer::new(build(), BinaryCrossEntropyWithLogits, opt);
+                    let mut t = Trainer::new(build(), BinaryCrossEntropyWithLogits::new(), opt);
                     (0..1500).for_each(|_| {
                         t.train_batch(xor_batch());
                     });
@@ -183,8 +189,8 @@ mod heap {
             .dense(4, ActivationKind::Tanh)
             .dense(1, ActivationKind::Linear);
         heap.init(&XavierUniform, &mut Pcg32::seeded(8));
-        let mut ts = Trainer::new(stack, Mse, opt());
-        let mut th = Trainer::new(heap, Mse, opt());
+        let mut ts = Trainer::new(stack, Mse::new(), opt());
+        let mut th = Trainer::new(heap, Mse::new(), opt());
         for _ in 0..50 {
             let a = ts.train_batch(xor_batch());
             let b = th.train_batch(xor_batch());

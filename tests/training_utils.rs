@@ -12,7 +12,7 @@ fn xor_trainer(
 ) -> Trainer<impl Layer<Input = [f32; 2], Output = [f32; 1]>, impl Loss, Adam> {
     let mut net = Dense::<2, 8, _>::new(Tanh).then(Dense::<8, 1, _>::new(Linear));
     net.init(&XavierUniform, &mut Pcg32::seeded(seed));
-    Trainer::new(net, BinaryCrossEntropyWithLogits, Adam::new(0.05))
+    Trainer::new(net, BinaryCrossEntropyWithLogits::new(), Adam::new(0.05))
 }
 
 // ---- train_epoch / evaluate_batch --------------------------------------------------------------
@@ -184,7 +184,7 @@ fn fit_and_score(standardise: bool) -> f32 {
 
     let mut net = Dense::<2, 1, _>::new(Linear);
     net.init(&Constant(0.0), &mut Pcg32::seeded(0));
-    let mut t = Trainer::new(net, Mse, Adam::new(0.05));
+    let mut t = Trainer::new(net, Mse::new(), Adam::new(0.05));
     let inputs: Vec<[f32; 2]> = train_x.iter().map(prep).collect();
     let mut order: Vec<usize> = (0..inputs.len()).collect();
     let mut rng = Pcg32::seeded(4);
@@ -240,7 +240,7 @@ fn tail_errors(decay: f32) -> (f32, f32) {
 
     let mut net = Dense::<1, 1, _>::new(Linear);
     net.init(&Constant(0.0), &mut Pcg32::seeded(0));
-    let mut t = Trainer::new(net, Mse, Sgd::new(0.3));
+    let mut t = Trainer::new(net, Mse::new(), Sgd::new(0.3));
     let mut ema = ParamEma::<[f32; 2]>::for_params(t.network(), decay);
     let mut shadow_net = Dense::<1, 1, _>::new(Linear);
 
@@ -251,7 +251,7 @@ fn tail_errors(decay: f32) -> (f32, f32) {
         ema.update(t.network()).unwrap();
         if step >= 1000 {
             ema.copy_to(&mut shadow_net).unwrap();
-            let mut shadow = Trainer::new(shadow_net.clone(), Mse, Sgd::new(0.0));
+            let mut shadow = Trainer::new(shadow_net.clone(), Mse::new(), Sgd::new(0.0));
             raw_err += t.evaluate_batch(clean.iter().map(|(x, y)| (&x[..], &y[..])));
             ema_err += shadow.evaluate_batch(clean.iter().map(|(x, y)| (&x[..], &y[..])));
             counted += 1;
@@ -299,7 +299,7 @@ fn early_stopping_halts_an_overfitting_network_and_the_snapshot_is_better_than_t
     net.init(&XavierUniform, &mut Pcg32::seeded(3));
     let n_params = net.param_count();
     assert_eq!(n_params, 48 + 48 + 48 + 1);
-    let mut t = Trainer::new(net, Mse, Adam::new(0.02));
+    let mut t = Trainer::new(net, Mse::new(), Adam::new(0.02));
 
     let max_epochs = 6000;
     let mut stopper = EarlyStopping::new(150);
@@ -359,7 +359,7 @@ fn confusion_matrix_scores_a_trained_classifier() {
 
     let mut net = Dense::<2, 3, _>::new(Linear);
     net.init(&XavierUniform, &mut Pcg32::seeded(1));
-    let mut t = Trainer::new(net, SoftmaxCrossEntropy, Adam::new(0.05));
+    let mut t = Trainer::new(net, SoftmaxCrossEntropy::new(), Adam::new(0.05));
     let mut order: Vec<usize> = (0..xs.len()).collect();
     let mut shuffler = Pcg32::seeded(2);
     for _ in 0..100 {
@@ -394,7 +394,11 @@ mod heap {
             net.init(&XavierUniform, &mut Pcg32::seeded(1));
             net
         };
-        let mut t = Trainer::new(build(), BinaryCrossEntropyWithLogits, Adam::new(0.05));
+        let mut t = Trainer::new(
+            build(),
+            BinaryCrossEntropyWithLogits::new(),
+            Adam::new(0.05),
+        );
         // ParamEma über `Vec<f32>`.
         let mut ema = ParamEma::<Vec<f32>>::for_params(t.network(), 0.9);
         assert_eq!(ema.averaged().len(), t.network().param_count());
@@ -422,8 +426,8 @@ mod heap {
             .dense(4, ActivationKind::Tanh)
             .dense(1, ActivationKind::Linear);
         heap.init(&XavierUniform, &mut Pcg32::seeded(3));
-        let mut ts = Trainer::new(stack, Mse, Lookahead::new(Adam::new(0.03)));
-        let mut th = Trainer::new(heap, Mse, Lookahead::new(Adam::new(0.03)));
+        let mut ts = Trainer::new(stack, Mse::new(), Lookahead::new(Adam::new(0.03)));
+        let mut th = Trainer::new(heap, Mse::new(), Lookahead::new(Adam::new(0.03)));
         let (mut os, mut oh): ([usize; 4], [usize; 4]) =
             (core::array::from_fn(|i| i), core::array::from_fn(|i| i));
         let (mut rs, mut rh) = (Pcg32::seeded(2), Pcg32::seeded(2));
