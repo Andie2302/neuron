@@ -682,6 +682,105 @@ impl Optimizer for Adagrad {
     }
 }
 
+/// Lion (EvoLved Sign Momentum, Chen et al. 2023): Aktualisierung über das
+/// **Vorzeichen** eines geglätteten Gradienten.
+///
+/// ```text
+/// c ← β₁ m + (1 - β₁) g
+/// p ← p - lr · (sign(c) + weight_decay · p)      // Zerfall entkoppelt, nur bei Gewichten
+/// m ← β₂ m + (1 - β₂) g
+/// ```
+///
+/// **Speicher:** Lion braucht nur einen Zustandspuffer `m` je Tensor, Adam zwei
+/// (`m` und `v`) – bei knappem RAM spart das die Hälfte des Optimizer-Zustands.
+/// Jeder Schritt hat die Länge `lr` (unabhängig von der Gradientengröße), daher
+/// braucht Lion eine ca. 3- bis 10-mal kleinere Lernrate und einen entsprechend
+/// größeren Weight Decay als Adam/AdamW. `sign(0) = 0`; `NaN` bleibt `NaN` und
+/// zeigt sich dadurch in den Parametern.
+#[derive(Clone, Copy, Debug)]
+pub struct Lion {
+    /// Lernrate (üblich: 3- bis 10-mal kleiner als bei Adam).
+    pub lr: f32,
+    /// Glättung für die Update-Richtung (Standard `0.9`).
+    pub beta1: f32,
+    /// Glättung des Impulses `m` (Standard `0.99`).
+    pub beta2: f32,
+    /// Entkoppelter Weight Decay (Standard `0.0`).
+    pub weight_decay: f32,
+}
+
+impl Lion {
+    /// Lion mit `β₁ = 0.9`, `β₂ = 0.99`, ohne Weight Decay.
+    pub fn new(lr: f32) -> Self {
+        Lion {
+            lr,
+            beta1: 0.9,
+            beta2: 0.99,
+            weight_decay: 0.0,
+        }
+    }
+
+    /// Überschreibt `β₁` und `β₂`.
+    pub fn with_betas(mut self, beta1: f32, beta2: f32) -> Self {
+        self.beta1 = beta1;
+        self.beta2 = beta2;
+        self
+    }
+
+    /// Setzt den Weight Decay (entkoppelt, nur auf Gewichte).
+    ///
+    /// # Panics
+    /// Wenn `weight_decay` negativ oder nicht endlich ist.
+    pub fn with_weight_decay(mut self, weight_decay: f32) -> Self {
+        check_weight_decay(weight_decay);
+        self.weight_decay = weight_decay;
+        self
+    }
+}
+
+/// `sign(x)` mit `sign(0) = 0` und `sign(NaN) = NaN`.
+#[inline]
+fn sign(x: f32) -> f32 {
+    if x > 0.0 {
+        1.0
+    } else if x < 0.0 {
+        -1.0
+    } else {
+        // 0.0 -> 0.0, NaN -> NaN
+        x * 0.0
+    }
+}
+
+impl Optimizer for Lion {
+    /// Impuls `m`, gleiche Form wie der Parameter: **ein** Puffer.
+    type State<B: Buffer> = B;
+
+    fn init_state<B: Buffer>(&self, len: usize) -> B {
+        B::zeroed(len)
+    }
+
+    fn update<B: Buffer>(&self, momentum: &mut B, params: &mut B, grads: &B, kind: ParamKind) {
+        let decay = kind.decay(self.weight_decay);
+        let it = params
+            .as_mut_slice()
+            .iter_mut()
+            .zip(grads.as_slice())
+            .zip(momentum.as_mut_slice());
+        for ((p, &g), m) in it {
+            let direction = sign(self.beta1 * *m + (1.0 - self.beta1) * g);
+            *p -= self.lr * (direction + decay * *p);
+            *m = self.beta2 * *m + (1.0 - self.beta2) * g;
+        }
+    }
+
+    fn learning_rate(&self) -> f32 {
+        self.lr
+    }
+    fn set_learning_rate(&mut self, lr: f32) {
+        self.lr = lr;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1066,6 +1165,110 @@ mod tests {
     }
 
     #[test]
+    fn lion_first_step_known_values() {
+        // m = 0: c = (1-β₁) g = 0.2 > 0 -> sign +1, p = 1 - 0.1 = 0.9; m = (1-β₂) g = 0.02
+        let opt = Lion::new(0.1);
+        let mut m = opt.init_state::<[f32; 1]>(1);
+        let mut p = [1.0];
+        opt.update(&mut m, &mut p, &[2.0], ParamKind::Weight);
+        assert!((p[0] - 0.9).abs() < 1e-7, "{p:?}");
+        assert!((m[0] - 0.02).abs() < 1e-7, "{m:?}");
+        // Negativer Gradient: p wächst um lr.
+        let mut q = [1.0];
+        let mut mq = opt.init_state::<[f32; 1]>(1);
+        opt.update(&mut mq, &mut q, &[-2.0], ParamKind::Weight);
+        assert!((q[0] - 1.1).abs() < 1e-7, "{q:?}");
+    }
+
+    #[test]
+    fn lion_step_length_is_independent_of_the_gradient_scale() {
+        let opt = Lion::new(0.01);
+        for &g in &[1e-6f32, 1e-2, 1.0, 1e6, 1e20] {
+            let mut m = opt.init_state::<[f32; 1]>(1);
+            let mut p = [0.0];
+            opt.update(&mut m, &mut p, &[g], ParamKind::Weight);
+            assert_eq!(p[0], -0.01, "g = {g}");
+        }
+    }
+
+    #[test]
+    fn lion_momentum_keeps_the_direction_after_the_gradient_vanishes() {
+        // Nach einem Schritt mit g > 0 ist m > 0: auch bei g = 0 zeigt c = β₁ m weiter nach oben.
+        let opt = Lion::new(0.1);
+        let mut m = opt.init_state::<[f32; 1]>(1);
+        let mut p = [0.0];
+        opt.update(&mut m, &mut p, &[1.0], ParamKind::Weight);
+        opt.update(&mut m, &mut p, &[0.0], ParamKind::Weight);
+        assert!((p[0] + 0.2).abs() < 1e-6, "{p:?}");
+        // Ohne Impuls und ohne Gradient: sign(0) = 0, kein Schritt.
+        let mut m0 = opt.init_state::<[f32; 1]>(1);
+        let mut p0 = [5.0];
+        opt.update(&mut m0, &mut p0, &[0.0], ParamKind::Weight);
+        assert_eq!(p0, [5.0]);
+    }
+
+    #[test]
+    fn lion_weight_decay_is_decoupled_and_skips_biases() {
+        // c = 0 -> nur der Zerfall: p ← p (1 - lr·wd) = 2 · (1 - 0.05) = 1.9
+        let opt = Lion::new(0.1).with_weight_decay(0.5);
+        let (mut mw, mut mb) = (opt.init_state::<[f32; 1]>(1), opt.init_state::<[f32; 1]>(1));
+        let (mut w, mut b) = ([2.0], [2.0]);
+        opt.update(&mut mw, &mut w, &[0.0], ParamKind::Weight);
+        opt.update(&mut mb, &mut b, &[0.0], ParamKind::Bias);
+        assert!((w[0] - 1.9).abs() < 1e-6, "{w:?}");
+        assert_eq!(b, [2.0]);
+        // Der Gradient bewegt den Bias trotzdem.
+        let mut mb = opt.init_state::<[f32; 1]>(1);
+        opt.update(&mut mb, &mut b, &[1.0], ParamKind::Bias);
+        assert!((b[0] - 1.9).abs() < 1e-6, "{b:?}");
+    }
+
+    #[test]
+    fn lion_propagates_nan_instead_of_hiding_it() {
+        let opt = Lion::new(0.1);
+        let mut m = opt.init_state::<[f32; 1]>(1);
+        let mut p = [1.0];
+        opt.update(&mut m, &mut p, &[f32::NAN], ParamKind::Weight);
+        assert!(p[0].is_nan());
+    }
+
+    #[test]
+    fn lion_needs_one_state_buffer_where_adam_needs_two() {
+        use core::mem::size_of;
+        assert_eq!(size_of::<<Lion as Optimizer>::State<[f32; 100]>>(), 100 * 4);
+        assert_eq!(size_of::<<Adam as Optimizer>::State<[f32; 100]>>(), 200 * 4);
+        assert_eq!(
+            size_of::<<AdamW as Optimizer>::State<[f32; 100]>>(),
+            200 * 4
+        );
+        // Bei einem Dense<16,16>: Lion spart gegenüber Adam 272 · 4 Byte Zustand.
+        let weights = size_of::<<Lion as Optimizer>::State<[[f32; 16]; 16]>>();
+        let adam = size_of::<<Adam as Optimizer>::State<[[f32; 16]; 16]>>();
+        assert_eq!(adam - weights, 16 * 16 * 4);
+    }
+
+    #[test]
+    fn lion_minimises_a_quadratic_up_to_its_step_size() {
+        // Jeder Schritt hat die Länge lr, Lion oszilliert also in einem Band um das Optimum.
+        let x = minimise_quadratic(Lion::new(0.01), 1500);
+        assert!((x - 3.0).abs() < 0.15, "x = {x}");
+    }
+
+    #[test]
+    fn lion_default_hyperparameters_are_pinned() {
+        let l = Lion::new(0.1);
+        assert_eq!((l.beta1, l.beta2, l.weight_decay), (0.9, 0.99, 0.0));
+        let l = l.with_betas(0.8, 0.95).with_weight_decay(0.3);
+        assert_eq!((l.beta1, l.beta2, l.weight_decay), (0.8, 0.95, 0.3));
+    }
+
+    #[test]
+    #[should_panic(expected = "weight_decay")]
+    fn lion_rejects_negative_weight_decay() {
+        let _ = Lion::new(0.1).with_weight_decay(-1.0);
+    }
+
+    #[test]
     fn learning_rate_accessors() {
         fn roundtrip<O: Optimizer>(mut o: O, initial: f32) {
             assert_eq!(o.learning_rate(), initial);
@@ -1078,5 +1281,6 @@ mod tests {
         roundtrip(AdamW::new(0.2), 0.2);
         roundtrip(RmsProp::new(0.1), 0.1);
         roundtrip(Adagrad::new(0.05), 0.05);
+        roundtrip(Lion::new(0.02), 0.02);
     }
 }

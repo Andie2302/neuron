@@ -126,6 +126,8 @@ fn sgd_momentum_and_adam_state_work_with_heap_buffers() {
     assert!(fit_linear(Momentum::new(0.05, 0.9).with_nesterov(true)) < 1e-3);
     assert!(fit_linear(RmsProp::new(0.01).with_alpha(0.9).with_momentum(0.9)) < 1e-2);
     assert!(fit_linear(Adagrad::new(0.5)) < 1e-2);
+    assert!(fit_linear(Lion::new(0.005)) < 1e-2);
+    assert!(fit_linear(RmsProp::new(0.01).with_alpha(0.9)) < 1e-2);
 }
 
 /// Neue Optimizer, Aktivierungen und Verluste im Heap-Zweig bitgleich zum Stack-Zweig.

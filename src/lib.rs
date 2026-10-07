@@ -82,8 +82,8 @@ pub mod dynamic;
 pub mod math;
 
 pub use activation::{
-    Activation, ActivationKind, Elu, Gelu, LeakyRelu, Linear, Mish, Relu, Sigmoid, Softplus, Swish,
-    Tanh,
+    Activation, ActivationKind, Elu, Gelu, HardSigmoid, HardSwish, HardTanh, LeakyRelu, Linear,
+    Mish, Relu, Relu6, Sigmoid, Softplus, Softsign, Swish, Tanh,
 };
 pub use buffer::{Buffer, Stack, Storage};
 pub use dense::{Dense, DenseLayer, InferDense, InferenceDense};
@@ -97,7 +97,7 @@ pub use loss::{
 pub use math::{argmax, sigmoid, softmax_inplace};
 pub use model::{crc32, Crc32, ModelError, ModelHeader};
 pub use optim::{
-    Adagrad, Adam, AdamW, Momentum, Optimizer, ParamKind, RmsProp, RmsPropMomentum, Sgd,
+    Adagrad, Adam, AdamW, Lion, Momentum, Optimizer, ParamKind, RmsProp, RmsPropMomentum, Sgd,
 };
 pub use params::{LayerKind, LayerSig, ParamError, Params};
 pub use rng::{Pcg32, Rng};
@@ -118,11 +118,12 @@ pub mod prelude {
     pub use crate::{
         argmax, sigmoid, softmax_inplace, Activation, ActivationKind, Adagrad, Adam, AdamW,
         BinaryCrossEntropy, BinaryCrossEntropyWithLogits, Buffer, Chain, Constant, ConstantLr,
-        CosineAnnealing, Dense, Dropout, Elu, ExponentialDecay, Gelu, HeNormal, HeUniform, Huber,
-        InferDense, InferLayer, Initializer, IntoInference, Layer, LeakyRelu, Linear, Loss,
-        LrSchedule, Mae, Mish, Mode, ModelError, Momentum, Mse, Optimizer, ParamError, ParamKind,
-        Params, Pcg32, Relu, RmsProp, RmsPropMomentum, Rng, Sgd, Sigmoid, SoftmaxCrossEntropy,
-        Softplus, StepDecay, Swish, Tanh, Trainer, Warmup, XavierNormal, XavierUniform,
+        CosineAnnealing, Dense, Dropout, Elu, ExponentialDecay, Gelu, HardSigmoid, HardSwish,
+        HardTanh, HeNormal, HeUniform, Huber, InferDense, InferLayer, Initializer, IntoInference,
+        Layer, LeakyRelu, Linear, Lion, Loss, LrSchedule, Mae, Mish, Mode, ModelError, Momentum,
+        Mse, Optimizer, ParamError, ParamKind, Params, Pcg32, Relu, Relu6, RmsProp,
+        RmsPropMomentum, Rng, Sgd, Sigmoid, SoftmaxCrossEntropy, Softplus, Softsign, StepDecay,
+        Swish, Tanh, Trainer, Warmup, XavierNormal, XavierUniform,
     };
 
     #[cfg(feature = "alloc")]

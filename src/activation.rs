@@ -340,6 +340,135 @@ impl Activation for Mish {
     }
 }
 
+/// ReLU6: `f(x) = min(max(x, 0), 6)`.
+///
+/// Begrenzt die Ausgabe auf `[0, 6]`; beliebt in Mobile-Netzen, weil der Wertebereich
+/// bei Quantisierung klein bleibt. Kommt ohne `exp`/`tanh` aus. Die Ableitung ist
+/// `1` für `0 < x < 6`, sonst `0` (an den Knicken `0`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Relu6;
+
+impl Activation for Relu6 {
+    fn signature(&self) -> u32 {
+        11
+    }
+
+    #[inline]
+    fn apply(&self, x: f32) -> f32 {
+        x.clamp(0.0, 6.0)
+    }
+    #[inline]
+    fn derivative(&self, x: f32, _y: f32) -> f32 {
+        if x > 0.0 && x < 6.0 {
+            1.0
+        } else {
+            0.0
+        }
+    }
+}
+
+/// Hard-Sigmoid: stückweise lineare Sigmoid-Näherung
+/// `f(x) = min(max(x + 3, 0), 6) / 6`, also `0` für `x ≤ -3`, `1` für `x ≥ 3`, dazwischen
+/// `x/6 + ½`. Ohne `exp`; die Ableitung ist `1/6` für `-3 < x < 3`, sonst `0`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HardSigmoid;
+
+impl Activation for HardSigmoid {
+    fn signature(&self) -> u32 {
+        12
+    }
+
+    #[inline]
+    fn apply(&self, x: f32) -> f32 {
+        (x + 3.0).clamp(0.0, 6.0) / 6.0
+    }
+    #[inline]
+    fn derivative(&self, x: f32, _y: f32) -> f32 {
+        if x > -3.0 && x < 3.0 {
+            1.0 / 6.0
+        } else {
+            0.0
+        }
+    }
+}
+
+/// Hard-Swish (MobileNetV3): `f(x) = x · HardSigmoid(x)`, also `0` für `x ≤ -3`, `x` für
+/// `x ≥ 3`, dazwischen `x (x + 3) / 6`. Die billige Näherung von [`Swish`], ganz ohne `exp`.
+///
+/// Ableitung: `0` für `x ≤ -3`, `1` für `x ≥ 3`, dazwischen `(2x + 3) / 6`. An den
+/// Knicken `±3` gilt diese Zuordnung (Konvention).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HardSwish;
+
+impl Activation for HardSwish {
+    fn signature(&self) -> u32 {
+        13
+    }
+
+    #[inline]
+    fn apply(&self, x: f32) -> f32 {
+        x * HardSigmoid.apply(x)
+    }
+    #[inline]
+    fn derivative(&self, x: f32, _y: f32) -> f32 {
+        if x <= -3.0 {
+            0.0
+        } else if x >= 3.0 {
+            1.0
+        } else {
+            (2.0 * x + 3.0) / 6.0
+        }
+    }
+}
+
+/// Hard-Tanh: `f(x) = min(max(x, -1), 1)`. Ohne `tanh`; die Ableitung ist `1` für
+/// `-1 < x < 1`, sonst `0`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HardTanh;
+
+impl Activation for HardTanh {
+    fn signature(&self) -> u32 {
+        14
+    }
+
+    #[inline]
+    fn apply(&self, x: f32) -> f32 {
+        x.clamp(-1.0, 1.0)
+    }
+    #[inline]
+    fn derivative(&self, x: f32, _y: f32) -> f32 {
+        if x > -1.0 && x < 1.0 {
+            1.0
+        } else {
+            0.0
+        }
+    }
+}
+
+/// Softsign: `f(x) = x / (1 + |x|)`, Ableitung `1 / (1 + |x|)²`. Beschränkt wie `tanh`,
+/// aber nur mit einer Division statt `exp`; die Sättigung ist langsamer (polynomial
+/// statt exponentiell). Stetig differenzierbar, in `x = 0` springt allerdings die
+/// zweite Ableitung (wegen `|x|`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Softsign;
+
+impl Activation for Softsign {
+    fn signature(&self) -> u32 {
+        15
+    }
+
+    #[inline]
+    fn apply(&self, x: f32) -> f32 {
+        x / (1.0 + math::abs(x))
+    }
+    #[inline]
+    fn derivative(&self, x: f32, _y: f32) -> f32 {
+        let d = 1.0 + math::abs(x);
+        // Für |x| > ~1,8e19 läuft d·d auf inf: 1/inf = 0 ist dort der richtige Grenzwert.
+        1.0 / (d * d)
+    }
+}
+
 /// Zur Laufzeit wählbare Aktivierung (z. B. aus einer Konfiguration).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ActivationKind {
@@ -363,6 +492,16 @@ pub enum ActivationKind {
     Softplus,
     /// Siehe [`Mish`].
     Mish,
+    /// Siehe [`Relu6`].
+    Relu6,
+    /// Siehe [`HardSigmoid`].
+    HardSigmoid,
+    /// Siehe [`HardSwish`].
+    HardSwish,
+    /// Siehe [`HardTanh`].
+    HardTanh,
+    /// Siehe [`Softsign`].
+    Softsign,
 }
 
 impl Activation for ActivationKind {
@@ -378,6 +517,11 @@ impl Activation for ActivationKind {
             ActivationKind::Elu(alpha) => Elu { alpha }.signature(),
             ActivationKind::Softplus => Softplus.signature(),
             ActivationKind::Mish => Mish.signature(),
+            ActivationKind::Relu6 => Relu6.signature(),
+            ActivationKind::HardSigmoid => HardSigmoid.signature(),
+            ActivationKind::HardSwish => HardSwish.signature(),
+            ActivationKind::HardTanh => HardTanh.signature(),
+            ActivationKind::Softsign => Softsign.signature(),
         }
     }
 
@@ -394,6 +538,11 @@ impl Activation for ActivationKind {
             ActivationKind::Elu(alpha) => Elu { alpha }.apply(x),
             ActivationKind::Softplus => Softplus.apply(x),
             ActivationKind::Mish => Mish.apply(x),
+            ActivationKind::Relu6 => Relu6.apply(x),
+            ActivationKind::HardSigmoid => HardSigmoid.apply(x),
+            ActivationKind::HardSwish => HardSwish.apply(x),
+            ActivationKind::HardTanh => HardTanh.apply(x),
+            ActivationKind::Softsign => Softsign.apply(x),
         }
     }
 
@@ -410,6 +559,11 @@ impl Activation for ActivationKind {
             ActivationKind::Elu(alpha) => Elu { alpha }.derivative(x, y),
             ActivationKind::Softplus => Softplus.derivative(x, y),
             ActivationKind::Mish => Mish.derivative(x, y),
+            ActivationKind::Relu6 => Relu6.derivative(x, y),
+            ActivationKind::HardSigmoid => HardSigmoid.derivative(x, y),
+            ActivationKind::HardSwish => HardSwish.derivative(x, y),
+            ActivationKind::HardTanh => HardTanh.derivative(x, y),
+            ActivationKind::Softsign => Softsign.derivative(x, y),
         }
     }
 }
@@ -518,7 +672,7 @@ mod tests {
 
     #[test]
     fn signatures_are_distinct_stable_and_match_the_enum() {
-        let all: [(u32, u32); 10] = [
+        let all: [(u32, u32); 15] = [
             (Linear.signature(), ActivationKind::Linear.signature()),
             (Relu.signature(), ActivationKind::Relu.signature()),
             (
@@ -535,6 +689,14 @@ mod tests {
             ),
             (Softplus.signature(), ActivationKind::Softplus.signature()),
             (Mish.signature(), ActivationKind::Mish.signature()),
+            (Relu6.signature(), ActivationKind::Relu6.signature()),
+            (
+                HardSigmoid.signature(),
+                ActivationKind::HardSigmoid.signature(),
+            ),
+            (HardSwish.signature(), ActivationKind::HardSwish.signature()),
+            (HardTanh.signature(), ActivationKind::HardTanh.signature()),
+            (Softsign.signature(), ActivationKind::Softsign.signature()),
         ];
         for (i, (stat, kind)) in all.iter().enumerate() {
             assert_eq!(
@@ -561,6 +723,176 @@ mod tests {
         assert_eq!(Linear.signature(), 1);
         assert_eq!(Tanh.signature(), 5);
         assert_eq!(Mish.signature(), 10);
+        assert_eq!(Relu6.signature(), 11);
+        assert_eq!(Softsign.signature(), 15);
+    }
+
+    // ---- Hard-Aktivierungen und Softsign -----------------------------------
+
+    /// Stützstellen abseits aller Knicke (0, ±1, ±3, 6), je mehr als eps entfernt.
+    const HARD_XS: [f32; 14] = [
+        -7.0, -5.0, -2.5, -1.5, -0.5, -0.05, 0.05, 0.5, 1.5, 2.5, 4.0, 5.0, 5.5, 7.0,
+    ];
+
+    #[test]
+    fn hard_derivatives_match_finite_differences() {
+        // Stückweise linear bzw. quadratisch: die zentrale Differenz ist abseits der Knicke exakt.
+        check_with("relu6", Relu6, &HARD_XS, 1e-3);
+        check_with("hard_sigmoid", HardSigmoid, &HARD_XS, 1e-3);
+        check_with("hard_swish", HardSwish, &HARD_XS, 1e-3);
+        check_with("hard_tanh", HardTanh, &HARD_XS, 1e-3);
+        // Softsign ist C¹, aber in 0 nicht C²: die zentrale Differenz hat dort einen Fehler der
+        // Ordnung eps (wie bei ELU). Das Paar um 0 entfällt; f'(0) = 1 prüft
+        // `hard_activations_known_values` direkt.
+        check_with("softsign links", Softsign, &SMOOTH_XS[..8], 1e-3);
+        check_with("softsign rechts", Softsign, &SMOOTH_XS[9..], 1e-3);
+    }
+
+    #[test]
+    fn hard_enum_variants_match_finite_differences() {
+        for (name, kind) in [
+            ("Relu6", ActivationKind::Relu6),
+            ("HardSigmoid", ActivationKind::HardSigmoid),
+            ("HardSwish", ActivationKind::HardSwish),
+            ("HardTanh", ActivationKind::HardTanh),
+        ] {
+            check_with(name, kind, &HARD_XS, 1e-3);
+        }
+        check_with(
+            "Softsign links",
+            ActivationKind::Softsign,
+            &SMOOTH_XS[..8],
+            1e-3,
+        );
+        check_with(
+            "Softsign rechts",
+            ActivationKind::Softsign,
+            &SMOOTH_XS[9..],
+            1e-3,
+        );
+    }
+
+    #[test]
+    fn hard_activations_known_values() {
+        // ReLU6
+        assert_eq!(
+            [
+                Relu6.apply(-1.0),
+                Relu6.apply(0.0),
+                Relu6.apply(3.5),
+                Relu6.apply(6.0),
+                Relu6.apply(9.0)
+            ],
+            [0.0, 0.0, 3.5, 6.0, 6.0]
+        );
+        // HardSigmoid: 0 | x/6 + 1/2 | 1
+        assert_eq!(
+            [
+                HardSigmoid.apply(-4.0),
+                HardSigmoid.apply(-3.0),
+                HardSigmoid.apply(0.0),
+                HardSigmoid.apply(3.0),
+                HardSigmoid.apply(4.0)
+            ],
+            [0.0, 0.0, 0.5, 1.0, 1.0]
+        );
+        assert!((HardSigmoid.apply(1.5) - 0.75).abs() < 1e-7);
+        // HardSwish: 0 | x(x+3)/6 | x
+        assert_eq!(
+            [
+                HardSwish.apply(-4.0),
+                HardSwish.apply(0.0),
+                HardSwish.apply(3.0),
+                HardSwish.apply(5.0)
+            ],
+            [0.0, 0.0, 3.0, 5.0]
+        );
+        assert!((HardSwish.apply(1.0) - 4.0 / 6.0).abs() < 1e-7);
+        assert!((HardSwish.apply(-1.0) + 2.0 / 6.0).abs() < 1e-7);
+        // HardTanh
+        assert_eq!(
+            [
+                HardTanh.apply(-2.0),
+                HardTanh.apply(0.3),
+                HardTanh.apply(2.0)
+            ],
+            [-1.0, 0.3, 1.0]
+        );
+        // Softsign
+        assert_eq!(Softsign.apply(0.0), 0.0);
+        assert!((Softsign.apply(1.0) - 0.5).abs() < 1e-7);
+        assert!((Softsign.apply(-3.0) + 0.75).abs() < 1e-7);
+        assert_eq!(Softsign.derivative(0.0, 0.0), 1.0);
+        assert!((Softsign.derivative(1.0, 0.5) - 0.25).abs() < 1e-7);
+    }
+
+    #[test]
+    fn hard_activations_let_nan_through_instead_of_hiding_it() {
+        // `clamp` gibt NaN zurück (anders als max/min, die NaN zu einer Schranke machen würden).
+        assert!(Relu6.apply(f32::NAN).is_nan());
+        assert!(HardSigmoid.apply(f32::NAN).is_nan());
+        assert!(HardSwish.apply(f32::NAN).is_nan());
+        assert!(HardTanh.apply(f32::NAN).is_nan());
+        assert!(Softsign.apply(f32::NAN).is_nan());
+    }
+
+    #[test]
+    fn hard_activations_are_continuous_at_their_knots() {
+        // Die Funktionswerte (nicht die Ableitungen) müssen an den Knicken zusammenpassen.
+        for &(f, knot) in &[
+            (Relu6.apply(5.999_999), 6.0),
+            (HardSigmoid.apply(-2.999_999), 0.0),
+            (HardSigmoid.apply(2.999_999), 1.0),
+            (HardSwish.apply(-2.999_999), 0.0),
+            (HardSwish.apply(2.999_999), 3.0),
+            (HardTanh.apply(0.999_999), 1.0),
+            (HardTanh.apply(-0.999_999), -1.0),
+        ] {
+            assert!((f - knot).abs() < 1e-5, "{f} vs {knot}");
+        }
+    }
+
+    #[test]
+    fn hard_derivative_conventions_at_the_knots() {
+        assert_eq!(Relu6.derivative(0.0, 0.0), 0.0);
+        assert_eq!(Relu6.derivative(6.0, 6.0), 0.0);
+        assert_eq!(HardSwish.derivative(-3.0, 0.0), 0.0);
+        assert_eq!(HardSwish.derivative(3.0, 3.0), 1.0);
+        assert_eq!(HardSigmoid.derivative(3.0, 1.0), 0.0);
+        assert_eq!(HardTanh.derivative(1.0, 1.0), 0.0);
+        assert!((HardSwish.derivative(0.0, 0.0) - 0.5).abs() < 1e-7);
+        assert!((HardSigmoid.derivative(0.0, 0.5) - 1.0 / 6.0).abs() < 1e-7);
+    }
+
+    #[test]
+    fn hard_activations_are_finite_for_extreme_inputs() {
+        for x in [1e3, -1e3, 1e20, -1e20, 1e30, -1e30, f32::MAX, -f32::MAX] {
+            for (name, y, d) in [
+                ("relu6", Relu6.apply(x), Relu6.derivative(x, 0.0)),
+                (
+                    "hard_sigmoid",
+                    HardSigmoid.apply(x),
+                    HardSigmoid.derivative(x, 0.0),
+                ),
+                (
+                    "hard_swish",
+                    HardSwish.apply(x),
+                    HardSwish.derivative(x, 0.0),
+                ),
+                ("hard_tanh", HardTanh.apply(x), HardTanh.derivative(x, 0.0)),
+                ("softsign", Softsign.apply(x), Softsign.derivative(x, 0.0)),
+            ] {
+                assert!(
+                    y.is_finite() && d.is_finite(),
+                    "{name}, x = {x}: y = {y}, d = {d}"
+                );
+            }
+        }
+        // Grenzwerte
+        assert_eq!(Softsign.apply(f32::MAX), 1.0);
+        assert_eq!(Softsign.derivative(1e30, 0.0), 0.0);
+        assert_eq!(HardSwish.apply(1e30), 1e30);
+        assert_eq!(HardSwish.derivative(1e30, 0.0), 1.0);
     }
 
     #[test]

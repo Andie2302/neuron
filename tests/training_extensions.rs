@@ -535,3 +535,60 @@ fn weight_decay_shrinks_the_weight_but_leaves_the_bias_alone() {
     assert!(w.abs() < 0.05, "AdamW: Gewicht {w}");
     assert!((b - 5.0).abs() < 0.1, "AdamW: Bias {b}");
 }
+
+#[test]
+fn xor_with_hard_activations() {
+    // Alle ohne exp/tanh. Stückweise lineare Funktionen brauchen etwas mehr Zeit.
+    // HardSigmoid fehlt hier bewusst: als *versteckte* Schicht ist sie im Bereich (-3, 3)
+    // linear, ein fast lineares Netz kann XOR nicht lernen. Sie ist für Gates und Ausgänge
+    // gedacht (siehe `hard_sigmoid_recovers_its_own_parameters`).
+    assert_learns_xor("HardSwish+AdamW", HardSwish, AdamW::new(0.03), 1500);
+    assert_learns_xor("Relu6+AdamW", Relu6, AdamW::new(0.03), 1500);
+    assert_learns_xor("HardTanh+AdamW", HardTanh, AdamW::new(0.03), 1500);
+    assert_learns_xor("Softsign+AdamW", Softsign, AdamW::new(0.03), 1500);
+}
+
+#[test]
+fn hard_sigmoid_recovers_its_own_parameters() {
+    // y = HardSigmoid(x/3 + 0.25) auf x ∈ [-3, 3]: Vor-Aktivierung bleibt in (-3, 3), wo die
+    // Ableitung 1/6 ist. Das Training muss die Parameter (1/3, 0.25) aus einem falschen Start finden.
+    let mut net = Dense::<1, 1, _>::new(HardSigmoid);
+    *net.weights_mut() = [[1.0]];
+    *net.bias_mut() = [-0.5];
+    let mut t = Trainer::new(net, Mse, Adam::new(0.05));
+    let mut samples = [([0.0f32; 1], [0.0f32; 1]); 25];
+    for (i, s) in samples.iter_mut().enumerate() {
+        let x = -3.0 + 0.25 * i as f32;
+        *s = ([x], [HardSigmoid.apply(x / 3.0 + 0.25)]);
+    }
+    for _ in 0..1500 {
+        t.train_batch(samples.iter().map(|(x, y)| (&x[..], &y[..])));
+    }
+    let (w, b) = (
+        t.network().weights_as_slice()[0],
+        t.network().bias_as_slice()[0],
+    );
+    assert!((w - 1.0 / 3.0).abs() < 0.01, "w = {w}");
+    assert!((b - 0.25).abs() < 0.02, "b = {b}");
+}
+
+#[test]
+fn xor_with_lion() {
+    // Lion macht Schritte der Länge lr: kleine Rate, dafür gleichmäßiger Fortschritt.
+    assert_learns_xor("Gelu+Lion", Gelu, Lion::new(0.01), 1200);
+    assert_learns_xor(
+        "HardSwish+Lion",
+        HardSwish,
+        Lion::new(0.01).with_weight_decay(0.1),
+        1500,
+    );
+}
+
+#[test]
+fn lion_with_weight_decay_leaves_the_bias_alone_end_to_end() {
+    // Wie bei den anderen Optimizern: das Gewicht zerfällt, der Bias erreicht das Ziel.
+    // Lion oszilliert in einem Band der Breite ~lr um das Optimum.
+    let (w, b) = fit_constant_target(Lion::new(0.01).with_weight_decay(1.0), 3000);
+    assert!(w.abs() < 0.05, "Gewicht müsste zerfallen sein: {w}");
+    assert!((b - 5.0).abs() < 0.1, "Bias wurde mit zerfallen: {b}");
+}

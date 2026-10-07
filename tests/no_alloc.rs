@@ -185,6 +185,11 @@ fn every_activation_optimizer_loss_and_schedule_never_touches_the_heap() {
         ActivationKind::Elu(1.0),
         ActivationKind::Softplus,
         ActivationKind::Mish,
+        ActivationKind::Relu6,
+        ActivationKind::HardSigmoid,
+        ActivationKind::HardSwish,
+        ActivationKind::HardTanh,
+        ActivationKind::Softsign,
     ];
     for kind in kinds {
         let mut net =
@@ -211,6 +216,7 @@ fn every_activation_optimizer_loss_and_schedule_never_touches_the_heap() {
     sink += train_briefly(RmsProp::new(0.01));
     sink += train_briefly(RmsProp::new(0.01).with_momentum(0.9));
     sink += train_briefly(Adagrad::new(0.1));
+    sink += train_briefly(Lion::new(0.01).with_weight_decay(0.1));
 
     // Jeder Verlust.
     sink += train_with_loss(Mse);
