@@ -503,6 +503,8 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
+mod macros;
+
 pub mod activation;
 pub mod average;
 pub mod buffer;
@@ -513,10 +515,13 @@ pub mod infer;
 pub mod init;
 pub mod layer;
 pub mod loss;
+pub mod lr_finder;
 pub mod metrics;
 pub mod model;
+pub mod norm;
 pub mod optim;
 pub mod params;
+pub mod residual;
 pub mod rng;
 pub mod schedule;
 pub mod stopping;
