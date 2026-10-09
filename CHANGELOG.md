@@ -11,7 +11,84 @@ Inkompatible Änderungen sind mit **Breaking:** gekennzeichnet; für jede steht 
 
 ## [Unveröffentlicht]
 
-Noch keine Einträge.
+Weitere Bausteine für Aktivierungen, Verluste, Optimizer, Training, Inferenz und Layer. Die
+inkompatiblen Änderungen betreffen nur erschöpfende `match`-Ausdrücke über `ActivationKind` und
+`LayerKind` sowie Struktur-Literale von `Sgd` und `Momentum` (siehe „Geändert“).
+
+### Hinzugefügt
+
+**Aktivierungen und Initialisierung**
+
+- `Selu` (feste Konstanten λ und α), `GeluExact` (exakte GELU über die Fehlerfunktion; die
+  tanh-Näherung `Gelu` weicht höchstens um 4,7e-4 ab), `LogSigmoid` (überlauffrei), `SwishBeta { beta }`,
+  `Sine { omega }` (SIREN) und `Snake { alpha }`. Parameter werden geprüft, die Felder sind privat.
+- `FastTanh` und `FastSigmoid`: Näherungen nur mit Grundrechenarten für Mikrocontroller ohne schnelle
+  Hardware-Mathematik (Abweichung unter 1e-4 bzw. 5e-5; die Ableitung gehört zur Näherung).
+- `LecunNormal` und `LecunUniform` (passende Initialisierung für `Selu`).
+- Neue Kennungen 16 bis 23 für den Architektur-Fingerprint; die Kennungen 1 bis 15 sind unverändert.
+
+**Verluste**
+
+- `WeightedSoftmaxCrossEntropy<K>` (Klassengewichte), `KlDivergence` (Destillation, mit
+  `with_temperature`), `PoissonNll` (Log-Rate, Zähldaten), `QuantileLoss` (Pinball) und
+  `FocalSoftmaxCrossEntropy<K>` (Mehrklassen-Fokalverlust). Alle folgen der Konstruktor-Konvention
+  (`new`, `Default`, Getter, geprüfte `with_*`). Der `Trainer` teilt Mini-Batches durch die
+  Sample-Zahl, nicht durch die Summe der Klassengewichte; die Doku beschreibt die Folge.
+
+**Optimizer**
+
+- `AmsGrad` (bitgleich zu `Adam`, solange das zweite Moment monoton wächst), `Adamax`
+  (Unendlichnorm) und `Adadelta`.
+- L1-Regularisierung für `Sgd` und `Momentum` über `with_l1` (proximales Soft-Thresholding, exakte
+  Nullen, nur auf Gewichten).
+- `Optimizer::reset` (Standard: No-op) und `Trainer::reset_optimizer_state()`: Optimizer-Zustand und
+  Schrittzähler zurücksetzen, etwa nach `load_model` mitten im Training; bei `Lookahead` entstehen die
+  langsamen Gewichte danach neu. Golden-Test `tests/optim_ext_golden.rs` für die übrigen Optimizer.
+
+**Training**
+
+- Lernraten-Pläne `LinearDecay`, `PolynomialDecay`, `CosineWarmRestarts`, `OneCycle`,
+  `InverseSqrtDecay` und der zustandsbehaftete `ReduceLrOnPlateau`.
+- Modul `lr_finder`: `LrRangeTest<N>` (Lernraten-Bereichstest, heap-frei, mit `suggest()`).
+- `ParamEma::with_warmup()` (Aufwärmen des Zerfalls); ohne Aufruf bleibt alles bitgleich.
+- `data::KFold` und `data::train_val_split` (Index-Helfer über einen vom Aufrufer gestellten Puffer).
+
+**Inferenz und Metriken**
+
+- Temperatur-Kalibrierung: `math::softmax_with_temperature`, `InferExt::probabilities_with_temperature`,
+  `classify_with_confidence_at`, `fit_temperature` (ohne Heap, auf Validierungsdaten).
+- `InferExt::evaluate_confusion`, `evaluate_calibration`, `accuracy_top_k` und `infer_batch`.
+- `math::log_softmax_inplace`, `logsumexp`, `softmax_entropy`.
+- Metriken `mean_absolute_error`, `mean_squared_error`, `root_mean_squared_error`, `max_error`,
+  `explained_variance_score`, `negative_log_likelihood`, `log_loss`, `roc_auc` sowie
+  `CalibrationBins<B>` (erwarteter Kalibrierungsfehler, Zuverlässigkeitsdiagramm).
+
+**Layer**
+
+- `Residual<L>` (Skip-Verbindung) und `LayerNorm<N>` samt Inferenz-Gegenstücken `InferResidual` und
+  `InferLayerNorm` (beide mit `IntoInference`, bitgleich zum Trainings-Forward im Inferenzmodus).
+  `gamma` und `beta` melden sich als `ParamKind::Bias`, erhalten also keinen Weight Decay.
+- Das Makro `chain!(a, b, c)` für `a.then(b).then(c)`.
+- Neue Layer-Kennungen: `LayerNorm = 2` sowie Strukturmarker `ResidualBegin = 128` und
+  `ResidualEnd = 129`, die die Signaturen einer Skip-Verbindung einklammern, sodass Netze mit und ohne
+  Verbindung verschiedene Fingerprints haben. Marker zählen nicht in `Params::layer_count`; Fingerprints
+  und Modell-Bytes bestehender Netze bleiben unverändert.
+
+### Geändert
+
+- **Breaking:** `ActivationKind` hat acht neue Varianten (`Selu`, `GeluExact`, `LogSigmoid`,
+  `SwishBeta(f32)`, `Sine(f32)`, `Snake(f32)`, `FastSigmoid`, `FastTanh`). Ein `match` ohne
+  Auffangzweig muss sie behandeln oder `_ =>` ergänzen.
+- **Breaking:** `LayerKind` ist `#[non_exhaustive]` und hat drei neue Varianten; ein erschöpfendes
+  `match` außerhalb des Crates braucht einen Auffangzweig. Die Kennung liefert `LayerKind::id()`.
+- **Breaking:** `Sgd` und `Momentum` haben das öffentliche Feld `l1`. Struktur-Literale, die alle
+  Felder nennen, kompilieren nicht mehr; `Sgd::new(lr)`, `Momentum::new(lr, beta)` und das
+  Struktur-Update `Sgd { lr: 0.5, ..Sgd::new(0.1) }` bleiben gültig.
+- `Optimizer` hat die Standardmethode `reset`; bestehende Implementierungen bleiben gültig.
+- `ParamEma::reset_to` setzt zusätzlich den Update-Zähler zurück (nur mit eingeschaltetem Aufwärmen
+  wirksam).
+- Doku: Die Moduldoku von `loss`, `optim`, `activation`, `init`, `schedule`, `metrics` und `model` ist
+  um die neuen Elemente erweitert; alle neuen Elemente haben Doctests.
 
 ## [0.2.0] - 2026-10-07
 

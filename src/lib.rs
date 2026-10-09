@@ -13,20 +13,21 @@
 //! |---------------|------------------------------------------|-----------------------------------------------------|
 //! | [`Buffer`]    | `f32`-Speicher (Stack/Heap)              | `[f32; N]`, `[[f32; C]; R]`, `Vec<f32>` (`alloc`)   |
 //! | [`Storage`]   | Puffertypen eines Dense-Layers           | [`Stack`], `Heap` (`alloc`)                         |
-//! | [`Activation`]| Aktivierung + Ableitung + Kennung        | [`Linear`], [`Relu`], [`LeakyRelu`], [`Sigmoid`], [`Tanh`], [`Gelu`], [`Swish`], [`Elu`], [`Softplus`], [`Mish`]; ohne `exp`/`tanh`: [`Relu6`], [`HardSigmoid`], [`HardSwish`], [`HardTanh`], [`Softsign`]; [`ActivationKind`] |
-//! | [`Loss`]      | Verlust + Gradient                       | [`Mse`], [`Mae`], [`Huber`], [`LogCosh`], [`Hinge`], [`SquaredHinge`], [`BinaryCrossEntropyWithLogits`], [`WeightedBinaryCrossEntropyWithLogits`], [`FocalLossWithLogits`], [`SoftmaxCrossEntropy`], [`LabelSmoothingCrossEntropy`] |
-//! | [`Initializer`]| Gewichtsinitialisierung                 | [`Constant`], [`XavierUniform`], [`XavierNormal`], [`HeUniform`], [`HeNormal`] |
-//! | [`Optimizer`] | Parameter-Update (+ Zustand je Tensor)   | [`Sgd`], [`Momentum`], [`Adam`], [`AdamW`], [`NAdam`], [`RAdam`], [`Lion`], [`RmsProp`], [`RmsPropMomentum`], [`Adagrad`]; Wrapper [`Lookahead`] |
-//! | [`LrSchedule`]| Lernrate je Schritt                      | [`ConstantLr`], [`StepDecay`], [`ExponentialDecay`], [`CosineAnnealing`], [`Warmup`] |
+//! | [`Activation`]| Aktivierung + Ableitung + Kennung        | [`Linear`], [`Relu`], [`LeakyRelu`], [`Sigmoid`], [`Tanh`], [`Gelu`], [`GeluExact`], [`Swish`], [`SwishBeta`], [`Selu`], [`Elu`], [`Softplus`], [`LogSigmoid`], [`Mish`], [`Sine`], [`Snake`]; ohne `exp`/`tanh`: [`Relu6`], [`HardSigmoid`], [`HardSwish`], [`HardTanh`], [`Softsign`], [`FastTanh`], [`FastSigmoid`]; [`ActivationKind`] |
+//! | [`Loss`]      | Verlust + Gradient                       | [`Mse`], [`Mae`], [`Huber`], [`LogCosh`], [`Hinge`], [`SquaredHinge`], [`BinaryCrossEntropyWithLogits`], [`WeightedBinaryCrossEntropyWithLogits`], [`FocalLossWithLogits`], [`SoftmaxCrossEntropy`], [`WeightedSoftmaxCrossEntropy`], [`FocalSoftmaxCrossEntropy`], [`KlDivergence`], [`LabelSmoothingCrossEntropy`], [`PoissonNll`], [`QuantileLoss`] |
+//! | [`Initializer`]| Gewichtsinitialisierung                 | [`Constant`], [`XavierUniform`], [`XavierNormal`], [`HeUniform`], [`HeNormal`], [`LecunUniform`], [`LecunNormal`] |
+//! | [`Optimizer`] | Parameter-Update (+ Zustand je Tensor)   | [`Sgd`], [`Momentum`], [`Adam`], [`AdamW`], [`NAdam`], [`RAdam`], [`AmsGrad`], [`Adamax`], [`Adadelta`], [`Lion`], [`RmsProp`], [`RmsPropMomentum`], [`Adagrad`]; Wrapper [`Lookahead`] |
+//! | [`LrSchedule`]| Lernrate je Schritt                      | [`ConstantLr`], [`StepDecay`], [`ExponentialDecay`], [`CosineAnnealing`], [`LinearDecay`], [`PolynomialDecay`], [`CosineWarmRestarts`], [`OneCycle`], [`InverseSqrtDecay`], [`Warmup`], [`ReduceLrOnPlateau`] |
 //! | [`Params`]    | Parameter lesen/schreiben, Fingerprint, Modell speichern/laden | alle Layer und Inferenz-Layer |
-//! | [`Layer`]     | Baustein mit Forward/Backward            | [`Dense`], [`Dropout`], [`Chain`], `Sequential` (`alloc`) |
-//! | [`InferLayer`]| Baustein nur zum Rechnen (kein Training) | [`InferDense`], [`InferChain`], [`Passthrough`], `InferSequential` (`alloc`); erzeugt über [`IntoInference`] |
-//! | [`InferExt`]  | Entscheidungshilfen für jeden `InferLayer` | `classify`, `classify_confident`, `probabilities`, `top_k`, `accuracy` |
+//! | [`Layer`]     | Baustein mit Forward/Backward            | [`Dense`], [`Dropout`], [`LayerNorm`], [`Residual`], [`Chain`] (kurz: [`chain!`]), `Sequential` (`alloc`) |
+//! | [`InferLayer`]| Baustein nur zum Rechnen (kein Training) | [`InferDense`], [`InferChain`], [`InferLayerNorm`], [`InferResidual`], [`Passthrough`], `InferSequential` (`alloc`); erzeugt über [`IntoInference`] |
+//! | [`InferExt`]  | Entscheidungshilfen für jeden `InferLayer` | `classify`, `classify_confident`, `probabilities`, `top_k`, `accuracy`, `fit_temperature`, `evaluate_confusion` |
 //!
 //! Rund ums Training (alles ohne Heap): [`Trainer::train_epoch`] (gemischte Mini-Batches),
 //! [`Trainer::evaluate_batch`], [`Standardizer`] / [`RunningStats`] (Merkmale skalieren),
 //! [`one_hot`], [`EarlyStopping`], [`ParamEma`] (gleitendes Mittel der Gewichte),
-//! [`ConfusionMatrix`] und [`r2_score`].
+//! [`ConfusionMatrix`], [`r2_score`] und weitere Metriken ([`mean_absolute_error`], [`log_loss`], [`roc_auc`], [`CalibrationBins`]),
+//! [`KFold`] und [`LrRangeTest`].
 //!
 //! ## Schnellstart: Training
 //!
@@ -494,6 +495,9 @@
 //! | [`metrics`]     | Auswertung: [`ConfusionMatrix`] und [`r2_score`]                                          |
 //! | [`stopping`]    | [`EarlyStopping`] nach Geduld und Mindestverbesserung                                     |
 //! | [`average`]     | [`ParamEma`]: gleitendes Mittel der Gewichte                                              |
+//! | [`lr_finder`]   | [`LrRangeTest`]: Lernraten-Bereichstest                                                   |
+//! | [`norm`]        | [`LayerNorm`] und [`InferLayerNorm`]                                                      |
+//! | [`residual`]    | [`Residual`] und [`InferResidual`]: Skip-Verbindungen                                     |
 //! | `dynamic`       | Nur mit Feature `alloc`: zur Laufzeit konfigurierbare Netze (`Sequential`, `InferSequential`) |
 
 #![no_std]
@@ -533,32 +537,51 @@ pub mod dynamic;
 pub mod math;
 
 pub use activation::{
-    Activation, ActivationKind, Elu, Gelu, HardSigmoid, HardSwish, HardTanh, LeakyRelu, Linear,
-    Mish, Relu, Relu6, Sigmoid, Softplus, Softsign, Swish, Tanh,
+    Activation, ActivationKind, Elu, FastSigmoid, FastTanh, Gelu, GeluExact, HardSigmoid,
+    HardSwish, HardTanh, LeakyRelu, Linear, LogSigmoid, Mish, Relu, Relu6, Selu, Sigmoid, Sine,
+    Snake, Softplus, Softsign, Swish, SwishBeta, Tanh,
 };
 pub use average::ParamEma;
 pub use buffer::{Buffer, Stack, Storage};
-pub use data::{one_hot, RunningStats, Standardizer};
+pub use data::{one_hot, train_val_split, KFold, RunningStats, Standardizer};
 pub use dense::{Dense, DenseLayer, InferDense, InferenceDense};
 pub use dropout::{Dropout, DropoutLayer};
 pub use infer::{InferChain, InferExt, InferLayer, IntoInference, Passthrough};
-pub use init::{Constant, HeNormal, HeUniform, Initializer, XavierNormal, XavierUniform};
+pub use init::{
+    Constant, HeNormal, HeUniform, Initializer, LecunNormal, LecunUniform, XavierNormal,
+    XavierUniform,
+};
 pub use layer::{Chain, Layer, Mode};
 pub use loss::{
-    BinaryCrossEntropyWithLogits, FocalLossWithLogits, Hinge, Huber, LabelSmoothingCrossEntropy,
-    LogCosh, Loss, Mae, Mse, SoftmaxCrossEntropy, SquaredHinge,
-    WeightedBinaryCrossEntropyWithLogits,
+    BinaryCrossEntropyWithLogits, FocalLossWithLogits, FocalSoftmaxCrossEntropy, Hinge, Huber,
+    KlDivergence, LabelSmoothingCrossEntropy, LogCosh, Loss, Mae, Mse, PoissonNll, QuantileLoss,
+    SoftmaxCrossEntropy, SquaredHinge, WeightedBinaryCrossEntropyWithLogits,
+    WeightedSoftmaxCrossEntropy,
 };
-pub use math::{argmax, sigmoid, softmax_confidence, softmax_inplace, top_k};
-pub use metrics::{r2_score, ConfusionMatrix};
+pub use lr_finder::LrRangeTest;
+pub use math::{
+    argmax, log_softmax_inplace, logsumexp, sigmoid, softmax_confidence,
+    softmax_confidence_with_temperature, softmax_entropy, softmax_inplace,
+    softmax_with_temperature, top_k,
+};
+pub use metrics::{
+    explained_variance_score, log_loss, max_error, mean_absolute_error, mean_squared_error,
+    negative_log_likelihood, r2_score, roc_auc, root_mean_squared_error, CalibrationBins,
+    ConfusionMatrix, ReliabilityBin,
+};
 pub use model::{crc32, Crc32, ModelError, ModelHeader};
+pub use norm::{InferLayerNorm, LayerNorm};
 pub use optim::{
-    Adagrad, Adam, AdamW, Lion, Lookahead, Momentum, NAdam, Optimizer, ParamKind, RAdam, RmsProp,
-    RmsPropMomentum, Sgd,
+    Adadelta, Adagrad, Adam, AdamW, Adamax, AmsGrad, Lion, Lookahead, Momentum, NAdam, Optimizer,
+    ParamKind, RAdam, RmsProp, RmsPropMomentum, Sgd,
 };
 pub use params::{LayerKind, LayerSig, ParamError, Params};
+pub use residual::{InferResidual, Residual};
 pub use rng::{shuffle, Pcg32, Rng};
-pub use schedule::{ConstantLr, CosineAnnealing, ExponentialDecay, LrSchedule, StepDecay, Warmup};
+pub use schedule::{
+    ConstantLr, CosineAnnealing, CosineWarmRestarts, ExponentialDecay, InverseSqrtDecay,
+    LinearDecay, LrSchedule, OneCycle, PolynomialDecay, ReduceLrOnPlateau, StepDecay, Warmup,
+};
 pub use stopping::{EarlyStopping, StopStatus};
 pub use trainer::Trainer;
 
@@ -573,18 +596,24 @@ pub use dynamic::{DynLayer, HeapPassthrough, InferSequential, Sequential};
 
 /// Alles Wichtige auf einmal importieren.
 pub mod prelude {
+    pub use crate::chain;
     pub use crate::{
-        argmax, one_hot, r2_score, sigmoid, softmax_inplace, Activation, ActivationKind, Adagrad,
-        Adam, AdamW, BinaryCrossEntropyWithLogits, Buffer, Chain, ConfusionMatrix, Constant,
-        ConstantLr, CosineAnnealing, Dense, Dropout, EarlyStopping, Elu, ExponentialDecay,
-        FocalLossWithLogits, Gelu, HardSigmoid, HardSwish, HardTanh, HeNormal, HeUniform, Hinge,
-        Huber, InferDense, InferExt, InferLayer, Initializer, IntoInference,
-        LabelSmoothingCrossEntropy, Layer, LeakyRelu, Linear, Lion, LogCosh, Lookahead, Loss,
-        LrSchedule, Mae, Mish, Mode, ModelError, Momentum, Mse, NAdam, Optimizer, ParamEma,
-        ParamError, ParamKind, Params, Pcg32, RAdam, Relu, Relu6, RmsProp, RmsPropMomentum, Rng,
-        RunningStats, Sgd, Sigmoid, SoftmaxCrossEntropy, Softplus, Softsign, SquaredHinge,
-        Standardizer, StepDecay, StopStatus, Swish, Tanh, Trainer, Warmup,
-        WeightedBinaryCrossEntropyWithLogits, XavierNormal, XavierUniform,
+        argmax, log_loss, mean_absolute_error, mean_squared_error, one_hot, r2_score, roc_auc,
+        root_mean_squared_error, sigmoid, softmax_inplace, train_val_split, Activation,
+        ActivationKind, Adadelta, Adagrad, Adam, AdamW, Adamax, AmsGrad,
+        BinaryCrossEntropyWithLogits, Buffer, CalibrationBins, Chain, ConfusionMatrix, Constant,
+        ConstantLr, CosineAnnealing, CosineWarmRestarts, Dense, Dropout, EarlyStopping, Elu,
+        ExponentialDecay, FocalLossWithLogits, FocalSoftmaxCrossEntropy, Gelu, GeluExact,
+        HardSigmoid, HardSwish, HardTanh, HeNormal, HeUniform, Hinge, Huber, InferDense, InferExt,
+        InferLayer, Initializer, IntoInference, KFold, KlDivergence, LabelSmoothingCrossEntropy,
+        Layer, LayerNorm, LeakyRelu, LecunNormal, LecunUniform, Linear, LinearDecay, Lion, LogCosh,
+        Lookahead, Loss, LrRangeTest, LrSchedule, Mae, Mish, Mode, ModelError, Momentum, Mse,
+        NAdam, OneCycle, Optimizer, ParamEma, ParamError, ParamKind, Params, Pcg32, PoissonNll,
+        QuantileLoss, RAdam, ReduceLrOnPlateau, Relu, Relu6, Residual, RmsProp, RmsPropMomentum,
+        Rng, RunningStats, Selu, Sgd, Sigmoid, SoftmaxCrossEntropy, Softplus, Softsign,
+        SquaredHinge, Standardizer, StepDecay, StopStatus, Swish, Tanh, Trainer, Warmup,
+        WeightedBinaryCrossEntropyWithLogits, WeightedSoftmaxCrossEntropy, XavierNormal,
+        XavierUniform,
     };
 
     #[cfg(feature = "alloc")]

@@ -83,18 +83,23 @@ ihrer Dokumentation je einen eigenen Typ als Beispiel. `cargo test` führt die D
 
 | Trait           | Aufgabe                                | Implementierungen |
 |-----------------|----------------------------------------|-------------------|
-| `Activation`    | `apply(x)`, `derivative(x, y)`, `signature()` | `Linear`, `Relu`, `LeakyRelu`, `Sigmoid`, `Tanh`, `Gelu`, `Swish`, `Elu`, `Softplus`, `Mish`, **ohne `exp`/`tanh`:** `Relu6`, `HardSigmoid`, `HardSwish`, `HardTanh`, `Softsign`; Enum `ActivationKind` (Laufzeitwahl) |
-| `Loss`          | `value(pred, target)`, `gradient(..)`  | `Mse`, `Mae`, `Huber`, `LogCosh`, `Hinge`/`SquaredHinge` (Ziele ±1), `BinaryCrossEntropyWithLogits` (auf Logits), `WeightedBinaryCrossEntropyWithLogits` (`pos_weight`), `FocalLossWithLogits`, `SoftmaxCrossEntropy` und `LabelSmoothingCrossEntropy` (auf Logits); alle per `X::new(..)` (siehe „Einheitliche Loss-Konstruktoren“) |
-| `Initializer`   | `fill(w, fan_in, fan_out, rng)`        | `Constant`, `XavierUniform/Normal`, `HeUniform/Normal` |
-| `Optimizer`     | `update(state, params, grads, kind)`   | `Sgd`, `Momentum` (optional Nesterov), `Adam`, `AdamW`, `NAdam`, `RAdam`, `Lion`, `RmsProp`/`RmsPropMomentum`, `Adagrad`; Wrapper `Lookahead<O>` um jeden Optimizer |
-| `LrSchedule`    | `lr(step)`                             | `ConstantLr`, `StepDecay`, `ExponentialDecay`, `CosineAnnealing`, `Warmup<S>` |
+| `Activation`    | `apply(x)`, `derivative(x, y)`, `signature()` | `Linear`, `Relu`, `LeakyRelu`, `Sigmoid`, `Tanh`, `Gelu`, `GeluExact`, `Swish`, `SwishBeta`, `Selu`, `Elu`, `Softplus`, `LogSigmoid`, `Mish`, `Sine`, `Snake`, **ohne `exp`/`tanh`:** `Relu6`, `HardSigmoid`, `HardSwish`, `HardTanh`, `Softsign`, Näherungen **nur mit Grundrechenarten:** `FastTanh`, `FastSigmoid`; Enum `ActivationKind` (Laufzeitwahl) |
+| `Loss`          | `value(pred, target)`, `gradient(..)`  | `Mse`, `Mae`, `Huber`, `LogCosh`, `Hinge`/`SquaredHinge` (Ziele ±1), `BinaryCrossEntropyWithLogits` (auf Logits), `WeightedBinaryCrossEntropyWithLogits` (`pos_weight`), `FocalLossWithLogits`, `SoftmaxCrossEntropy`, `WeightedSoftmaxCrossEntropy<K>` (Klassengewichte), `FocalSoftmaxCrossEntropy<K>`, `KlDivergence` (Destillation) und `LabelSmoothingCrossEntropy` (auf Logits), `PoissonNll` (Log-Rate), `QuantileLoss` (Pinball); alle per `X::new(..)` (siehe „Einheitliche Loss-Konstruktoren“) |
+| `Initializer`   | `fill(w, fan_in, fan_out, rng)`        | `Constant`, `XavierUniform/Normal`, `HeUniform/Normal`, `LecunUniform/Normal` |
+| `Optimizer`     | `update(state, params, grads, kind)`   | `Sgd`, `Momentum` (optional Nesterov), `Adam`, `AdamW`, `NAdam`, `RAdam`, `AmsGrad`, `Adamax`, `Adadelta`, `Lion`, `RmsProp`/`RmsPropMomentum`, `Adagrad` (L1-Regularisierung für `Sgd`/`Momentum` über `with_l1`); Wrapper `Lookahead<O>` um jeden Optimizer |
+| `LrSchedule`    | `lr(step)`                             | `ConstantLr`, `StepDecay`, `ExponentialDecay`, `CosineAnnealing`, `LinearDecay`, `PolynomialDecay`, `CosineWarmRestarts`, `OneCycle`, `InverseSqrtDecay`, `Warmup<S>`; zustandsbehaftet: `ReduceLrOnPlateau`; Lernraten-Finder: `LrRangeTest<N>` |
 | `Params`        | Parameter lesen/schreiben, Fingerprint, Modell speichern/laden | alle Layer und Inferenz-Layer |
-| `Layer`         | `forward` / `backward` / `step` ...    | `Dense<IN, OUT, A>`, `Dropout<N>`, `Chain<A, B>`; mit `alloc`: `HeapDense`, `HeapDropout`, `Sequential` |
-| `InferLayer`    | nur `infer` (kein Training)            | `InferDense<IN, OUT, A>`, `InferChain<A, B>`, `Passthrough<N>`; mit `alloc`: `InferSequential` |
-| `InferExt`      | `classify`, `classify_confident`, `probabilities`, `top_k`, `accuracy` | automatisch für jeden `InferLayer` |
-| `IntoInference` | `net.into_inference()`                 | `Dense`, `Dropout` (Stack: `Passthrough`, Heap: `HeapPassthrough`), `Chain`, (`alloc`) `Sequential` |
+| `Layer`         | `forward` / `backward` / `step` ...    | `Dense<IN, OUT, A>`, `Dropout<N>`, `LayerNorm<N>`, `Residual<L>` (Skip-Verbindung), `Chain<A, B>` (kurz: `chain!(a, b, c)`); mit `alloc`: `HeapDense`, `HeapDropout`, `Sequential` |
+| `InferLayer`    | nur `infer` (kein Training)            | `InferDense<IN, OUT, A>`, `InferChain<A, B>`, `InferLayerNorm<N>`, `InferResidual<L>`, `Passthrough<N>`; mit `alloc`: `InferSequential` |
+| `InferExt`      | `classify`, `classify_confident`, `probabilities`, `top_k`, `accuracy`; Kalibrierung: `fit_temperature`, `classify_with_confidence_at`; `evaluate_confusion`, `accuracy_top_k`, `infer_batch` | automatisch für jeden `InferLayer` |
+| `IntoInference` | `net.into_inference()`                 | `Dense`, `Dropout` (Stack: `Passthrough`, Heap: `HeapPassthrough`), `LayerNorm`, `Residual`, `Chain`, (`alloc`) `Sequential` |
 | `Buffer`        | `f32`-Speicher                         | `[f32; N]`, `[[f32; C]; R]`, `Vec<f32>` (`alloc`) |
 | `Storage`       | Puffertypen eines Dense-Layers         | `Stack<IN, OUT>`, `Heap` (`alloc`) |
+
+Weitere Hilfen ohne Heap: Metriken (`mean_absolute_error`, `root_mean_squared_error`, `r2_score`,
+`explained_variance_score`, `log_loss`, `roc_auc`, `ConfusionMatrix`, `CalibrationBins` für den
+erwarteten Kalibrierungsfehler), Validierungs-Indizes (`KFold`, `train_val_split`) und das
+Zurücksetzen des Optimizer-Zustands (`Trainer::reset_optimizer_state`, etwa nach `load_model`).
 
 Dropout hat einen expliziten Schalter: jeder `forward`-Aufruf bekommt einen
 `Mode::Training` oder `Mode::Inference` (Standard). `Trainer::predict` und
