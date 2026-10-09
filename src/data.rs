@@ -1,4 +1,5 @@
-//! Datenvorbereitung ohne Allokation: One-Hot-Kodierung und Standardisierung der Merkmale.
+//! Datenvorbereitung ohne Allokation: One-Hot-Kodierung, Standardisierung der Merkmale und
+//! Index-Helfer für die Validierung ([`KFold`], [`train_val_split`]).
 //!
 //! Netze lernen deutlich besser, wenn jedes Merkmal um `0` streut und eine Streuung von etwa `1`
 //! hat. [`RunningStats`] sammelt dafür Mittelwert und Streuung in einem Durchlauf (Welford,
@@ -23,6 +24,8 @@
 //! DEPLOYED.transform(&mut y);
 //! assert!(y[0].abs() < 1e-6);
 //! ```
+
+use core::ops::Range;
 
 use crate::math;
 
@@ -217,6 +220,250 @@ impl<const N: usize> Standardizer<N> {
     }
 }
 
+// ---- Index-Helfer für die Validierung ---------------------------------------------------------
+
+/// K-fache Kreuzvalidierung ohne Heap: teilt `n` Samples in `k` Folds, die der Reihe nach als
+/// Validierung dienen, während die übrigen trainieren.
+///
+/// `KFold` speichert nur `n` und `k`. Die Aufteilung gilt für **Positionen** in einem Index-Puffer
+/// `order`, den der Aufrufer stellt (`[usize; N]`, Länge `n`): Fold `f` validiert mit den Einträgen
+/// [`validation_range(f)`](Self::validation_range) von `order` und trainiert mit allen anderen.
+/// Welches Sample hinter einer Position steckt, bestimmt `order`; wird er vorher mit
+/// [`shuffle`](crate::rng::shuffle) gemischt, sind die Folds zufällige, überschneidungsfreie
+/// Teilmengen – ohne dass die Daten selbst bewegt werden. Ungemischt (`order[i] = i`) sind die
+/// Folds zusammenhängende Blöcke, was für zeitlich geordnete Daten gewollt sein kann.
+///
+/// **Aufteilung:** Mit `q = n / k` und `r = n % k` haben die ersten `r` Folds `q + 1`
+/// Validierungs-Samples, die übrigen `q`. Die Größen unterscheiden sich also um höchstens eins, der
+/// Rest verteilt sich auf die vorderen Folds. Die Validierungsbereiche sind aufeinanderfolgende,
+/// lückenlose Abschnitte von `0..n`: jede Position liegt in genau einem Fold, und die Trainingsmenge
+/// eines Folds ist genau der Rest.
+///
+/// **Randfälle:** `n = 0`, `k < 2` und `k > n` werden von [`new`](Self::new) abgelehnt (Panik mit
+/// Meldung): ein Fold ohne Validierungs-Sample ließe `evaluate_batch` stillschweigend `0.0`
+/// liefern, und mit `k = 1` bliebe nichts zum Trainieren. `k = n` ist das Leave-One-Out-Verfahren.
+/// Ob `order` tatsächlich eine Permutation ist, prüfen die Methoden nicht (das ginge nur mit
+/// Zusatzspeicher); geprüft wird die Länge.
+///
+/// ```
+/// use neuron::prelude::*;
+/// use neuron::data::KFold;
+///
+/// // Gerade y = 2x + 1 auf 20 Punkten, 4 Folds zu je 5 Samples. Die Reihenfolge wird vorab gemischt.
+/// let xs: [[f32; 1]; 20] = core::array::from_fn(|i| [i as f32 / 10.0 - 1.0]);
+/// let ys = xs.map(|x| [2.0 * x[0] + 1.0]);
+/// let mut order: [usize; 20] = core::array::from_fn(|i| i);
+/// neuron::rng::shuffle(&mut Pcg32::seeded(7), &mut order);
+///
+/// let folds = KFold::new(xs.len(), 4);
+/// let mut seen = [0u8; 20]; // wie oft ein Sample in einer Validierung auftrat
+/// let mut total = 0.0;
+/// for fold in folds.folds() {
+///     let val = folds.validation_indices(fold, &order);
+///     assert_eq!(val.len(), 5);
+///     for &i in val {
+///         seen[i] += 1;
+///     }
+///     // Das Training sieht kein Validierungs-Sample.
+///     assert!(folds.train_indices(fold, &order).all(|i| !val.contains(&i)));
+///     assert_eq!(folds.train_indices(fold, &order).count(), 15);
+///
+///     // Pro Fold ein frisches Netz; Voll-Batch-Training auf den Trainingsindizes.
+///     let mut trainer = Trainer::new(Dense::<1, 1, _>::new(Linear), Mse::new(), Sgd::new(0.3));
+///     for _ in 0..200 {
+///         trainer.train_batch(folds.train_indices(fold, &order).map(|i| (&xs[i][..], &ys[i][..])));
+///     }
+///     total += trainer.evaluate_batch(val.iter().map(|&i| (&xs[i][..], &ys[i][..])));
+/// }
+/// assert_eq!(seen, [1; 20]); // jedes Sample genau einmal in der Validierung
+/// assert!(total / 4.0 < 1e-3); // die Gerade wird auf allen Folds gefunden
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KFold {
+    n: usize,
+    k: usize,
+}
+
+impl KFold {
+    /// Teilt `n` Samples in `k` Folds.
+    ///
+    /// # Panics
+    /// Wenn `n == 0`, `k < 2` oder `k > n` ist.
+    pub const fn new(n: usize, k: usize) -> Self {
+        assert!(n > 0, "n muss > 0 sein");
+        assert!(k >= 2, "k muss >= 2 sein");
+        assert!(
+            k <= n,
+            "k darf n nicht übersteigen (jeder Fold braucht ein Validierungs-Sample)"
+        );
+        KFold { n, k }
+    }
+
+    /// Anzahl der Samples.
+    pub const fn n(&self) -> usize {
+        self.n
+    }
+
+    /// Anzahl der Folds.
+    pub const fn k(&self) -> usize {
+        self.k
+    }
+
+    /// Die Fold-Nummern `0..k`, zum Durchlaufen in `for fold in folds.folds()`.
+    pub fn folds(&self) -> Range<usize> {
+        0..self.k
+    }
+
+    /// Positionen in `order`, die Fold `fold` zur Validierung nutzt.
+    ///
+    /// Die Bereiche aller Folds schließen lückenlos aneinander an und decken `0..n` ab; die
+    /// ersten `n % k` Folds sind um eins länger.
+    ///
+    /// ```
+    /// use neuron::data::KFold;
+    ///
+    /// // 10 Samples in 3 Folds: 10 = 4 + 3 + 3.
+    /// let folds = KFold::new(10, 3);
+    /// assert_eq!(folds.validation_range(0), 0..4);
+    /// assert_eq!(folds.validation_range(1), 4..7);
+    /// assert_eq!(folds.validation_range(2), 7..10);
+    /// ```
+    ///
+    /// # Panics
+    /// Wenn `fold >= k`.
+    pub fn validation_range(&self, fold: usize) -> Range<usize> {
+        assert!(fold < self.k, "fold muss < k sein");
+        let (size, rest) = (self.n / self.k, self.n % self.k);
+        // `fold * size` liegt unter `n`: kein Überlauf.
+        let start = fold * size + fold.min(rest);
+        let len = size + usize::from(fold < rest);
+        start..start + len
+    }
+
+    /// Anzahl der Validierungs-Samples von `fold`.
+    ///
+    /// # Panics
+    /// Wenn `fold >= k`.
+    pub fn validation_len(&self, fold: usize) -> usize {
+        self.validation_range(fold).len()
+    }
+
+    /// Anzahl der Trainings-Samples von `fold`: `n` minus die Validierung.
+    ///
+    /// # Panics
+    /// Wenn `fold >= k`.
+    pub fn train_len(&self, fold: usize) -> usize {
+        self.n - self.validation_len(fold)
+    }
+
+    fn check_order(&self, order: &[usize]) {
+        assert_eq!(order.len(), self.n, "order muss genau n Indizes enthalten");
+    }
+
+    /// Die Validierungs-Indizes von `fold`: der Abschnitt [`validation_range`](Self::validation_range)
+    /// von `order`.
+    ///
+    /// # Panics
+    /// Wenn `fold >= k` oder `order.len() != n`.
+    pub fn validation_indices<'a>(&self, fold: usize, order: &'a [usize]) -> &'a [usize] {
+        self.check_order(order);
+        &order[self.validation_range(fold)]
+    }
+
+    /// Die Trainings-Indizes von `fold`: alle Einträge von `order` **außerhalb** der Validierung,
+    /// in der Reihenfolge von `order` (erst der Teil vor, dann der Teil nach dem Validierungsbereich).
+    ///
+    /// Der Iterator liest `order` nur, ist `Clone` und meldet seine Länge über `size_hint` genau
+    /// ([`train_len`](Self::train_len)). Für Mini-Batches genügt `skip` und `take`; beide springen
+    /// über Slices in konstanter Zeit:
+    ///
+    /// ```
+    /// use neuron::data::KFold;
+    ///
+    /// let order = [4, 1, 3, 0, 2, 5]; // etwa nach dem Mischen
+    /// let folds = KFold::new(6, 3); // Validierung je 2 Positionen
+    /// let train: Vec<usize> = folds.train_indices(1, &order).collect();
+    /// assert_eq!(train, [4, 1, 2, 5]); // Positionen 2 und 3 (die Samples 3 und 0) fehlen
+    ///
+    /// // Mini-Batches der Größe 3: die Positionen 0..3 und 3..4 des Trainingsteils.
+    /// let batch = |b: usize| folds.train_indices(1, &order).skip(b * 3).take(3).collect::<Vec<_>>();
+    /// assert_eq!(batch(0), [4, 1, 2]);
+    /// assert_eq!(batch(1), [5]);
+    /// ```
+    ///
+    /// # Panics
+    /// Wenn `fold >= k` oder `order.len() != n`.
+    pub fn train_indices<'a>(
+        &self,
+        fold: usize,
+        order: &'a [usize],
+    ) -> impl Iterator<Item = usize> + Clone + 'a {
+        self.check_order(order);
+        let range = self.validation_range(fold);
+        let (head, rest) = order.split_at(range.start);
+        let tail = &rest[range.len()..];
+        head.iter().chain(tail).copied()
+    }
+}
+
+/// Teilt einen (vorher gemischten) Index-Puffer in Training und Validierung: gibt
+/// `(train, val)` als Slices von `order` zurück, ohne zu kopieren.
+///
+/// Die **letzten** `val_len` Einträge bilden die Validierung, die davor das Training, mit
+///
+/// ```text
+/// val_len = round(n · val_fraction)      (halbe nach oben, n = order.len())
+/// ```
+///
+/// Für `0 < val_fraction < 1` und `n ≥ 2` bleibt keiner der beiden Teile leer: `val_len` wird auf
+/// `[1, n - 1]` begrenzt (sonst bekäme eine kleine Datenmenge mit kleinem Anteil stillschweigend
+/// keine Validierung). Die Ränder sind ausdrücklich erlaubt: `0.0` gibt alles ans Training, `1.0`
+/// alles an die Validierung. Ein leeres `order` liefert zwei leere Slices; bei `n = 1` entscheidet
+/// die Rundung, ohne Begrenzung.
+///
+/// `order` ist meist eine mit [`shuffle`](crate::rng::shuffle) gemischte Permutation von `0..n`;
+/// die Funktion ist aber für jeden Slice gültig (daher generisch über `T`). Für mehrere Folds statt
+/// eines einzelnen Split dient [`KFold`].
+///
+/// ```
+/// use neuron::data::train_val_split;
+///
+/// let mut order: [usize; 10] = core::array::from_fn(|i| i);
+/// neuron::rng::shuffle(&mut neuron::rng::Pcg32::seeded(3), &mut order);
+///
+/// let (train, val) = train_val_split(&order, 0.2);
+/// assert_eq!((train.len(), val.len()), (8, 2));
+/// assert_eq!(train, &order[..8]); // Slices von `order`, nichts wird kopiert
+/// assert_eq!(val, &order[8..]);
+///
+/// // Randfälle: kleiner Anteil auf kleiner Menge lässt die Validierung nicht leer ...
+/// assert_eq!(train_val_split(&[1, 2, 3], 0.1).1.len(), 1);
+/// // ... und der Rand 0.0 / 1.0 ist erlaubt.
+/// assert_eq!(train_val_split(&[1, 2, 3], 0.0).1.len(), 0);
+/// assert_eq!(train_val_split(&[1, 2, 3], 1.0).0.len(), 0);
+/// ```
+///
+/// # Panics
+/// Wenn `val_fraction` nicht in `[0, 1]` liegt (auch `NaN`).
+pub fn train_val_split<T>(order: &[T], val_fraction: f32) -> (&[T], &[T]) {
+    assert!(
+        (0.0..=1.0).contains(&val_fraction),
+        "val_fraction muss in [0, 1] liegen"
+    );
+    let n = order.len();
+    // `+ 0.5` und Abschneiden: auf die nächste ganze Zahl runden (halbe nach oben).
+    // Die Rechnung läuft in `f64` (exakt bis 2^53), weil `f32` oberhalb von 2^24 Stellen verliert.
+    let mut val = if val_fraction >= 1.0 {
+        n
+    } else {
+        (n as f64 * f64::from(val_fraction) + 0.5) as usize
+    };
+    if n >= 2 && val_fraction > 0.0 && val_fraction < 1.0 {
+        val = val.clamp(1, n - 1);
+    }
+    order.split_at(n - val.min(n))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,5 +649,72 @@ mod tests {
     #[should_panic(expected = "Merkmalszahl")]
     fn transform_rejects_a_wrong_feature_count() {
         Standardizer::<2>::from_parts([0.0; 2], [1.0; 2]).transform(&mut [1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn kfold_ranges_are_contiguous_and_balanced() {
+        let folds = KFold::new(10, 3);
+        assert_eq!(folds.validation_range(0), 0..4);
+        assert_eq!(folds.validation_range(1), 4..7);
+        assert_eq!(folds.validation_range(2), 7..10);
+        assert_eq!((folds.validation_len(0), folds.train_len(0)), (4, 6));
+        assert_eq!(folds.folds(), 0..3);
+    }
+
+    #[test]
+    fn kfold_train_indices_skip_exactly_the_validation_block() {
+        let order = [5usize, 3, 0, 4, 1, 2];
+        let folds = KFold::new(6, 3);
+        assert_eq!(folds.validation_indices(1, &order), &[0, 4]);
+        let mut train = [0usize; 4];
+        for (slot, i) in train.iter_mut().zip(folds.train_indices(1, &order)) {
+            *slot = i;
+        }
+        assert_eq!(train, [5, 3, 1, 2]);
+        assert_eq!(folds.train_indices(1, &order).count(), 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "k muss >= 2")]
+    fn kfold_rejects_a_single_fold() {
+        let _ = KFold::new(10, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "k darf n nicht übersteigen")]
+    fn kfold_rejects_more_folds_than_samples() {
+        let _ = KFold::new(3, 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "n muss > 0")]
+    fn kfold_rejects_no_samples() {
+        let _ = KFold::new(0, 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "genau n Indizes")]
+    fn kfold_rejects_an_order_of_the_wrong_length() {
+        let _ = KFold::new(4, 2).validation_indices(0, &[0, 1, 2]);
+    }
+
+    #[test]
+    fn split_rounds_half_up_and_keeps_both_parts_non_empty() {
+        let data = [0usize, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let (train, val) = train_val_split(&data, 0.25); // 2,5 -> 3
+        assert_eq!((train.len(), val.len()), (7, 3));
+        assert_eq!(val, &[7, 8, 9]);
+        assert_eq!(train_val_split(&data[..3], 0.1).1.len(), 1);
+        assert_eq!(train_val_split(&data[..3], 0.99).0.len(), 1);
+        assert_eq!(train_val_split(&data, 0.0).1.len(), 0);
+        assert_eq!(train_val_split(&data, 1.0).0.len(), 0);
+        let empty: [usize; 0] = [];
+        assert_eq!(train_val_split(&empty, 0.5), (&empty[..], &empty[..]));
+    }
+
+    #[test]
+    #[should_panic(expected = "val_fraction")]
+    fn split_rejects_nan() {
+        let _ = train_val_split(&[1, 2, 3], f32::NAN);
     }
 }

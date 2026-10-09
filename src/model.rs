@@ -14,12 +14,62 @@
 //! 16      4      Architektur-Fingerprint (u32, siehe Params::fingerprint)
 //! 20      4      CRC32 über die Bytes 0..20 und die Nutzdaten (u32)
 //! 24      4·n    Parameter, f32 little endian, in Export-Reihenfolge
+//!                (Dense: Gewichte, dann Bias; LayerNorm: gamma, dann beta)
 //! ```
 //!
 //! Beim Laden werden zuerst Magic, Version, Länge und Prüfsumme geprüft (ein
 //! beschädigtes Modell wird so als beschädigt erkannt und nicht als „falsche
 //! Architektur"), danach der Fingerprint gegen das Zielnetz. Erst wenn alles
 //! stimmt, wird geschrieben.
+//!
+//! ## Layer-Kennungen und Fingerprint
+//!
+//! Der Fingerprint ist der CRC32 über die Signaturen aller Bausteine in Vorwärtsrichtung. Eine
+//! Signatur sind 13 Bytes: die Art (1 Byte, [`LayerKind`](crate::params::LayerKind)), Eingangs-
+//! und Ausgangsdimension (je `u32`) und eine Kennung (`u32`), alles little endian. Die Kennung
+//! ist bei Dense die der Aktivierung ([`Activation::signature`](crate::activation::Activation::signature)),
+//! sonst eine andere stabile Konstante des Bausteins. Vergebene Werte ändern sich nie:
+//!
+//! ```text
+//! Art   Baustein                   Kennung (u32)
+//!   1   Dense                      Aktivierungs-Kennung
+//!   2   LayerNorm                  Bits von eps (f32::to_bits)
+//! 128   ResidualBegin (Marker)     0
+//! 129   ResidualEnd   (Marker)     0
+//! ```
+//!
+//! Die Marker 128 und 129 klammern die Signaturen des inneren Layers einer Skip-Verbindung
+//! ([`Residual`](crate::residual::Residual)): `x + f(x)` rechnet etwas anderes als `f(x)`, und
+//! derselbe Parametersatz darf nicht in beide Netze laden. Marker haben keine Parameter und zählen
+//! nicht zum Header-Feld „Anzahl parametertragender Layer“ (Offset 8), das die Dense- und
+//! LayerNorm-Layer zählt. Dropout bleibt unsichtbar. Netze ohne die neueren Bausteine behalten
+//! Fingerprint und Bytes unverändert (Golden-Test `tests/model_format.rs`).
+//!
+//! ```
+//! use neuron::model::{crc32, inspect, model_len};
+//! use neuron::norm::LayerNorm;
+//! use neuron::prelude::*;
+//! use neuron::residual::Residual;
+//!
+//! // Eine Skip-Verbindung um eine Layer-Normalisierung mit eps = 0,5 über 2 Merkmale.
+//! let net = Residual::new(LayerNorm::<2>::new().with_eps(0.5));
+//!
+//! // Drei Signaturen: ResidualBegin, LayerNorm (Kennung: Bits von eps), ResidualEnd.
+//! let mut bytes = Vec::new();
+//! for (kind, id) in [(128u8, 0u32), (2, 0.5f32.to_bits()), (129, 0)] {
+//!     bytes.push(kind);
+//!     bytes.extend_from_slice(&2u32.to_le_bytes()); // Eingang
+//!     bytes.extend_from_slice(&2u32.to_le_bytes()); // Ausgang
+//!     bytes.extend_from_slice(&id.to_le_bytes());
+//! }
+//! assert_eq!(net.fingerprint(), crc32(&bytes));
+//!
+//! // Im Header zählt nur der Layer mit Parametern (gamma und beta: 4 Werte).
+//! let mut buf = [0u8; model_len(4)];
+//! net.save_model(&mut buf).unwrap();
+//! let header = inspect(&buf).unwrap();
+//! assert_eq!((header.layer_count, header.param_count), (1, 4));
+//! ```
 //!
 //! Im Alltag genügen [`Params::save_model`] und [`Params::load_model`]; dieses Modul liefert
 //! dazu [`model_len`] (Puffergröße zur Compilezeit), [`inspect`] (Modell ohne Zielnetz
@@ -446,7 +496,8 @@ impl core::fmt::Display for ModelError {
 pub struct ModelHeader {
     /// Format-Version.
     pub version: u16,
-    /// Anzahl parametertragender Layer.
+    /// Anzahl parametertragender Layer (Dense, LayerNorm); Dropout und die Strukturmarker einer
+    /// Skip-Verbindung zählen nicht.
     pub layer_count: u32,
     /// Anzahl Parameter.
     pub param_count: u32,

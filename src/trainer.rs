@@ -281,6 +281,131 @@ impl<L: Layer, Ls: Loss, O: Optimizer> Trainer<L, Ls, O> {
         &mut self.opt
     }
 
+    /// Setzt den Optimizer in den Anfangszustand zurück: Der Tensor-Zustand (Adams Momente, die
+    /// Geschwindigkeit von [`Momentum`](crate::optim::Momentum), die langsamen Gewichte von
+    /// [`Lookahead`](crate::optim::Lookahead)) wird neu angelegt, und
+    /// [`Optimizer::reset`] setzt die Zähler im Optimizer zurück (Adams Schrittzähler `t`, der
+    /// Schrittzähler von `Lookahead`).
+    ///
+    /// Wann: nach dem **Laden von Parametern mitten im Training**
+    /// ([`network_mut`](Self::network_mut), etwa mit
+    /// [`load_model`](crate::params::Params::load_model)) oder wenn der Optimizer neu starten soll,
+    /// zum Beispiel für eine zweite Trainingsphase. Ohne das passt der alte Zustand nicht mehr zu den
+    /// Parametern: Adams Momente schieben die neuen Gewichte in die Richtung der alten, und
+    /// `Lookahead` zieht sie bei der nächsten Synchronisation zu den alten langsamen Gewichten
+    /// zurück. Was den Optimizer betrifft, verhält sich der Trainer danach wie ein frisch gebauter mit
+    /// denselben Parametern: Die langsamen Gewichte von `Lookahead` entstehen beim nächsten Schritt aus
+    /// den dann aktuellen Parametern, und `t` zählt wieder bei null. Zustand, der im **Netz** liegt,
+    /// bleibt unberührt, etwa die Zufallsfolge der Masken von [`Dropout`](crate::dropout::Dropout): Ein
+    /// Trainer mit Dropout rechnet nach dem Zurücksetzen deshalb nicht bitgleich wie ein frisch
+    /// gebauter.
+    ///
+    /// Was **erhalten bleibt**: das Netz samt Parametern, die Hyperparameter des Optimizers (auch eine
+    /// per [`set_learning_rate`](Self::set_learning_rate) geänderte Lernrate, Betas, `ε`, Zerfall,
+    /// `k` und `α` von `Lookahead`), der Verlust, das Clipping sowie bereits akkumulierte Gradienten
+    /// (sie lassen sich getrennt mit [`zero_grad`](Self::zero_grad) verwerfen).
+    ///
+    /// **Speicher:** Bei Stack-Netzen allokiert nichts. Bei Heap-Netzen (Feature `alloc`) entsteht
+    /// jeder Zustandspuffer neu, also eine Allokation je Puffer und Tensor (Momentum einen, Adam zwei,
+    /// AmsGrad drei je Tensor; [`Sgd`](crate::optim::Sgd) keinen) und eine weitere für die Liste der
+    /// Layer-Zustände, auch bei `Sgd`. Der alte Zustand wird freigegeben. Ein Netz mit zwei
+    /// Dense-Schichten hat vier Tensoren (je ein Gewicht und ein Bias), der Aufruf allokiert dann bei
+    /// `Sgd` einmal, bei Momentum fünfmal, bei Adam neunmal und bei AmsGrad dreizehnmal.
+    ///
+    /// Das erste Beispiel zeigt Adam. Drei Trainer machen denselben Schritt auf denselben Parametern;
+    /// nur wer den Zustand zurückgesetzt hat, ist bitgleich zu dem, der frisch beginnt:
+    ///
+    /// ```
+    /// use neuron::prelude::*;
+    ///
+    /// fn params<O: Optimizer>(t: &Trainer<Dense<1, 1, Linear>, Mse, O>) -> [f32; 2] {
+    ///     let mut p = [0.0f32; 2];
+    ///     t.network().copy_params_to_slice(&mut p).unwrap();
+    ///     p
+    /// }
+    /// let new_trainer = || Trainer::new(Dense::<1, 1, _>::new(Linear), Mse::new(), Adam::new(0.1));
+    ///
+    /// // Zwei Trainer lernen y = 2·x ein Stück (die Schritte gehen nach oben, Adams Momente zeigen
+    /// // ebenfalls dorthin), dann bekommen beide andere Parameter (w = 0, b = 0).
+    /// let mut stale = new_trainer();
+    /// let mut reset = new_trainer();
+    /// for t in [&mut stale, &mut reset] {
+    ///     for _ in 0..5 {
+    ///         t.train_step(&[1.0], &[2.0]);
+    ///     }
+    ///     t.network_mut().copy_params_from_slice(&[0.0, 0.0]).unwrap();
+    /// }
+    /// reset.reset_optimizer_state();
+    ///
+    /// // Ein dritter beginnt frisch mit denselben Parametern.
+    /// let mut fresh = new_trainer();
+    /// fresh.network_mut().copy_params_from_slice(&[0.0, 0.0]).unwrap();
+    ///
+    /// // Alle drei sehen jetzt ein Sample, dessen Schritt nach unten geht (Ziel -3, Vorhersage 0).
+    /// for t in [&mut stale, &mut reset, &mut fresh] {
+    ///     t.train_step(&[1.0], &[-3.0]);
+    /// }
+    /// // Frisch (und nach dem Zurücksetzen) hat Adams erster Schritt die Länge lr = 0,1 nach unten.
+    /// assert_eq!(params(&reset), params(&fresh));
+    /// assert!((params(&fresh)[0] + 0.1).abs() < 1e-6);
+    /// // Ohne Zurücksetzen treiben die alten Momente die Parameter noch nach oben.
+    /// assert!(params(&stale)[0] > 0.0);
+    ///
+    /// // Die Lernrate bleibt.
+    /// assert_eq!(reset.learning_rate(), 0.1);
+    /// ```
+    ///
+    /// Das zweite Beispiel zeigt `Lookahead` mit `k = 2`. Es ersetzt die Parameter mitten im Lauf
+    /// und macht zwei Schritte, beim zweiten greift die Synchronisation:
+    ///
+    /// ```
+    /// use neuron::prelude::*;
+    ///
+    /// fn params<O: Optimizer>(t: &Trainer<Dense<1, 1, Linear>, Mse, O>) -> [f32; 2] {
+    ///     let mut p = [0.0f32; 2];
+    ///     t.network().copy_params_to_slice(&mut p).unwrap();
+    ///     p
+    /// }
+    /// let new_trainer = || {
+    ///     let opt = Lookahead::new(Sgd::new(0.1)).with_sync_period(2).with_alpha(0.5);
+    ///     Trainer::new(Dense::<1, 1, _>::new(Linear), Mse::new(), opt)
+    /// };
+    ///
+    /// // Zwei Trainer lernen fünf Schritte lang y = 3 (ihre langsamen Gewichte liegen danach bei
+    /// // etwa 0,8), dann laden beide Parameter weit davon entfernt: w = b = 10. Die ungerade
+    /// // Schrittzahl ist Absicht: Ein nicht zurückgesetzter Zähler würde die Synchronisation von
+    /// // Schritt 2 auf Schritt 1 des neuen Abschnitts verschieben.
+    /// let mut stale = new_trainer();
+    /// let mut reset = new_trainer();
+    /// for t in [&mut stale, &mut reset] {
+    ///     for _ in 0..5 {
+    ///         t.train_step(&[1.0], &[3.0]);
+    ///     }
+    ///     t.network_mut().copy_params_from_slice(&[10.0, 10.0]).unwrap();
+    /// }
+    /// reset.reset_optimizer_state();
+    /// let mut fresh = new_trainer();
+    /// fresh.network_mut().copy_params_from_slice(&[10.0, 10.0]).unwrap();
+    ///
+    /// // Zwei Schritte auf demselben Sample; beim zweiten greift die Synchronisation.
+    /// for t in [&mut stale, &mut reset, &mut fresh] {
+    ///     t.train_step(&[1.0], &[3.0]);
+    ///     t.train_step(&[1.0], &[3.0]);
+    /// }
+    /// // Nach dem Zurücksetzen sind die langsamen Gewichte die geladenen Parameter (10): Die
+    /// // schnellen Gewichte laufen 10 -> 6,6 -> 4,56, die Synchronisation setzt sie auf
+    /// // 10 + 0,5 · (4,56 - 10) = 7,28. Der Trainer ist bitgleich zum frischen.
+    /// assert_eq!(params(&reset), params(&fresh));
+    /// assert!((params(&fresh)[0] - 7.28).abs() < 1e-4);
+    /// // Ohne Zurücksetzen mischt die Synchronisation die alten langsamen Gewichte unter und zieht
+    /// // die Parameter weit davon weg (auf etwa 2,8).
+    /// assert!(params(&stale)[0] < 3.0);
+    /// ```
+    pub fn reset_optimizer_state(&mut self) {
+        self.opt.reset();
+        self.state = self.net.init_opt_state(&self.opt);
+    }
+
     /// Aktuelle Lernrate des Optimizers (siehe [`set_learning_rate`](Self::set_learning_rate)).
     ///
     /// Sie liefert immer den Wert, den der Optimizer beim nächsten [`apply`](Self::apply)

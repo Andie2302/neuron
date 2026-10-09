@@ -4,6 +4,24 @@
 //! [`Loss::gradient`] schreibt `dL/dpred` in einen vom Aufrufer gestellten
 //! Puffer – es wird nichts allokiert.
 //!
+//! ## Übersicht
+//!
+//! `pred` ist die Netzausgabe (bei Logit-Verlusten die rohen Logits einer
+//! [`Linear`](crate::activation::Linear)-Schicht), `t` das Ziel. „Mittel“ heißt: Wert und
+//! Gradient sind Mittelwerte über die `n` Ausgabeelemente (Faktor `1/n`); „Summe“ heißt: Die
+//! Ausgabe ist **ein** Vektor von `K` Klassen, über den summiert wird – ein Skalar je Sample.
+//!
+//! | Verlust | `pred` | Ziel `t` | Reduktion |
+//! |---|---|---|---|
+//! | [`Mse`], [`Mae`], [`Huber`], [`LogCosh`] | beliebige Werte | Werte gleicher Größe | Mittel |
+//! | [`QuantileLoss`] | beliebige Werte | Werte gleicher Größe | Mittel |
+//! | [`Hinge`], [`SquaredHinge`] | rohe Werte | `-1` / `+1` | Mittel |
+//! | [`BinaryCrossEntropyWithLogits`], [`WeightedBinaryCrossEntropyWithLogits`], [`FocalLossWithLogits`] | Logits | `t ∈ [0, 1]` | Mittel |
+//! | [`PoissonNll`] | Log-Rate `ln λ` | Zählwert `t ≥ 0` | Mittel |
+//! | [`SoftmaxCrossEntropy`], [`LabelSmoothingCrossEntropy`] | `K` Logits | One-Hot oder Verteilung | Summe |
+//! | [`WeightedSoftmaxCrossEntropy`], [`FocalSoftmaxCrossEntropy`] | `K` Logits | One-Hot oder Verteilung | Summe |
+//! | [`KlDivergence`] | `K` Logits | Verteilung (Lehrer) | Summe |
+//!
 //! ## Einheitliche Konstruktoren
 //!
 //! **Jeder** Verlust wird mit `X::new(..)` erzeugt und hat ein [`Default`] mit den üblichen
@@ -14,10 +32,16 @@
 //!   Structs mit einer `const fn new()`. Außerhalb des Crates gibt es nur diesen einen Weg
 //!   (`Mse::new()`); ein später hinzukommender Parameter bricht dann keinen Aufrufer.
 //! * Verluste **mit Parametern** ([`Huber`], [`WeightedBinaryCrossEntropyWithLogits`],
-//!   [`FocalLossWithLogits`], [`LabelSmoothingCrossEntropy`]) prüfen ihre Werte in `new` (ungültige
-//!   Werte lösen einen `panic!` mit klarer Meldung aus) und halten die Felder **privat**; gelesen
-//!   werden sie über gleichnamige Getter. So lassen sich die Invarianten nicht per
-//!   Struktur-Literal umgehen. Optionale Parameter setzt ein validierter `with_*`-Builder.
+//!   [`FocalLossWithLogits`], [`LabelSmoothingCrossEntropy`], [`QuantileLoss`],
+//!   [`WeightedSoftmaxCrossEntropy`], [`FocalSoftmaxCrossEntropy`], [`KlDivergence`],
+//!   [`PoissonNll`]) prüfen ihre Werte in `new` (ungültige Werte lösen einen `panic!` mit klarer
+//!   Meldung aus) und halten die Felder **privat**; gelesen werden sie über gleichnamige Getter.
+//!   So lassen sich die Invarianten nicht per Struktur-Literal umgehen. Optionale Parameter setzt
+//!   ein validierter `with_*`-Builder. Bei [`KlDivergence`] und [`PoissonNll`] sind alle
+//!   Parameter optional; ihr `new()` hat deshalb keine Argumente (und ist `const`).
+//! * Die Klassenzahl `K` der Softmax-Verluste mit Klassengewichten ([`WeightedSoftmaxCrossEntropy`],
+//!   [`FocalSoftmaxCrossEntropy`]) steckt als Const Generic im Typ. Das Gewichtsfeld liegt dann
+//!   im Stack, und `K` wird bei jedem Aufruf gegen die Länge der Netzausgabe geprüft.
 //!
 //! ```
 //! use neuron::prelude::*;
@@ -30,13 +54,36 @@
 //! assert_eq!(plain.value(&[1.0, 3.0], &[0.0, 1.0]), 2.5);
 //! ```
 //!
+//! Die Verluste für gewichtete, fokussierte und destillierende Klassifikation, für Zähldaten und
+//! für Quantile folgen derselben Konvention:
+//!
+//! ```
+//! use neuron::loss::{
+//!     FocalSoftmaxCrossEntropy, KlDivergence, PoissonNll, QuantileLoss, WeightedSoftmaxCrossEntropy,
+//! };
+//!
+//! let weighted = WeightedSoftmaxCrossEntropy::new([1.0, 5.0, 1.0]); // Klasse 1 zählt fünffach
+//! assert_eq!(weighted.weights(), &[1.0, 5.0, 1.0]);
+//! let focal = FocalSoftmaxCrossEntropy::<3>::new(2.0); // oder .with_alpha([..]) je Klasse
+//! assert_eq!((focal.gamma(), focal.alpha()), (2.0, None));
+//! let distill = KlDivergence::new().with_temperature(4.0);
+//! assert_eq!(distill.temperature(), 4.0);
+//! assert!(!PoissonNll::new().full()); // ohne die Konstante ln t!
+//! assert_eq!(QuantileLoss::new(0.9).tau(), 0.9);
+//! assert_eq!(QuantileLoss::default().tau(), 0.5); // der Median
+//! ```
+//!
 //! ## Warum es keinen Verlust auf Wahrscheinlichkeiten gibt
 //!
 //! Die binäre Kreuzentropie gibt es nur als [`BinaryCrossEntropyWithLogits`]: Sie rechnet auf
 //! den rohen Logits einer `Linear`-Ausgabe. Ein Verlust auf den Wahrscheinlichkeiten einer
 //! `Sigmoid`-Ausgabe friert in `f32` ein (`σ(z)` ist für `z ≳ 17` exakt `1.0`, die
 //! Sigmoid-Ableitung dann exakt `0`), auch bei völlig falscher Vorhersage. Details und der
-//! Test dazu stehen bei [`BinaryCrossEntropyWithLogits`].
+//! Test dazu stehen bei [`BinaryCrossEntropyWithLogits`]. Ebenso rechnen die Softmax-Verluste
+//! auf Logits und [`PoissonNll`] auf der Log-Rate statt auf der Rate: Das Netz darf jede reelle
+//! Zahl ausgeben. Bei den Softmax-Verlusten stecken `exp` und `ln` im Verlust und werden dort
+//! überlauffrei ausgewertet. Bei [`PoissonNll`] läuft `e^z` ab `z > 88,72` auf `+∞` (Details
+//! bei [`PoissonNll`]).
 
 use crate::math;
 
@@ -49,7 +96,9 @@ use crate::math;
 /// Backward-Passes durch das Netz. Der Vertrag:
 ///
 /// * `pred`, `target` und `grad` sind gleich lang (die Ausgangsdimension des Netzes). `value` ist
-///   ein Skalar je Sample; die eingebauten Verluste mitteln dazu über die `n` Ausgabeelemente.
+///   ein Skalar je Sample; die elementweisen eingebauten Verluste mitteln dazu über die `n`
+///   Ausgabeelemente, die Softmax-Verluste summieren über die Klassen (Tabelle im
+///   [Moduldoc](self)).
 /// * `gradient` ist die Ableitung **genau dessen, was `value` zurückgibt**, einschließlich des
 ///   Faktors `1/n` eines Mittelwerts. Weichen beide voneinander ab, lernt das Netz in eine falsche
 ///   Richtung, ohne dass etwas meldet, warum. Die Probe ist der Vergleich mit zentralen
@@ -791,8 +840,1034 @@ impl Loss for LabelSmoothingCrossEntropy {
     }
 }
 
+/// Prüft Klassengewichte: jedes endlich und `>= 0`, mindestens eines `> 0`.
+///
+/// Ein Gewicht `0` ist erlaubt (die Klasse wird dann ignoriert). Lauter Nullen wären ein Verlust,
+/// der nie etwas lernt; das meldet die Prüfung, statt still zu bleiben.
+#[track_caller]
+fn assert_class_weights(weights: &[f32], name: &str) {
+    for (i, &w) in weights.iter().enumerate() {
+        assert!(
+            w.is_finite() && w >= 0.0,
+            "{name}[{i}] muss endlich und >= 0 sein"
+        );
+    }
+    assert!(
+        weights.iter().any(|&w| w > 0.0),
+        "{name} braucht mindestens ein Element > 0"
+    );
+}
+
+/// Prüft, dass die Netzausgabe so viele Elemente hat, wie die Klassenzahl `K` im Typ des
+/// Verlusts vorgibt. Ein Vergleich je Aufruf; ohne ihn würde `zip` bei einer falschen Länge still
+/// abschneiden und ein falsches Ergebnis liefern.
+#[inline]
+fn assert_class_count(len: usize, classes: usize) {
+    assert_eq!(
+        len, classes,
+        "Länge der Netzausgabe und Klassenzahl K des Verlusts passen nicht zusammen"
+    );
+}
+
+/// Gewichtete Softmax-Kreuzentropie auf **Logits**, mit einem Gewicht je Klasse
+/// (letzte Schicht: [`Linear`](crate::activation::Linear)). Das Mehrklassen-Gegenstück zu
+/// [`WeightedBinaryCrossEntropyWithLogits`], gedacht für unausgewogene Klassen.
+///
+/// Für `K` Logits `z`, `p = softmax(z)`, Klassengewichte `w` und ein Ziel `t` (One-Hot oder eine
+/// weiche Verteilung):
+///
+/// * Verlust: `L = -Σ_c w_c · t_c · ln p_c` (Summe über die `K` Klassen, ein Skalar je Sample).
+///   Ausgewertet wird `ln p_c = z_c - max - ln Σ exp(z - max)` (log-sum-exp, überlauffrei).
+/// * Gradient: `dL/dz_j = p_j · S - w_j · t_j` mit `S = Σ_c w_c · t_c`.
+///
+/// **Herleitung.** Aus `∂ ln p_c / ∂z_j = δ_cj - p_j` folgt
+/// `dL/dz_j = -Σ_c w_c t_c (δ_cj - p_j) = -w_j t_j + p_j Σ_c w_c t_c`. Der Faktor vor `p_j` ist
+/// `S = Σ w_c t_c`, **nicht** `Σ t_c`: Die bekannte Form `softmax - t` setzt `w = 1` und `Σ t = 1`
+/// voraus und ist mit Gewichten falsch (bei einem One-Hot-Ziel auf Klasse `y` ist der Gradient
+/// `w_y · (p - e_y)`). Die Summe der Gradienten über die Klassen ist `0`, weil `softmax`
+/// verschiebungsinvariant ist. Der Verlust ist [`SoftmaxCrossEntropy`] mit dem Ziel `w ⊙ t`.
+///
+/// ```
+/// use neuron::loss::{Loss, WeightedSoftmaxCrossEntropy};
+///
+/// // Drei gleich wahrscheinliche Klassen (Logits 0); das Ziel ist Klasse 1 mit Gewicht 4.
+/// let loss = WeightedSoftmaxCrossEntropy::new([1.0, 4.0, 2.0]);
+/// let z = [0.0f32; 3];
+/// let mut g = [0.0f32; 3];
+/// assert!((loss.value(&z, &[0.0, 1.0, 0.0]) - 4.0 * 3.0f32.ln()).abs() < 1e-5); // -4 ln ⅓
+/// loss.gradient(&z, &[0.0, 1.0, 0.0], &mut g); // w_y (p - e_y) = 4 · (⅓, ⅓ - 1, ⅓)
+/// assert!((g[0] - 4.0 / 3.0).abs() < 1e-6 && (g[1] + 8.0 / 3.0).abs() < 1e-6);
+///
+/// // Weiches Ziel (½, ½, 0): S = ½·1 + ½·4 = 2,5, also p·S - w⊙t = (0,833 - 0,5, 0,833 - 2, 0,833).
+/// // Mit `softmax - w⊙t` (S = Σ t = 1) käme (⅓ - 0,5, ⅓ - 2, ⅓) heraus – das wäre falsch.
+/// loss.gradient(&z, &[0.5, 0.5, 0.0], &mut g);
+/// assert!((g[0] - (2.5 / 3.0 - 0.5)).abs() < 1e-6);
+/// assert!((g[1] - (2.5 / 3.0 - 2.0)).abs() < 1e-6);
+/// assert!((g[2] - 2.5 / 3.0).abs() < 1e-6);
+/// assert!(g.iter().sum::<f32>().abs() < 1e-6); // Summe 0
+/// ```
+///
+/// # Gewichte
+///
+/// Jedes Gewicht muss endlich und `>= 0` sein, mindestens eines `> 0` (sonst wäre der Verlust
+/// konstant `0` und das Training stünde still). Ein Gewicht von `0` **blendet die Klasse aus**:
+/// Ein Sample, dessen Ziel nur auf solchen Klassen liegt, trägt weder Wert noch Gradient bei
+/// (vergleichbar mit `ignore_index` bei PyTorch). Der Standard ([`Default`]) ist `1` für jede
+/// Klasse; dann stimmt der Verlust für endliche Logits bitgleich mit [`SoftmaxCrossEntropy`]
+/// überein (ein Logit `-∞` mit Ziel `0` ist hier ausdrücklich erlaubt, dort nicht). Üblich bei
+/// unausgewogenen Klassen sind Gewichte umgekehrt proportional zur Häufigkeit `f_c`, etwa
+/// `w_c = 1 / (K · f_c)`; sie haben die Eigenschaft `Σ_c f_c · w_c = 1` (siehe unten).
+///
+/// ```
+/// use neuron::loss::{Loss, SoftmaxCrossEntropy, WeightedSoftmaxCrossEntropy};
+///
+/// let (z, t) = ([0.5f32, -1.0, 2.0], [0.0f32, 1.0, 0.0]);
+/// // Klasse 1 ausgeblendet: Das Ziel liegt auf ihr, also bleibt nichts übrig.
+/// let masked = WeightedSoftmaxCrossEntropy::new([1.0, 0.0, 1.0]);
+/// let mut g = [9.0f32; 3];
+/// masked.gradient(&z, &t, &mut g);
+/// assert_eq!((masked.value(&z, &t), g), (0.0, [0.0; 3]));
+///
+/// // Standard: alle Gewichte 1, bitgleich zu SoftmaxCrossEntropy.
+/// let plain = WeightedSoftmaxCrossEntropy::<3>::default();
+/// assert_eq!(plain.weights(), &[1.0; 3]);
+/// assert_eq!(plain.value(&z, &t), SoftmaxCrossEntropy::new().value(&z, &t));
+/// ```
+///
+/// # Mini-Batches und effektive Lernrate
+///
+/// Der [`Trainer`](crate::trainer::Trainer) mittelt einen Mini-Batch über
+/// [`accumulate`](crate::trainer::Trainer::accumulate) und [`apply(n)`](crate::trainer::Trainer::apply):
+/// Die Gradienten der Samples werden summiert und durch die **Zahl der Samples** `n` geteilt. Er
+/// teilt **nicht** wie PyTorchs `CrossEntropyLoss(weight=..)` (Reduktion `mean`) durch die Summe
+/// der Gewichte `Σ_i w_{y_i}` der Ziele im Batch. Das hat Folgen:
+///
+/// * Ein Batch, dessen Samples alle zu Klassen mit Gewicht `w` gehören, liefert einen
+///   `w`-mal so großen Gradienten wie der ungewichtete Verlust (bei PyTorch: denselben). Bei
+///   [`Sgd`](crate::optim::Sgd) und [`Momentum`](crate::optim::Momentum) wächst der Parameterschritt
+///   im selben Maß, die **effektive Lernrate** ist `η · w̄` mit dem mittleren Gewicht `w̄` der
+///   Samples im Batch.
+/// * Optimizer, die den Gradienten normieren ([`Adam`](crate::optim::Adam) und Verwandte), merken
+///   einen konstanten Faktor kaum (bis auf `epsilon`). Das Clipping nach Norm
+///   ([`set_grad_clip_norm`](crate::trainer::Trainer::set_grad_clip_norm)) greift dagegen
+///   entsprechend früher, weil die Norm mitwächst.
+/// * Die Gewichte verschieben außerdem das Verhältnis der Klassen untereinander; nur der
+///   gemeinsame Faktor ist ein Lernraten-Effekt.
+///
+/// Soll der mittlere Gradient die Größenordnung des ungewichteten Verlusts behalten, skaliert man
+/// die Gewichte so, dass ihr Mittel über die Klassenhäufigkeiten `1` ist: `Σ_c f_c · w_c = 1`.
+/// Die genannten Gewichte `w_c = 1 / (K · f_c)` erfüllen das automatisch. Das gilt im Mittel über
+/// viele Batches; ein einzelner Batch mit anderer Zusammensetzung weicht ab (PyTorch normiert
+/// dagegen jeden Batch einzeln). Das Beispiel zeigt den Faktor an einem einzigen Schritt: Bei
+/// Gewicht `4` auf der Zielklasse ist der Schritt viermal so groß wie ungewichtet, bei Gewicht
+/// `¼` ein Viertel:
+///
+/// ```
+/// use neuron::loss::WeightedSoftmaxCrossEntropy;
+/// use neuron::prelude::*;
+///
+/// // Alle Parameter starten bei 0, also ist p = (½, ½). Vier Samples der Klasse 0, ein Schritt.
+/// fn first_step<Ls: Loss>(loss: Ls) -> f32 {
+///     let mut trainer = Trainer::new(Dense::<1, 2, _>::new(Linear), loss, Sgd::new(0.1));
+///     let sample = (&[1.0f32][..], &[1.0f32, 0.0][..]);
+///     trainer.train_batch([sample; 4]);
+///     trainer.network().bias_as_slice()[0] // Bias der Klasse 0: η · (1 - p_0) · Gewicht
+/// }
+///
+/// let plain = first_step(SoftmaxCrossEntropy::new());
+/// let heavy = first_step(WeightedSoftmaxCrossEntropy::new([4.0, 1.0]));
+/// let light = first_step(WeightedSoftmaxCrossEntropy::new([0.25, 1.0]));
+/// assert!((plain - 0.05).abs() < 1e-6); // 0,1 · 0,5
+/// assert!((heavy - 4.0 * plain).abs() < 1e-6, "{heavy}: viermal so groß, nicht gleich groß");
+/// assert!((light - plain / 4.0).abs() < 1e-6);
+/// ```
+///
+/// # Panics
+/// * In [`new`](Self::new) bei einem Gewicht, das nicht endlich oder `< 0` ist (auch `NaN`), und
+///   wenn kein Gewicht `> 0` ist.
+/// * In `value` und `gradient`, wenn die Netzausgabe nicht genau `K` Elemente hat.
+///
+/// `K == 0` kompiliert nicht. Die Beispiele fangen die Panik ab (Doctests laufen mit `std`) und
+/// prüfen die Meldung; ein einfaches `should_panic` würde jede beliebige Panik akzeptieren:
+///
+/// ```
+/// use neuron::loss::{Loss, WeightedSoftmaxCrossEntropy};
+///
+/// fn message(f: impl FnOnce() + std::panic::UnwindSafe) -> String {
+///     let payload = std::panic::catch_unwind(f).unwrap_err();
+///     match payload.downcast_ref::<String>() {
+///         Some(text) => text.clone(),
+///         None => payload.downcast_ref::<&str>().unwrap().to_string(),
+///     }
+/// }
+///
+/// assert_eq!(
+///     message(|| drop(WeightedSoftmaxCrossEntropy::new([1.0, -0.5]))),
+///     "weights[1] muss endlich und >= 0 sein"
+/// );
+/// assert_eq!(
+///     message(|| drop(WeightedSoftmaxCrossEntropy::new([0.0, 0.0]))),
+///     "weights braucht mindestens ein Element > 0"
+/// );
+/// // Zwei Logits, aber K = 3:
+/// let loss = WeightedSoftmaxCrossEntropy::<3>::default();
+/// assert!(message(|| drop(loss.value(&[0.0, 1.0], &[1.0, 0.0]))).contains("Klassenzahl K"));
+/// ```
+///
+/// ```compile_fail,E0080
+/// let _ = neuron::loss::WeightedSoftmaxCrossEntropy::<0>::new([]);
+/// ```
+///
+/// # Speicher und Rechenaufwand
+/// Die Gewichte liegen als `[f32; K]` im Wert selbst; `value` und `gradient` brauchen keinen
+/// Hilfspuffer und rechnen in `O(K)` mit einem `exp` je Klasse. Sehr große Gewichte (nahe
+/// `f32::MAX`) lassen `S` und den Wert überlaufen.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WeightedSoftmaxCrossEntropy<const K: usize> {
+    /// Gewicht je Klasse: endlich, `>= 0`, mindestens eines `> 0`.
+    weights: [f32; K],
+}
+
+impl<const K: usize> WeightedSoftmaxCrossEntropy<K> {
+    /// Verlust mit den Klassengewichten `weights`.
+    ///
+    /// # Panics
+    /// Wenn ein Gewicht nicht endlich oder `< 0` ist (auch `NaN`) oder kein Gewicht `> 0` ist.
+    /// `K == 0` ist ein Compilerfehler.
+    #[track_caller]
+    pub fn new(weights: [f32; K]) -> Self {
+        const {
+            assert!(K > 0, "K muss > 0 sein");
+        }
+        assert_class_weights(&weights, "weights");
+        WeightedSoftmaxCrossEntropy { weights }
+    }
+
+    /// Die Klassengewichte (Standard: für jede Klasse `1.0`).
+    pub fn weights(&self) -> &[f32; K] {
+        &self.weights
+    }
+}
+
+impl<const K: usize> Default for WeightedSoftmaxCrossEntropy<K> {
+    fn default() -> Self {
+        Self::new([1.0; K])
+    }
+}
+
+impl<const K: usize> Loss for WeightedSoftmaxCrossEntropy<K> {
+    fn value(&self, logits: &[f32], target: &[f32]) -> f32 {
+        debug_assert_eq!(logits.len(), target.len());
+        assert_class_count(logits.len(), K);
+        let (max, lse) = log_sum_exp(logits);
+        let mut sum = 0.0;
+        for ((&l, &t), &w) in logits.iter().zip(target).zip(&self.weights) {
+            let weighted = w * t;
+            // `0 · ln 0 = 0`: Auch eine ausgeblendete oder maskierte Klasse (Logit `-∞`) trägt
+            // nichts bei, statt `0 · ∞ = NaN` zu liefern.
+            if weighted != 0.0 {
+                sum -= weighted * (l - max - lse);
+            }
+        }
+        sum
+    }
+
+    fn gradient(&self, logits: &[f32], target: &[f32], grad: &mut [f32]) {
+        debug_assert!(logits.len() == target.len() && logits.len() == grad.len());
+        assert_class_count(logits.len(), K);
+        let (max, lse) = log_sum_exp(logits);
+        let weighted_sum: f32 = target.iter().zip(&self.weights).map(|(&t, &w)| w * t).sum();
+        for (((g, &l), &t), &w) in grad.iter_mut().zip(logits).zip(target).zip(&self.weights) {
+            *g = math::exp(l - max - lse) * weighted_sum - w * t;
+        }
+    }
+}
+
+/// `(max, ln Σ exp(l / T - max))` mit `max` über `l / T` – das Log-Softmax der durch die
+/// Temperatur `T` geteilten Logits.
+fn log_sum_exp_scaled(logits: &[f32], temperature: f32) -> (f32, f32) {
+    let max = logits
+        .iter()
+        .map(|&l| l / temperature)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let sum: f32 = logits
+        .iter()
+        .map(|&l| math::exp(l / temperature - max))
+        .sum();
+    (max, math::ln(sum))
+}
+
+/// Kullback-Leibler-Divergenz einer **weichen Zielverteilung** gegen die Softmax-Verteilung der
+/// Logits, der Verlust der Wissensdestillation (Hinton et al.): Ein „Schüler“ lernt die
+/// Ausgabeverteilung eines „Lehrers“, die als Ziel `t` vorliegt.
+///
+/// Für `K` Logits `z`, die Temperatur `T` (Standard `1`) und `p = softmax(z / T)`:
+///
+/// * Verlust: `L = T² · Σ_c t_c · (ln t_c - ln p_c)` (Summe über die Klassen, ein Skalar je
+///   Sample), mit `0 · ln 0 = 0`: Klassen mit `t_c = 0` tragen nichts bei, auch wenn ihr Logit
+///   `-∞` ist (maskierte Klassen). `ln p_c` kommt aus log-sum-exp, nie aus einem Softmax-Wert.
+/// * Gradient: `dL/dz_j = T · (S · p_j - t_j)` mit `S = Σ_c t_c`. Für `T = 1` und eine
+///   Verteilung (`S = 1`) ist das das bekannte `softmax(z) - t`.
+///
+/// ```
+/// use neuron::loss::{KlDivergence, Loss};
+///
+/// let kl = KlDivergence::new();
+/// let teacher = [0.7f32, 0.2, 0.1];
+/// // Gleichverteilte Logits: KL(t ‖ ⅓) = Σ t ln(3 t) = 0,29679 (unabhängig berechnet).
+/// let v = kl.value(&[0.0; 3], &teacher);
+/// assert!((v - 0.296_794).abs() < 1e-5, "{v}");
+/// // Der Schüler trifft den Lehrer, wenn seine Logits ln t sind: Verlust und Gradient 0.
+/// let z = teacher.map(f32::ln);
+/// let mut g = [9.0f32; 3];
+/// kl.gradient(&z, &teacher, &mut g);
+/// assert!(kl.value(&z, &teacher).abs() < 1e-6 && g.iter().all(|x| x.abs() < 1e-6));
+/// // Nullen im Ziel (`0 · ln 0 = 0`): Ein hartes Ziel gibt ln 2, nicht NaN.
+/// let v = kl.value(&[0.0, 0.0], &[1.0, 0.0]);
+/// assert!((v - core::f32::consts::LN_2).abs() < 1e-6);
+/// ```
+///
+/// # Temperatur
+///
+/// Eine Temperatur `T > 1` glättet die Verteilung des Schülers. Der Lehrer muss mit derselben
+/// Temperatur geglättet werden; das ist Sache des Aufrufers, der das Ziel als
+/// `softmax(z_Lehrer / T)` bildet. [`temperature`](Self::temperature) liefert den passenden Wert.
+///
+/// **Entscheidung: Der Faktor `T²` ist eingebaut.** Der Verlust ist `T² · KL(t ‖ softmax(z / T))`
+/// (Hinton et al. 2015). Die Gradienten der weichen Ziele schrumpfen mit wachsendem `T` etwa wie
+/// `1/T²`: `softmax(z / T) - t` und die innere Ableitung `1/T` werden beide kleiner. Ohne den
+/// Faktor müsste die Lernrate mit `T²` nachgeführt werden; mit ihm bleibt die Größe des Gradienten
+/// unabhängig von `T`. Für große `T` ist nämlich `T · (p - t) ≈ ((z - z̄) - (v - v̄)) / K`, mit den
+/// Mittelwerten `z̄` und `v̄` der Logits von Schüler `z` und Lehrer `v`; darin kommt `T` nicht mehr
+/// vor (das Beispiel unten zeigt es).
+///
+/// Eingebaut ist der Faktor, weil ein [`Loss`] hier ein Ziel und einen Verlustwert hat und der
+/// [`Trainer`](crate::trainer::Trainer) kein Verlust-Gewicht kennt: Von außen ließe sich der
+/// Faktor nur über die Lernrate ausgleichen, nicht im gemeldeten Wert und nicht beim Clipping.
+/// Für `T = 1` (Standard) ist der Faktor `1`, dann ist der Verlust die reine KL-Divergenz. Wer den
+/// Verlust ohne den Faktor will, schreibt einen eigenen `Loss` (siehe das Beispiel beim Trait).
+///
+/// ```
+/// use neuron::loss::{KlDivergence, Loss};
+/// use neuron::math::softmax_inplace;
+///
+/// // Gradientengröße bei verschiedenen Temperaturen: Lehrerlogits v, Schülerlogits z.
+/// let (v, z) = ([2.0f32, 0.0, -2.0], [0.5f32, 0.0, -1.0]);
+/// let size = |t: f32| {
+///     let mut teacher = v.map(|x| x / t);
+///     softmax_inplace(&mut teacher); // Ziel: Lehrer bei derselben Temperatur
+///     let mut g = [0.0f32; 3];
+///     KlDivergence::new().with_temperature(t).gradient(&z, &teacher, &mut g);
+///     g.iter().map(|x| x * x).sum::<f32>().sqrt()
+/// };
+/// // Mit dem Faktor T² bleibt die Größe für große T nahezu gleich (ohne ihn fiele sie mit 1/T²).
+/// let (g8, g16) = (size(8.0), size(16.0));
+/// assert!((g16 / g8 - 1.0).abs() < 0.1, "{g8} vs {g16}");
+/// // Und der Wert ist genau T² mal die KL-Divergenz gegen softmax(z / T).
+/// let t = 4.0f32;
+/// let mut teacher = v.map(|x| x / t);
+/// softmax_inplace(&mut teacher);
+/// let mut student = z.map(|x| x / t);
+/// softmax_inplace(&mut student);
+/// let kl: f32 = teacher.iter().zip(&student).map(|(a, b)| a * (a / b).ln()).sum();
+/// let v = KlDivergence::new().with_temperature(t).value(&z, &teacher);
+/// assert!((v - t * t * kl).abs() < 1e-5, "{v} vs {}", t * t * kl);
+/// ```
+///
+/// # Ziel und Wertebereich
+///
+/// Das Ziel ist eine Verteilung: `t_c >= 0`, `Σ t = 1`. Negative Einträge machen den Wert `NaN`
+/// (`ln` einer negativen Zahl), der Gradient bliebe formal endlich; ein `NaN` im Wert zeigt den
+/// Fehler im Ziel. Für `Σ t = 1` ist `L >= 0` (bis auf Rundung von etwa `1e-7`, die den Wert
+/// in der Nähe von `0` kurz unter `0` bringen kann) und genau dann `0`, wenn `softmax(z / T) = t`.
+/// Ist `S = Σ t ≠ 1`, ist der Gradient weiter die exakte Ableitung des Werts, aber der Wert
+/// ist keine Divergenz mehr: Sein Minimum über `z` liegt bei `softmax(z / T) = t / S` und
+/// beträgt `T² · S · ln S` (negativ für `S < 1`). Für `T = 1` gilt außerdem: Mit
+/// einem One-Hot-Ziel ist `KL` gleich der [`SoftmaxCrossEntropy`], mit einem weichen Ziel ist sie
+/// um die Entropie `H(t)` kleiner (`CE = KL + H`); beide haben denselben Gradienten.
+///
+/// ```
+/// use neuron::loss::{KlDivergence, Loss};
+///
+/// // Summe 0,7 statt 1: Der Gradient ist 0,7·p - t, sein Nullpunkt liegt bei p = t / 0,7, und
+/// // dort ist der Wert 0,7·ln 0,7 < 0 – keine Divergenz mehr.
+/// let kl = KlDivergence::new();
+/// let t = [0.4f32, 0.2, 0.1];
+/// let z = t.map(|x| (x / 0.7).ln());
+/// assert!((kl.value(&z, &t) - 0.7 * 0.7f32.ln()).abs() < 1e-5);
+/// let mut g = [9.0f32; 3];
+/// kl.gradient(&z, &t, &mut g);
+/// assert!(g.iter().all(|x| x.abs() < 1e-6));
+/// // Ein negativer Eintrag im Ziel macht den Wert zu NaN.
+/// assert!(kl.value(&[0.0, 0.0], &[1.5, -0.5]).is_nan());
+/// ```
+///
+/// Einzelne Logits `-∞` sind erlaubt (Klasse mit Wahrscheinlichkeit `0`). Ist dabei `t_c > 0`,
+/// ist der Wert `+∞`, weil die Divergenz unendlich ist. `+∞`, `NaN` und lauter `-∞` ergeben
+/// `NaN`. Sehr kleine Temperaturen lassen `z / T` überlaufen, sehr große (`T² > f32::MAX`,
+/// also `T > 1e19`) den Faktor; üblich sind `T` zwischen `1` und etwa `20`.
+///
+/// # Panics
+/// In [`with_temperature`](Self::with_temperature), wenn `T` nicht endlich und `> 0` ist:
+///
+/// ```
+/// use neuron::loss::KlDivergence;
+///
+/// fn message(f: impl FnOnce() + std::panic::UnwindSafe) -> String {
+///     let payload = std::panic::catch_unwind(f).unwrap_err();
+///     match payload.downcast_ref::<String>() {
+///         Some(text) => text.clone(),
+///         None => payload.downcast_ref::<&str>().unwrap().to_string(),
+///     }
+/// }
+///
+/// for bad in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+///     assert_eq!(
+///         message(move || drop(KlDivergence::new().with_temperature(bad))),
+///         "temperature muss endlich und > 0 sein"
+///     );
+/// }
+/// ```
+///
+/// # Speicher und Rechenaufwand
+/// Kein Hilfspuffer; `O(K)` mit einem `exp`, einem `ln` (nur für `t_c > 0`) und einer Division
+/// je Klasse.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct KlDivergence {
+    /// Temperatur `T > 0`.
+    temperature: f32,
+}
+
+impl KlDivergence {
+    /// KL-Divergenz mit Temperatur `1`. Gleichwertig zu [`Default::default`].
+    pub const fn new() -> Self {
+        KlDivergence { temperature: 1.0 }
+    }
+
+    /// Setzt die Temperatur `T`, mit der die Logits geteilt werden (und die den Faktor `T²` im
+    /// Verlust bestimmt, siehe oben).
+    ///
+    /// # Panics
+    /// Wenn `temperature` nicht endlich und `> 0` ist.
+    #[track_caller]
+    pub fn with_temperature(mut self, temperature: f32) -> Self {
+        assert_positive_finite(temperature, "temperature");
+        self.temperature = temperature;
+        self
+    }
+
+    /// Temperatur `T` (Standard `1.0`).
+    pub fn temperature(&self) -> f32 {
+        self.temperature
+    }
+}
+
+impl Default for KlDivergence {
+    fn default() -> Self {
+        KlDivergence::new()
+    }
+}
+
+impl Loss for KlDivergence {
+    fn value(&self, logits: &[f32], target: &[f32]) -> f32 {
+        debug_assert_eq!(logits.len(), target.len());
+        let temperature = self.temperature;
+        let (max, lse) = log_sum_exp_scaled(logits, temperature);
+        let mut sum = 0.0;
+        for (&l, &t) in logits.iter().zip(target) {
+            // `0 · ln 0 = 0`; für `t < 0` bleibt `ln t = NaN` und meldet das ungültige Ziel.
+            if t != 0.0 {
+                let log_p = l / temperature - max - lse;
+                sum += t * (math::ln(t) - log_p);
+            }
+        }
+        temperature * temperature * sum
+    }
+
+    fn gradient(&self, logits: &[f32], target: &[f32], grad: &mut [f32]) {
+        debug_assert!(logits.len() == target.len() && logits.len() == grad.len());
+        let temperature = self.temperature;
+        let (max, lse) = log_sum_exp_scaled(logits, temperature);
+        let t_sum: f32 = target.iter().sum();
+        for ((g, &l), &t) in grad.iter_mut().zip(logits).zip(target) {
+            let p = math::exp(l / temperature - max - lse);
+            *g = temperature * (p * t_sum - t);
+        }
+    }
+}
+
+/// Konstante `ln t! = ln Γ(t + 1)` des Poisson-NLL; `NaN` für `t < 0` (kein Zählwert).
+fn ln_factorial(t: f32) -> f32 {
+    if t < 0.0 {
+        f32::NAN
+    } else {
+        libm::lgammaf(t + 1.0)
+    }
+}
+
+/// Negativer Log-Likelihood einer Poisson-Verteilung für **Zähldaten**. Das Netz gibt die
+/// **Log-Rate** `z = ln λ` aus (letzte Schicht: [`Linear`](crate::activation::Linear)); die Rate
+/// `λ = e^z` ist damit immer positiv, ohne dass der Ausgang begrenzt werden muss.
+///
+/// Für das Ziel `t >= 0` (ein Zählwert; bei Raten darf `t` auch nichtganzzahlig sein) ist
+/// `-ln P(t | λ) = λ - t · ln λ + ln t!`. Der Verlust ist davon der Teil, der vom Netz abhängt:
+///
+/// * Verlust: `L = e^z - t · z` (Mittel über die `n` Ausgabeelemente). Mit
+///   [`with_full`](Self::with_full)`(true)` kommt die Konstante `ln t! = ln Γ(t + 1)` dazu.
+/// * Gradient: `dL/dz = (e^z - t) / n`: vorhergesagte minus beobachtete Rate, ohne Einfluss der
+///   Konstante. Bei einem Ausgang ist das `e^z - t`.
+///
+/// **Entscheidung zur Konstante.** Standardmäßig fehlt `ln t!`. Sie hängt nicht vom Netz ab,
+/// ändert also weder Gradient noch Optimum, und `lgamma` je Element kostet Rechenzeit. Der Wert
+/// ist dann nicht der echte NLL (er kann negativ sein, z. B. `e^z - t z` mit `z = ln t` ist
+/// `t - t ln t < 0` für `t > e`); Vergleiche zwischen Modellen auf **denselben** Daten bleiben
+/// gültig, weil die Konstante für beide gleich ist. Wer den NLL berichten oder über
+/// verschiedene Datensätze vergleichen will, schaltet sie mit `with_full(true)` ein; dann ist
+/// der Wert für ganzzahlige `t` ein echter negativer Log-Likelihood (`>= 0`). `ln t!` wird als
+/// `ln Γ(t + 1)` mit `libm::lgammaf` berechnet (für `t = 0` und `t = 1` exakt `0`); in `f32` ist
+/// das für große Zählwerte nur auf einige Stellen genau (für `t ≈ 10⁶` ist `ln t! ≈ 1,3·10⁷`,
+/// die Auflösung dort `1`).
+///
+/// ```
+/// use neuron::loss::{Loss, PoissonNll};
+///
+/// let nll = PoissonNll::new();
+/// // Bei z = ln t verschwindet der Gradient: die Rate trifft die Beobachtung.
+/// let z = 3.0f32.ln();
+/// let mut g = [9.0f32];
+/// nll.gradient(&[z], &[3.0], &mut g);
+/// assert!(g[0].abs() < 1e-6);
+/// // L = e^z - t z = 3 - 3 ln 3 = -0,2958 (ohne ln t!), mit ln 3! = ln 6: 1,4959 (echter NLL).
+/// assert!((nll.value(&[z], &[3.0]) + 0.295_837).abs() < 1e-5);
+/// let full = PoissonNll::new().with_full(true);
+/// assert!((full.value(&[z], &[3.0]) - 1.495_923).abs() < 1e-5);
+/// // Für ein Ziel 0 ist L = e^z: ein reiner Strafterm auf die Rate.
+/// assert!((nll.value(&[2.0], &[0.0]) - 2.0f32.exp()).abs() < 1e-5);
+/// // Bei mehreren Ausgängen wird gemittelt (Wert und Gradient tragen den Faktor 1/n).
+/// let (z, t) = ([0.0f32, 1.0], [0.0f32, 0.0]);
+/// assert!((nll.value(&z, &t) - (1.0 + 1.0f32.exp()) / 2.0).abs() < 1e-6);
+/// let mut g = [0.0f32; 2];
+/// nll.gradient(&z, &t, &mut g);
+/// assert!((g[0] - 0.5).abs() < 1e-6 && (g[1] - 1.0f32.exp() / 2.0).abs() < 1e-6);
+/// ```
+///
+/// # Große Log-Raten und Überlauf
+///
+/// `e^z` läuft in `f32` für `z > ln(f32::MAX) ≈ 88,72` auf `+∞`. Der Verlust schneidet dort
+/// **nicht** ab (eine Begrenzung würde ein divergiertes Netz verbergen): Wert und Gradient
+/// sind `+∞`, auch für `z = +∞`. Das ist beim Training ein Warnsignal, kein stiller Fehler:
+/// Mit [`set_grad_clip_norm`](crate::trainer::Trainer::set_grad_clip_norm) überspringt der
+/// Trainer einen Schritt mit nicht endlichem Gradienten, ohne Clipping würden die Parameter
+/// `∞`/`NaN`. Wegen `exp` im Gradienten ist der Verlust nicht Lipschitz-stetig; ein Bias, der
+/// bei `ln(mittlerer Zählwert)` startet, und moderate Lernraten (oder Clipping) halten das Training
+/// in der Praxis im sicheren Bereich. Sehr negative `z` sind unkritisch: `e^z` wird `0`, der
+/// Wert `-t · z` bleibt endlich (`z = -1000`, `t = 2` gibt `2000`), der Gradient ist `-t`. Ein
+/// Ziel `t = 0` lässt den Term `t · z` weg, damit `z = ±∞` kein `0 · ∞` ergibt.
+///
+/// ```
+/// use neuron::loss::{Loss, PoissonNll};
+///
+/// let nll = PoissonNll::new();
+/// let mut g = [0.0f32];
+/// nll.gradient(&[100.0], &[3.0], &mut g); // e^100 > f32::MAX
+/// assert_eq!((nll.value(&[100.0], &[3.0]), g[0]), (f32::INFINITY, f32::INFINITY));
+/// nll.gradient(&[-1000.0], &[2.0], &mut g);
+/// assert_eq!((nll.value(&[-1000.0], &[2.0]), g[0]), (2000.0, -2.0));
+/// // z = +∞ ist ∞ (nicht NaN), und mit Ziel 0 ergibt z = -∞ kein 0 · ∞: Rate 0, Verlust 0.
+/// assert_eq!(nll.value(&[f32::INFINITY], &[3.0]), f32::INFINITY);
+/// nll.gradient(&[f32::NEG_INFINITY], &[0.0], &mut g);
+/// assert_eq!((nll.value(&[f32::NEG_INFINITY], &[0.0]), g[0]), (0.0, 0.0));
+/// ```
+///
+/// # Ziele
+/// Die Ziele müssen `>= 0` sein. Negative Ziele werden nicht geprüft; ohne `with_full` bleibt
+/// der Wert eine gewöhnliche Zahl, mit `with_full(true)` ist er dann `NaN` (kein Zählwert).
+///
+/// # Speicher und Rechenaufwand
+/// Kein Hilfspuffer; `O(n)` mit einem `exp` je Element (mit `with_full` zusätzlich ein `lgamma`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PoissonNll {
+    /// `true`: die Konstante `ln t!` gehört zum Wert.
+    full: bool,
+}
+
+impl PoissonNll {
+    /// Poisson-NLL ohne die Konstante `ln t!`. Gleichwertig zu [`Default::default`].
+    pub const fn new() -> Self {
+        PoissonNll { full: false }
+    }
+
+    /// Mit `true` gehört die Konstante `ln t!` zum Verlustwert (echter NLL); der Gradient ändert
+    /// sich nicht.
+    pub const fn with_full(self, full: bool) -> Self {
+        PoissonNll { full }
+    }
+
+    /// Ob `ln t!` im Wert enthalten ist (Standard `false`).
+    pub const fn full(&self) -> bool {
+        self.full
+    }
+}
+
+impl Loss for PoissonNll {
+    fn value(&self, log_rate: &[f32], target: &[f32]) -> f32 {
+        debug_assert_eq!(log_rate.len(), target.len());
+        let sum: f32 = log_rate
+            .iter()
+            .zip(target)
+            .map(|(&z, &t)| {
+                let rate = math::exp(z);
+                // Ohne `t · z` bei `t = 0` (sonst `0 · ∞ = NaN`) und bei `rate = ∞` (sonst
+                // `∞ - ∞ = NaN` für `z = +∞`): dort ist der Verlust `rate`.
+                let nll = if t == 0.0 || rate == f32::INFINITY {
+                    rate
+                } else {
+                    rate - t * z
+                };
+                if self.full {
+                    nll + ln_factorial(t)
+                } else {
+                    nll
+                }
+            })
+            .sum();
+        sum / log_rate.len() as f32
+    }
+
+    fn gradient(&self, log_rate: &[f32], target: &[f32], grad: &mut [f32]) {
+        debug_assert!(log_rate.len() == target.len() && log_rate.len() == grad.len());
+        let n = log_rate.len() as f32;
+        for ((g, &z), &t) in grad.iter_mut().zip(log_rate).zip(target) {
+            *g = (math::exp(z) - t) / n;
+        }
+    }
+}
+
+/// Quantil-Verlust (Pinball-Verlust): Regression auf das `τ`-Quantil statt auf den Mittelwert.
+///
+/// Mit dem Fehler `d = t - p` und `τ ∈ (0, 1)`:
+///
+/// * Verlust: `l(d) = max(τ · d, (τ - 1) · d)`, also `τ · d` für `d >= 0` (Vorhersage zu
+///   niedrig) und `(1 - τ) · |d|` für `d < 0` (zu hoch); `L` ist das Mittel über alle
+///   Ausgabeelemente.
+/// * Gradient (Subgradient): `dL/dp = -τ / n` für `d > 0`, `(1 - τ) / n` für `d < 0` und `0` am
+///   Knick `d = 0`. Das liegt im Subdifferential `[-τ, 1 - τ] / n` und folgt der Konvention von
+///   [`Mae`]. `NaN` bleibt in Wert und Gradient `NaN`.
+///
+/// Eine zu niedrige Vorhersage kostet `τ` je Einheit, eine zu hohe `1 - τ`. Im Optimum
+/// verschwindet der Subgradient des erwarteten Verlusts, wenn der Anteil `τ` der Ziele **unter**
+/// der Vorhersage liegt: `-τ · P(t > p) + (1 - τ) · P(t < p) = 0` gibt `P(t < p) = τ`. Mit `τ = 0,9`
+/// lernt ein Netz also eine obere Schranke, die etwa 90 % der Beobachtungen überdeckt; `τ = 0,5`
+/// ist der Median und genau `0,5 · ` [`Mae`].
+///
+/// Alle Ausgabeelemente erhalten dasselbe `τ`. Für mehrere Quantile trainiert man je ein Netz
+/// (oder einen Ausgang je Netz) mit eigenem Verlust. Weil der Betrag des Gradienten nicht mit
+/// dem Fehler schrumpft, springt die Vorhersage nahe dem Optimum um etwa die Schrittweite; eine
+/// fallende Lernrate (siehe [`schedule`](crate::schedule)) beruhigt das.
+///
+/// ```
+/// use neuron::loss::{Loss, QuantileLoss};
+/// use neuron::prelude::*;
+///
+/// let q90 = QuantileLoss::new(0.9);
+/// // Zu niedrig (p = 0, t = 1) kostet 0,9, zu hoch (p = 1, t = 0) nur 0,1.
+/// assert!((q90.value(&[0.0], &[1.0]) - 0.9).abs() < 1e-6);
+/// assert!((q90.value(&[1.0], &[0.0]) - 0.1).abs() < 1e-6);
+/// let mut g = [0.0f32];
+/// q90.gradient(&[0.0], &[1.0], &mut g);
+/// assert!((g[0] + 0.9).abs() < 1e-6); // -τ: nach oben ziehen
+/// q90.gradient(&[1.0], &[0.0], &mut g);
+/// assert!((g[0] - 0.1).abs() < 1e-6); // 1 - τ: leicht nach unten
+/// q90.gradient(&[1.0], &[1.0], &mut g);
+/// assert_eq!(g[0], 0.0); // am Knick
+/// // NaN bleibt NaN, in Wert und Gradient.
+/// q90.gradient(&[f32::NAN], &[1.0], &mut g);
+/// assert!(q90.value(&[f32::NAN], &[1.0]).is_nan() && g[0].is_nan());
+///
+/// // Training: ein konstanter Ausgang (Eingabe 0, nur der Bias lernt) an die Werte 1, 2, …, 100.
+/// // Das 0,9-Quantil liegt bei 90: 90 % der Werte liegen darunter. Der Mittelwert wäre 50,5.
+/// let values: [f32; 100] = core::array::from_fn(|i| (i + 1) as f32);
+/// let fit = |tau: f32| {
+///     let mut net = Dense::<1, 1, _>::new(Linear);
+///     net.init(&Constant(0.0), &mut Pcg32::seeded(0));
+///     let mut trainer = Trainer::new(net, QuantileLoss::new(tau), Sgd::new(20.0));
+///     for _ in 0..300 {
+///         trainer.train_batch(values.iter().map(|v| (&[0.0f32][..], core::slice::from_ref(v))));
+///     }
+///     trainer.network().bias_as_slice()[0]
+/// };
+/// let (c10, c50, c90) = (fit(0.1), fit(0.5), fit(0.9));
+/// assert!((c90 - 90.0).abs() < 1.5, "τ = 0,9: {c90}");
+/// assert!((c50 - 50.5).abs() < 1.5, "τ = 0,5: {c50}");
+/// assert!((c10 - 10.0).abs() < 1.5, "τ = 0,1: {c10}");
+/// ```
+///
+/// # Panics
+/// In [`new`](Self::new), wenn `tau` nicht in `(0, 1)` liegt (die Grenzen und `NaN` eingeschlossen:
+/// bei `τ = 0` oder `1` wäre der Verlust einseitig und hätte kein endliches Quantil als Optimum):
+///
+/// ```
+/// use neuron::loss::QuantileLoss;
+///
+/// fn message(f: impl FnOnce() + std::panic::UnwindSafe) -> String {
+///     let payload = std::panic::catch_unwind(f).unwrap_err();
+///     match payload.downcast_ref::<String>() {
+///         Some(text) => text.clone(),
+///         None => payload.downcast_ref::<&str>().unwrap().to_string(),
+///     }
+/// }
+///
+/// for bad in [0.0, 1.0, -0.1, 1.5, f32::NAN] {
+///     assert_eq!(message(move || drop(QuantileLoss::new(bad))), "tau muss in (0, 1) liegen");
+/// }
+/// ```
+///
+/// # Speicher und Rechenaufwand
+/// Kein Hilfspuffer, `O(n)`, kein `exp`/`ln`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct QuantileLoss {
+    /// Quantil `τ ∈ (0, 1)`.
+    tau: f32,
+}
+
+impl QuantileLoss {
+    /// Quantil-Verlust für das Quantil `tau`.
+    ///
+    /// # Panics
+    /// Wenn `tau` nicht in `(0, 1)` liegt (auch `NaN`).
+    #[track_caller]
+    pub fn new(tau: f32) -> Self {
+        assert!(tau > 0.0 && tau < 1.0, "tau muss in (0, 1) liegen");
+        QuantileLoss { tau }
+    }
+
+    /// Das Quantil `τ` (Standard `0.5`, der Median).
+    pub fn tau(&self) -> f32 {
+        self.tau
+    }
+}
+
+impl Default for QuantileLoss {
+    fn default() -> Self {
+        QuantileLoss { tau: 0.5 }
+    }
+}
+
+impl Loss for QuantileLoss {
+    fn value(&self, pred: &[f32], target: &[f32]) -> f32 {
+        debug_assert_eq!(pred.len(), target.len());
+        let tau = self.tau;
+        let sum: f32 = pred
+            .iter()
+            .zip(target)
+            .map(|(&p, &t)| {
+                let d = t - p;
+                // `NaN` landet im `else`-Zweig und bleibt `NaN` (`f32::max` würde es verschlucken).
+                if d >= 0.0 {
+                    tau * d
+                } else {
+                    (tau - 1.0) * d
+                }
+            })
+            .sum();
+        sum / pred.len() as f32
+    }
+
+    fn gradient(&self, pred: &[f32], target: &[f32], grad: &mut [f32]) {
+        debug_assert!(pred.len() == target.len() && pred.len() == grad.len());
+        let n = pred.len() as f32;
+        for ((g, &p), &t) in grad.iter_mut().zip(pred).zip(target) {
+            let d = t - p;
+            *g = if d > 0.0 {
+                -self.tau / n
+            } else if d < 0.0 {
+                (1.0 - self.tau) / n
+            } else if d == 0.0 {
+                0.0
+            } else {
+                f32::NAN
+            };
+        }
+    }
+}
+
+/// Mehrklassen-**Fokalverlust** auf **Logits** (Lin et al., „Focal Loss for Dense Object
+/// Detection“, auf Softmax übertragen), mit optionalem Gewicht `α` je Klasse.
+///
+/// Für `K` Logits `z`, `p = softmax(z)` und ein Ziel `t` (One-Hot oder weiche Verteilung):
+///
+/// ```text
+/// L = -Σ_c α_c · t_c · (1 - p_c)^γ · ln p_c        (ohne α: α_c = 1)
+/// ```
+///
+/// Der Faktor `(1 - p_c)^γ` blendet leicht klassifizierte Samples aus (`p_c ≈ 1`), sodass viele
+/// einfache Samples die wenigen schwierigen nicht übertönen. Mit `γ = 0` und ohne `α` ist das
+/// [`SoftmaxCrossEntropy`] (für endliche Logits bitgleich), mit `γ = 0` und `α` die
+/// [`WeightedSoftmaxCrossEntropy`]. Üblich ist `γ = 2`.
+///
+/// **Gradient (exakt).** Mit `q_c = 1 - p_c` und `∂p_c/∂z_j = p_c (δ_cj - p_j)` liefert die
+/// Kettenregel
+///
+/// ```text
+/// dL/dz_j = p_j · G - g_j,       G = Σ_c g_c,
+/// g_c = α_c · t_c · q_c^γ · [1 - γ · p_c · ln p_c / q_c]
+/// ```
+///
+/// Das ist keine Näherung; die Form ist die der Kreuzentropie mit dem „wirksamen Ziel“ `g`
+/// (Summe der Gradienten `0`). Die eckige Klammer liegt in `[1, 1 + γ]`, weil `-p ln p / (1 - p)`
+/// in `[0, 1]` liegt. Sie ist so geschrieben, dass `q_c^(γ-1)` nie auftritt (für `γ < 1` und
+/// `q_c = 0` wäre das `0 · ∞`): Der Bruch `ln p / q` strebt für `p → 1` gegen `-1` und wird
+/// dort so gesetzt; `q = 1 - p` kommt aus `-expm1(ln p)`; das vermeidet die Auslöschung bei `1 - p`, die
+/// Genauigkeit von `q` ist aber durch die `f32`-Genauigkeit von `ln p` begrenzt (absolut etwa
+/// `1e-7`). Für `p > 1 - 1e-7` ist `q = 0`; die Beiträge sind dort kleiner als etwa `1e-12`.
+///
+/// **Stabilität für `ln p → -∞`.** `ln p_c = z_c - max - ln Σ exp(z - max)` wird nie über ein
+/// Softmax-Ergebnis gebildet, das auf `0` unterläuft. Ein Logit, der weit unter dem Maximum
+/// liegt, gibt für die Zielklasse einen großen endlichen Wert (`-α · ln p`, z. B. `1000 α` bei
+/// 1000 Logits Abstand) und den endlichen Gradienten `-α` (Faktor `p · ln p / q → 0`); auch bei
+/// `-∞` sind die Gradienten endlich, der Wert `+∞`. Klassen mit `α_c · t_c = 0` tragen nichts
+/// bei (auch bei Logit `-∞`).
+///
+/// ```
+/// use neuron::loss::{FocalSoftmaxCrossEntropy, Loss};
+/// use neuron::prelude::*;
+///
+/// let focal = FocalSoftmaxCrossEntropy::<3>::new(2.0);
+/// let ce = SoftmaxCrossEntropy::new();
+///
+/// // Leichtes Sample (die richtige Klasse hat p ≈ 0,94): der Verlust fällt um (1 - p)².
+/// let (z, t) = ([4.0f32, 0.0, 0.0], [1.0f32, 0.0, 0.0]);
+/// let p = 1.0 / (1.0 + 2.0 * (-4.0f32).exp());
+/// assert!((focal.value(&z, &t) - (1.0 - p) * (1.0 - p) * ce.value(&z, &t)).abs() < 1e-7);
+/// assert!(focal.value(&z, &t) < 0.005 * ce.value(&z, &t));
+/// // Schweres Sample (p ≈ 0,06): kaum gedämpft.
+/// let z = [-4.0f32, 0.0, 0.0];
+/// assert!(focal.value(&z, &t) > 0.85 * ce.value(&z, &t));
+///
+/// // γ = 0 ist die gewöhnliche Kreuzentropie, auch für den Gradienten.
+/// let plain = FocalSoftmaxCrossEntropy::<3>::new(0.0);
+/// let (mut a, mut b) = ([0.0f32; 3], [0.0f32; 3]);
+/// plain.gradient(&z, &t, &mut a);
+/// ce.gradient(&z, &t, &mut b);
+/// assert_eq!(a, b);
+/// ```
+///
+/// ```
+/// use neuron::loss::{FocalSoftmaxCrossEntropy, Loss};
+///
+/// // Stabilität: Auch für γ < 1 (wo q^(γ-1) bei q = 0 divergieren würde) und bei Logits ±1000
+/// // bleibt alles endlich. Zielklasse mit ln p = -1000: Wert α · 1000, Gradient ±α.
+/// let focal = FocalSoftmaxCrossEntropy::new(0.5).with_alpha([1.0, 2.0, 1.0]);
+/// let mut g = [0.0f32; 3];
+/// focal.gradient(&[1000.0, 0.0, -1000.0], &[1.0, 0.0, 0.0], &mut g); // Ziel schon sicher: p = 1
+/// assert!(g.iter().all(|x| *x == 0.0));
+/// focal.gradient(&[1000.0, 0.0, -1000.0], &[0.0, 1.0, 0.0], &mut g); // ln p = -1000
+/// assert_eq!(focal.value(&[1000.0, 0.0, -1000.0], &[0.0, 1.0, 0.0]), 2000.0);
+/// assert_eq!(g, [2.0, -2.0, 0.0]);
+/// // Logit -∞ auf der Zielklasse: Wert +∞, Gradient trotzdem endlich.
+/// let z = [0.0, f32::NEG_INFINITY, 0.0];
+/// focal.gradient(&z, &[0.0, 1.0, 0.0], &mut g);
+/// assert_eq!(focal.value(&z, &[0.0, 1.0, 0.0]), f32::INFINITY);
+/// assert!(g.iter().all(|x| x.is_finite()) && g[1] < 0.0);
+/// ```
+///
+/// # Klassengewichte `α`
+///
+/// **Entscheidung:** `α` ist ein Gewicht **je Klasse** (`with_alpha([f32; K])`), kein Skalar. Beim
+/// binären [`FocalLossWithLogits`] ist `α` das Gewicht der positiven Klasse und `1 - α` das der
+/// negativen, also genau ein Gewichtsvektor `(1 - α, α)`; die natürliche Verallgemeinerung auf
+/// `K` Klassen ist ein Vektor. Ein skalares `α` würde alle Klassen gleich gewichten und
+/// wäre nur ein Faktor auf dem Verlust, keine Klassengewichtung. Anders als beim binären `α` ist
+/// der Bereich nicht auf `[0, 1]` beschränkt (die Gewichte sind nicht komplementär); wie bei
+/// [`WeightedSoftmaxCrossEntropy`] muss jedes Gewicht endlich und `>= 0` sein, mindestens eines
+/// `> 0`, und `0` blendet die Klasse aus. Für `K = 2` und harte Ziele ist
+/// `FocalSoftmaxCrossEntropy::<2>` mit `α = (1 - a, a)` auf den Logits `(0, z)` dieselbe Funktion
+/// von `z` wie `FocalLossWithLogits::new(γ).with_alpha(a)` auf dem Logit `z`. Das Gewicht hat
+/// dieselbe Wirkung auf die effektive Lernrate wie bei [`WeightedSoftmaxCrossEntropy`]
+/// (der Trainer teilt durch die Zahl der Samples, nicht durch die Summe der Gewichte).
+///
+/// Weil `K` im Typ steckt, schreibt man ohne `α` die Klassenzahl hin
+/// (`FocalSoftmaxCrossEntropy::<3>::new(2.0)`); mit `α` ergibt sie sich aus dem Array:
+///
+/// ```
+/// use neuron::loss::{FocalLossWithLogits, FocalSoftmaxCrossEntropy, Loss};
+///
+/// // Zwei Klassen mit α = (0,75, 0,25) auf den Logits (0, z) gleichen dem binären Fokalverlust.
+/// let softmax = FocalSoftmaxCrossEntropy::new(2.0).with_alpha([0.75, 0.25]);
+/// let binary = FocalLossWithLogits::new(2.0).with_alpha(0.25);
+/// for z in [-3.0f32, -0.5, 0.4, 2.0] {
+///     for (target, t) in [([0.0f32, 1.0], 1.0f32), ([1.0, 0.0], 0.0)] {
+///         let (mut gs, mut gb) = ([0.0f32; 2], [0.0f32; 1]);
+///         softmax.gradient(&[0.0, z], &target, &mut gs);
+///         binary.gradient(&[z], &[t], &mut gb);
+///         assert!((softmax.value(&[0.0, z], &target) - binary.value(&[z], &[t])).abs() < 1e-6);
+///         assert!((gs[1] - gb[0]).abs() < 1e-6 && (gs[0] + gb[0]).abs() < 1e-6);
+///     }
+/// }
+/// ```
+///
+/// # Panics
+/// * In [`new`](Self::new), wenn `gamma` nicht endlich und `>= 0` ist.
+/// * In [`with_alpha`](Self::with_alpha) bei einem Gewicht, das nicht endlich oder `< 0` ist, und
+///   wenn kein Gewicht `> 0` ist.
+/// * In `value` und `gradient`, wenn die Netzausgabe nicht genau `K` Elemente hat.
+///
+/// `K == 0` kompiliert nicht:
+///
+/// ```compile_fail,E0080
+/// let _ = neuron::loss::FocalSoftmaxCrossEntropy::<0>::new(2.0);
+/// ```
+///
+/// ```
+/// use neuron::loss::{FocalSoftmaxCrossEntropy, Loss};
+///
+/// fn message(f: impl FnOnce() + std::panic::UnwindSafe) -> String {
+///     let payload = std::panic::catch_unwind(f).unwrap_err();
+///     match payload.downcast_ref::<String>() {
+///         Some(text) => text.clone(),
+///         None => payload.downcast_ref::<&str>().unwrap().to_string(),
+///     }
+/// }
+///
+/// for bad in [-0.1, f32::NAN, f32::INFINITY] {
+///     assert_eq!(
+///         message(move || drop(FocalSoftmaxCrossEntropy::<3>::new(bad))),
+///         "gamma muss endlich und >= 0 sein"
+///     );
+/// }
+/// assert_eq!(
+///     message(|| drop(FocalSoftmaxCrossEntropy::new(2.0).with_alpha([1.0, -1.0]))),
+///     "alpha[1] muss endlich und >= 0 sein"
+/// );
+/// assert_eq!(
+///     message(|| drop(FocalSoftmaxCrossEntropy::new(2.0).with_alpha([0.0, 0.0]))),
+///     "alpha braucht mindestens ein Element > 0"
+/// );
+/// let focal = FocalSoftmaxCrossEntropy::<3>::new(2.0);
+/// assert!(message(|| drop(focal.value(&[0.0, 1.0], &[1.0, 0.0]))).contains("Klassenzahl K"));
+/// let gradient = || focal.gradient(&[0.0, 1.0], &[1.0, 0.0], &mut [0.0; 2]);
+/// assert!(message(gradient).contains("Klassenzahl K"));
+/// ```
+///
+/// # Speicher und Rechenaufwand
+/// Kein Hilfspuffer (der Gradient nutzt den Ausgabepuffer als Zwischenspeicher); `O(K)` mit einem
+/// `exp`, einem `expm1` und einem `powf` je Klasse mit `α_c · t_c ≠ 0`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FocalSoftmaxCrossEntropy<const K: usize> {
+    /// Fokussierungsparameter `γ >= 0`.
+    gamma: f32,
+    /// Gewicht `α_c` je Klasse (`None` = `1` für jede Klasse).
+    alpha: Option<[f32; K]>,
+}
+
+impl<const K: usize> FocalSoftmaxCrossEntropy<K> {
+    /// Fokalverlust mit Fokussierung `gamma`, ohne Klassengewichte.
+    ///
+    /// # Panics
+    /// Wenn `gamma` nicht endlich und `>= 0` ist. `K == 0` ist ein Compilerfehler.
+    #[track_caller]
+    pub fn new(gamma: f32) -> Self {
+        const {
+            assert!(K > 0, "K muss > 0 sein");
+        }
+        assert!(
+            gamma.is_finite() && gamma >= 0.0,
+            "gamma muss endlich und >= 0 sein"
+        );
+        FocalSoftmaxCrossEntropy { gamma, alpha: None }
+    }
+
+    /// Setzt die Klassengewichte `alpha` (ein Gewicht je Klasse).
+    ///
+    /// # Panics
+    /// Wenn ein Gewicht nicht endlich oder `< 0` ist (auch `NaN`) oder kein Gewicht `> 0` ist.
+    #[track_caller]
+    pub fn with_alpha(mut self, alpha: [f32; K]) -> Self {
+        assert_class_weights(&alpha, "alpha");
+        self.alpha = Some(alpha);
+        self
+    }
+
+    /// Fokussierungsparameter `γ` (Standard `2.0`; `0` = keine Fokussierung).
+    pub fn gamma(&self) -> f32 {
+        self.gamma
+    }
+
+    /// Die Klassengewichte `α` (`None` = kein Klassengewicht, der Standard).
+    pub fn alpha(&self) -> Option<&[f32; K]> {
+        self.alpha.as_ref()
+    }
+
+    /// `α_c · t` für Klasse `c` (ohne Klassengewichte: `t`).
+    #[inline]
+    fn weighted_target(&self, class: usize, t: f32) -> f32 {
+        match &self.alpha {
+            Some(alpha) => alpha[class] * t,
+            None => t,
+        }
+    }
+}
+
+impl<const K: usize> Default for FocalSoftmaxCrossEntropy<K> {
+    fn default() -> Self {
+        FocalSoftmaxCrossEntropy::new(2.0)
+    }
+}
+
+impl<const K: usize> Loss for FocalSoftmaxCrossEntropy<K> {
+    fn value(&self, logits: &[f32], target: &[f32]) -> f32 {
+        debug_assert_eq!(logits.len(), target.len());
+        assert_class_count(logits.len(), K);
+        let (max, lse) = log_sum_exp(logits);
+        let mut sum = 0.0;
+        for (class, (&l, &t)) in logits.iter().zip(target).enumerate() {
+            let weighted = self.weighted_target(class, t);
+            if weighted != 0.0 {
+                let log_p = l - max - lse;
+                // 1 - p = -expm1(ln p) vermeidet die Auslöschung; die Genauigkeit ist durch ln p in f32
+                // begrenzt (für p > 1 - 1e-7 ist q = 0). Der Betrag entfernt ein `-0.0`.
+                let q = math::abs(math::exp_m1(log_p));
+                sum -= weighted * math::powf(q, self.gamma) * log_p;
+            }
+        }
+        sum
+    }
+
+    fn gradient(&self, logits: &[f32], target: &[f32], grad: &mut [f32]) {
+        debug_assert!(logits.len() == target.len() && logits.len() == grad.len());
+        assert_class_count(logits.len(), K);
+        let (max, lse) = log_sum_exp(logits);
+        // 1. Durchlauf: das wirksame Ziel g_c in den Gradientenpuffer, G = Σ g_c.
+        let mut total = 0.0;
+        for (class, ((g, &l), &t)) in grad.iter_mut().zip(logits).zip(target).enumerate() {
+            let weighted = self.weighted_target(class, t);
+            let effective = if weighted == 0.0 {
+                0.0
+            } else {
+                let log_p = l - max - lse;
+                let q = math::abs(math::exp_m1(log_p));
+                // ln p / (1 - p) strebt für p → 1 gegen -1 (dort ist q = 0).
+                let ratio = if q > 0.0 { log_p / q } else { -1.0 };
+                // p · ratio → 0 für p → 0; bei log_p = -∞ wäre 0 · (-∞) = NaN.
+                let p = math::exp(log_p);
+                let p_ratio = if p > 0.0 { p * ratio } else { 0.0 };
+                weighted * math::powf(q, self.gamma) * (1.0 - self.gamma * p_ratio)
+            };
+            *g = effective;
+            total += effective;
+        }
+        // 2. Durchlauf: dL/dz_j = p_j · G - g_j.
+        for (g, &l) in grad.iter_mut().zip(logits) {
+            *g = math::exp(l - max - lse) * total - *g;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    // Die Bibliothek ist `no_std`; die Tests dürfen `std` nutzen (etwa `catch_unwind`).
+    extern crate std;
+
     use super::*;
 
     /// Referenz: binäre Kreuzentropie auf **Wahrscheinlichkeiten**, so wie die entfernte Variante
@@ -1466,6 +2541,933 @@ mod tests {
             LabelSmoothingCrossEntropy::new(0.2),
             &[0.5, -1.0, 2.0, 0.1],
             &[0.0, 0.0, 1.0, 0.0],
+        );
+    }
+
+    // ---- Neue Verluste: gewichtete Softmax-CE, KL, Poisson, Quantil, Fokal-Softmax ------------
+
+    /// `softmax` in `f64` für die Referenzen der Tests (unabhängig von `math`).
+    fn softmax64<const K: usize>(z: &[f32; K]) -> [f64; K] {
+        let max = z
+            .iter()
+            .fold(f64::NEG_INFINITY, |m, &v| m.max(f64::from(v)));
+        let e = z.map(|v| (f64::from(v) - max).exp());
+        let sum: f64 = e.iter().sum();
+        e.map(|v| v / sum)
+    }
+
+    fn close(a: f32, b: f32, tol: f32) -> bool {
+        (a - b).abs() <= tol * (1.0 + b.abs())
+    }
+
+    // -- WeightedSoftmaxCrossEntropy --
+
+    #[test]
+    fn weighted_ce_with_unit_weights_is_bit_identical_to_softmax_ce() {
+        let plain = SoftmaxCrossEntropy::new();
+        let weighted = WeightedSoftmaxCrossEntropy::<4>::default();
+        assert_eq!(weighted.weights(), &[1.0; 4]);
+        for logits in [
+            [0.5f32, -1.0, 2.0, 0.1],
+            [1000.0, 0.0, -1000.0, 3.0],
+            [0.0; 4],
+            [-7.5, 8.25, 8.25, 1e-3],
+        ] {
+            for target in [
+                [0.0f32, 0.0, 1.0, 0.0],
+                [0.25, 0.25, 0.25, 0.25],
+                [0.7, 0.0, 0.3, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0; 4],
+            ] {
+                assert_eq!(
+                    weighted.value(&logits, &target),
+                    plain.value(&logits, &target),
+                    "{logits:?} {target:?}"
+                );
+                let (mut a, mut b) = ([0.0; 4], [0.0; 4]);
+                weighted.gradient(&logits, &target, &mut a);
+                plain.gradient(&logits, &target, &mut b);
+                assert_eq!(a, b, "{logits:?} {target:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn weighted_ce_hard_target_scales_loss_and_gradient_by_the_class_weight() {
+        // Ziel Klasse y: L = -w_y ln p_y und dL/dz = w_y (p - e_y).
+        let (z, w) = ([0.5f32, -1.0, 2.0], [0.5f32, 3.0, 2.0]);
+        let loss = WeightedSoftmaxCrossEntropy::new(w);
+        let p = softmax64(&z);
+        for y in 0..3 {
+            let mut t = [0.0f32; 3];
+            t[y] = 1.0;
+            let v = loss.value(&z, &t);
+            assert!(
+                (f64::from(v) + f64::from(w[y]) * p[y].ln()).abs() < 1e-5,
+                "y = {y}: {v}"
+            );
+            let mut g = [0.0f32; 3];
+            loss.gradient(&z, &t, &mut g);
+            for c in 0..3 {
+                let expected = f64::from(w[y]) * (p[c] - if c == y { 1.0 } else { 0.0 });
+                assert!(
+                    (f64::from(g[c]) - expected).abs() < 1e-5,
+                    "y = {y}, c = {c}: {} vs {expected}",
+                    g[c]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn weighted_ce_gradient_uses_the_weighted_target_sum_not_the_plain_one() {
+        // Weiches Ziel: S = Σ w t = 0,5·1 + 0,5·4 = 2,5. Bei Gleichverteilung p = ⅓.
+        let loss = WeightedSoftmaxCrossEntropy::new([1.0, 4.0, 2.0]);
+        let mut g = [0.0f32; 3];
+        loss.gradient(&[0.0; 3], &[0.5, 0.5, 0.0], &mut g);
+        let third_s = 2.5f32 / 3.0;
+        assert!(close(g[0], third_s - 0.5, 1e-6), "{g:?}");
+        assert!(close(g[1], third_s - 2.0, 1e-6), "{g:?}");
+        assert!(close(g[2], third_s, 1e-6), "{g:?}");
+        // Die falsche Form `softmax · Σt - w t` hätte g[0] = ⅓ - 0,5 geliefert.
+        assert!((g[0] - (1.0 / 3.0 - 0.5)).abs() > 0.1);
+        // Das Vorzeichen-Nullsummen-Gesetz des Softmax gilt trotzdem.
+        assert!(g.iter().sum::<f32>().abs() < 1e-6, "{g:?}");
+    }
+
+    #[test]
+    fn weighted_ce_zero_weight_hides_a_class() {
+        let loss = WeightedSoftmaxCrossEntropy::new([1.0, 0.0, 1.0]);
+        let z = [0.5f32, -1.0, 2.0];
+        // Ziel nur auf der ausgeblendeten Klasse: Wert 0 und Gradient exakt 0.
+        let mut g = [9.0f32; 3];
+        loss.gradient(&z, &[0.0, 1.0, 0.0], &mut g);
+        assert_eq!((loss.value(&z, &[0.0, 1.0, 0.0]), g), (0.0, [0.0; 3]));
+        // Gemischtes Ziel: nur der sichtbare Teil zählt, der Gradient bleibt über die Klassen
+        // nullsummig.
+        let visible = SoftmaxCrossEntropy::new().value(&z, &[0.0, 0.0, 0.5]);
+        assert_eq!(loss.value(&z, &[0.0, 0.5, 0.5]), visible);
+    }
+
+    #[test]
+    fn weighted_ce_is_stable_for_extreme_logits_and_masked_classes() {
+        let loss = WeightedSoftmaxCrossEntropy::new([1e-6, 1.0, 1e6]);
+        for z in [
+            [1000.0f32, 0.0, -1000.0],
+            [-1000.0, 1000.0, 0.0],
+            [0.0, -1000.0, 1000.0],
+        ] {
+            for t in [[1.0f32, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]] {
+                let v = loss.value(&z, &t);
+                let mut g = [0.0f32; 3];
+                loss.gradient(&z, &t, &mut g);
+                assert!(
+                    v.is_finite() && v >= 0.0 && g.iter().all(|x| x.is_finite()),
+                    "{z:?} {t:?}: {v} {g:?}"
+                );
+            }
+        }
+        // Ein Logit -∞ (maskierte Klasse) mit Ziel 0 stört weder Wert noch Gradient.
+        let z = [0.5f32, f32::NEG_INFINITY, 2.0];
+        let t = [0.0f32, 0.0, 1.0];
+        let masked = WeightedSoftmaxCrossEntropy::new([1.0, 3.0, 2.0]);
+        let mut g = [0.0f32; 3];
+        masked.gradient(&z, &t, &mut g);
+        let two = WeightedSoftmaxCrossEntropy::new([1.0, 2.0]).value(&[0.5, 2.0], &[0.0, 1.0]);
+        assert!(close(masked.value(&z, &t), two, 1e-6));
+        assert!(g.iter().all(|x| x.is_finite()) && g[1] == 0.0, "{g:?}");
+        // Mit Ziel > 0 auf der maskierten Klasse ist der Verlust unendlich (zu Recht).
+        assert_eq!(masked.value(&z, &[0.0, 1.0, 0.0]), f32::INFINITY);
+    }
+
+    #[test]
+    fn weighted_ce_single_class_has_no_loss_and_no_gradient() {
+        let loss = WeightedSoftmaxCrossEntropy::new([3.0]);
+        let mut g = [9.0f32];
+        loss.gradient(&[5.0], &[1.0], &mut g);
+        assert_eq!((loss.value(&[5.0], &[1.0]), g), (0.0, [0.0]));
+    }
+
+    #[test]
+    fn weighted_ce_propagates_nan() {
+        let loss = WeightedSoftmaxCrossEntropy::new([1.0, 2.0]);
+        assert!(loss.value(&[f32::NAN, 0.0], &[1.0, 0.0]).is_nan());
+        let mut g = [0.0f32; 2];
+        loss.gradient(&[f32::NAN, 0.0], &[1.0, 0.0], &mut g);
+        assert!(g.iter().all(|x| x.is_nan()), "{g:?}");
+    }
+
+    #[test]
+    fn weighted_ce_getter_and_clone() {
+        let loss = WeightedSoftmaxCrossEntropy::new([0.5, 2.0, 0.0]);
+        assert_eq!(loss.weights(), &[0.5, 2.0, 0.0]);
+        assert_eq!(loss, loss.clone());
+    }
+
+    #[test]
+    #[should_panic(expected = "weights[1] muss endlich und >= 0 sein")]
+    fn weighted_ce_rejects_a_negative_weight() {
+        let _ = WeightedSoftmaxCrossEntropy::new([1.0, -0.5]);
+    }
+
+    #[test]
+    #[should_panic(expected = "weights[0] muss endlich und >= 0 sein")]
+    fn weighted_ce_rejects_nan_and_infinite_weights() {
+        let _ = WeightedSoftmaxCrossEntropy::new([f32::NAN, 1.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "weights[2] muss endlich und >= 0 sein")]
+    fn weighted_ce_rejects_an_infinite_weight() {
+        let _ = WeightedSoftmaxCrossEntropy::new([1.0, 1.0, f32::INFINITY]);
+    }
+
+    #[test]
+    #[should_panic(expected = "weights braucht mindestens ein Element > 0")]
+    fn weighted_ce_rejects_all_zero_weights() {
+        let _ = WeightedSoftmaxCrossEntropy::new([0.0, 0.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Klassenzahl K")]
+    fn weighted_ce_checks_the_output_length_against_k() {
+        let _ = WeightedSoftmaxCrossEntropy::<4>::default().value(&[0.0; 3], &[0.0; 3]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Klassenzahl K")]
+    fn weighted_ce_checks_the_gradient_length_against_k() {
+        let mut g = [0.0; 2];
+        WeightedSoftmaxCrossEntropy::<3>::default().gradient(&[0.0; 2], &[0.0; 2], &mut g);
+    }
+
+    // -- KlDivergence --
+
+    #[test]
+    fn kl_known_value_and_gradient() {
+        // Referenz (Python, float64, Gradient per zentraler Differenz): siehe tests/loss_ext_reference.rs.
+        let (z, t) = ([0.5f32, -1.0, 2.0], [0.7f32, 0.2, 0.1]);
+        let kl = KlDivergence::new();
+        assert!(close(kl.value(&z, &t), 1.089_492_7, 1e-5));
+        let mut g = [0.0f32; 3];
+        kl.gradient(&z, &t, &mut g);
+        let expected = [-0.524_709_6f32, -0.160_887_43, 0.685_597];
+        for i in 0..3 {
+            assert!((g[i] - expected[i]).abs() < 1e-5, "i = {i}: {g:?}");
+        }
+    }
+
+    #[test]
+    fn kl_with_a_one_hot_target_is_the_cross_entropy() {
+        let (z, t) = ([0.5f32, -1.0, 2.0, 0.1], [0.0f32, 0.0, 1.0, 0.0]);
+        let (kl, ce) = (KlDivergence::new(), SoftmaxCrossEntropy::new());
+        assert!(close(kl.value(&z, &t), ce.value(&z, &t), 1e-6));
+    }
+
+    #[test]
+    fn kl_is_the_cross_entropy_minus_the_target_entropy_with_the_same_gradient() {
+        let z = [0.5f32, -1.0, 2.0, 0.1];
+        let (kl, ce) = (KlDivergence::new(), SoftmaxCrossEntropy::new());
+        for t in [
+            [0.1f32, 0.2, 0.3, 0.4],
+            [0.7, 0.1, 0.1, 0.1],
+            [0.5, 0.5, 0.0, 0.0],
+        ] {
+            let entropy: f32 = t.iter().filter(|&&p| p > 0.0).map(|&p| -p * p.ln()).sum();
+            assert!(
+                (kl.value(&z, &t) - (ce.value(&z, &t) - entropy)).abs() < 1e-5,
+                "{t:?}"
+            );
+            let (mut a, mut b) = ([0.0f32; 4], [0.0f32; 4]);
+            kl.gradient(&z, &t, &mut a);
+            ce.gradient(&z, &t, &mut b);
+            assert_eq!(a, b, "{t:?}"); // bei T = 1 bitgleich
+        }
+    }
+
+    #[test]
+    fn kl_is_zero_at_the_target_and_nonnegative_elsewhere() {
+        let kl = KlDivergence::new();
+        let t = [0.6f32, 0.3, 0.1];
+        let z = t.map(f32::ln);
+        assert!(kl.value(&z, &t).abs() < 1e-6);
+        // Verschiebung aller Logits ändert nichts (Softmax ist verschiebungsinvariant).
+        let shifted = z.map(|x| x + 37.0);
+        assert!(kl.value(&shifted, &t).abs() < 1e-5);
+        for z in [
+            [0.0f32; 3],
+            [1.0, 0.0, -1.0],
+            [-2.0, 3.0, 0.5],
+            [10.0, -10.0, 0.0],
+        ] {
+            assert!(kl.value(&z, &t) > 1e-3, "{z:?}");
+        }
+    }
+
+    #[test]
+    fn kl_skips_zero_targets_even_for_a_minus_infinity_logit() {
+        let kl = KlDivergence::new();
+        // Die Klasse mit t = 0 und Logit -∞ ist ausgeschlossen: Rest ist KL über zwei Klassen.
+        let v = kl.value(&[0.0, f32::NEG_INFINITY, 0.5], &[0.5, 0.0, 0.5]);
+        let two = kl.value(&[0.0, 0.5], &[0.5, 0.5]);
+        assert!(close(v, two, 1e-6), "{v} vs {two}");
+        let mut g = [9.0f32; 3];
+        kl.gradient(&[0.0, f32::NEG_INFINITY, 0.5], &[0.5, 0.0, 0.5], &mut g);
+        assert!(g.iter().all(|x| x.is_finite()) && g[1] == 0.0, "{g:?}");
+        // Mit t > 0 auf einer Klasse mit Wahrscheinlichkeit 0 ist die Divergenz unendlich.
+        assert_eq!(
+            kl.value(&[0.0, f32::NEG_INFINITY], &[0.5, 0.5]),
+            f32::INFINITY
+        );
+    }
+
+    #[test]
+    fn kl_is_finite_for_extreme_logits() {
+        let kl = KlDivergence::new();
+        let mut g = [0.0f32; 2];
+        for (z, t) in [
+            ([1000.0f32, 0.0], [1.0f32, 0.0]),
+            ([1000.0, 0.0], [0.0, 1.0]),
+            ([-1000.0, 1000.0], [0.5, 0.5]),
+        ] {
+            let v = kl.value(&z, &t);
+            kl.gradient(&z, &t, &mut g);
+            assert!(
+                v.is_finite() && g.iter().all(|x| x.is_finite()),
+                "{z:?} {t:?}"
+            );
+        }
+        // Ziel auf der unwahrscheinlichen Klasse: -ln p = 1000.
+        assert!(close(kl.value(&[1000.0, 0.0], &[0.0, 1.0]), 1000.0, 1e-6));
+        assert!(kl.value(&[1000.0, 0.0], &[1.0, 0.0]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn kl_with_a_target_that_does_not_sum_to_one() {
+        // Gradient T=1: S·p - t. Minimum des Werts: p = t/S mit Wert S ln S (negativ für S < 1).
+        let (z, t) = ([0.5f32, -1.0, 2.0], [0.4f32, 0.2, 0.1]);
+        let kl = KlDivergence::new();
+        let mut g = [0.0f32; 3];
+        kl.gradient(&z, &t, &mut g);
+        let p = softmax64(&z);
+        for i in 0..3 {
+            let expected = 0.7 * p[i] - f64::from(t[i]);
+            assert!((f64::from(g[i]) - expected).abs() < 1e-6, "i = {i}");
+        }
+        let at_minimum = t.map(|x| (x / 0.7).ln());
+        let v = kl.value(&at_minimum, &t);
+        assert!((v - 0.7 * 0.7f32.ln()).abs() < 1e-5, "{v}");
+        // Mit Temperatur: Minimum T² S ln S.
+        let hot = KlDivergence::new().with_temperature(2.0);
+        let scaled = at_minimum.map(|x| x * 2.0);
+        assert!((hot.value(&scaled, &t) - 4.0 * 0.7 * 0.7f32.ln()).abs() < 1e-4);
+    }
+
+    #[test]
+    fn kl_negative_target_makes_the_value_nan() {
+        assert!(KlDivergence::new()
+            .value(&[0.0, 0.0], &[1.5, -0.5])
+            .is_nan());
+    }
+
+    #[test]
+    fn kl_temperature_scales_logits_and_the_value_by_t_squared() {
+        let (z, t) = ([0.5f32, -1.0, 2.0], [0.7f32, 0.2, 0.1]);
+        let hot = KlDivergence::new().with_temperature(4.0);
+        // softmax(z / 4) in f64 als unabhängige Referenz.
+        let p = softmax64(&z.map(|x| x / 4.0));
+        let reference: f64 = t
+            .iter()
+            .zip(&p)
+            .map(|(&a, &b)| f64::from(a) * (f64::from(a).ln() - b.ln()))
+            .sum();
+        assert!((f64::from(hot.value(&z, &t)) - 16.0 * reference).abs() < 1e-4);
+        // Der Gradient ist T (p_T - t) für Σ t = 1.
+        let mut g = [0.0f32; 3];
+        hot.gradient(&z, &t, &mut g);
+        for i in 0..3 {
+            let expected = 4.0 * (p[i] - f64::from(t[i]));
+            assert!((f64::from(g[i]) - expected).abs() < 1e-5, "i = {i}");
+        }
+        // T = 1 ist der Standard.
+        assert_eq!(KlDivergence::default().temperature(), 1.0);
+        assert_eq!(KlDivergence::new(), KlDivergence::default());
+    }
+
+    #[test]
+    fn kl_extreme_temperatures_stay_finite() {
+        let (z, t) = ([3.0f32, -2.0, 1.0], [0.6f32, 0.1, 0.3]);
+        for temperature in [1e-2f32, 1e-1, 10.0, 1e3, 1e9] {
+            let kl = KlDivergence::new().with_temperature(temperature);
+            let mut g = [0.0f32; 3];
+            kl.gradient(&z, &t, &mut g);
+            assert!(
+                kl.value(&z, &t).is_finite() && g.iter().all(|x| x.is_finite()),
+                "T = {temperature}"
+            );
+        }
+        // Sehr große T: p → Gleichverteilung, der Wert ist T² · KL(t ‖ gleichverteilt).
+        let flat = KlDivergence::new().with_temperature(1e3);
+        let uniform: f32 = t.iter().map(|&a| a * (a * 3.0).ln()).sum();
+        assert!(close(flat.value(&z, &t), 1e6 * uniform, 1e-2));
+    }
+
+    #[test]
+    fn kl_propagates_nan() {
+        let kl = KlDivergence::new();
+        assert!(kl.value(&[f32::NAN, 0.0], &[0.5, 0.5]).is_nan());
+        let mut g = [0.0f32; 2];
+        kl.gradient(&[f32::NAN, 0.0], &[0.5, 0.5], &mut g);
+        assert!(g.iter().all(|x| x.is_nan()));
+    }
+
+    #[test]
+    #[should_panic(expected = "temperature muss endlich und > 0 sein")]
+    fn kl_rejects_zero_temperature() {
+        let _ = KlDivergence::new().with_temperature(0.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "temperature muss endlich und > 0 sein")]
+    fn kl_rejects_negative_and_nan_temperature() {
+        let _ = KlDivergence::new().with_temperature(-1.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "temperature muss endlich und > 0 sein")]
+    fn kl_rejects_nan_temperature() {
+        let _ = KlDivergence::new().with_temperature(f32::NAN);
+    }
+
+    #[test]
+    #[should_panic(expected = "temperature muss endlich und > 0 sein")]
+    fn kl_rejects_infinite_temperature() {
+        let _ = KlDivergence::new().with_temperature(f32::INFINITY);
+    }
+
+    // -- PoissonNll --
+
+    #[test]
+    fn poisson_known_values_with_and_without_the_constant() {
+        // (z, t, L ohne ln t!, L mit ln t!), Python float64: exp(z) - t z (+ lgamma(t + 1)).
+        let cases = [
+            (0.0f32, 0.0f32, 1.0f32, 1.0f32),
+            (0.0, 1.0, 1.0, 1.0),
+            (1.0, 3.0, -0.281_718_17, 1.510_041_3),
+            (-2.0, 5.0, 10.135_335, 14.922_827),
+            (4.0, 7.5, 24.598_15, 34.147_417),
+        ];
+        let (plain, full) = (PoissonNll::new(), PoissonNll::new().with_full(true));
+        for (z, t, without, with) in cases {
+            assert!(
+                close(plain.value(&[z], &[t]), without, 2e-6),
+                "z = {z}, t = {t}"
+            );
+            assert!(
+                close(full.value(&[z], &[t]), with, 2e-6),
+                "z = {z}, t = {t}"
+            );
+            // Der Gradient ist unabhängig von der Konstante: e^z - t.
+            let (mut a, mut b) = ([0.0f32], [0.0f32]);
+            plain.gradient(&[z], &[t], &mut a);
+            full.gradient(&[z], &[t], &mut b);
+            assert_eq!(a, b);
+            assert!(close(a[0], z.exp() - t, 1e-6), "z = {z}, t = {t}");
+        }
+    }
+
+    #[test]
+    fn poisson_constant_is_the_log_factorial() {
+        // ln t! = lgamma(t + 1); Python math.lgamma.
+        let cases = [
+            (0.0f32, 0.0f32),
+            (1.0, 0.0),
+            (2.0, core::f32::consts::LN_2),
+            (5.0, 4.787_492),
+            (10.0, 15.104_413),
+            (100.0, 363.739_38),
+            (1000.0, 5912.128),
+            (0.5, -0.120_782_24),
+            (2.5, 1.200_973_6),
+        ];
+        for (t, expected) in cases {
+            let got = ln_factorial(t);
+            assert!(
+                (got - expected).abs() <= 1e-5 * (1.0 + expected.abs()),
+                "t = {t}: {got} vs {expected}"
+            );
+        }
+        // 0! = 1! = 1: der Logarithmus ist exakt 0 (so steht es in der Doku).
+        assert_eq!((ln_factorial(0.0), ln_factorial(1.0)), (0.0, 0.0));
+        assert!(ln_factorial(-1.0).is_nan() && ln_factorial(f32::NAN).is_nan());
+    }
+
+    #[test]
+    fn poisson_full_value_is_a_real_log_likelihood_for_counts() {
+        // Für ganzzahlige t ist L = -ln P(t | λ) >= 0, und Σ_t P(t | λ) = 1.
+        let full = PoissonNll::new().with_full(true);
+        let z = 1.3f32; // λ = e^1,3 ≈ 3,669
+        let mut total = 0.0f64;
+        for t in 0..60 {
+            let nll = full.value(&[z], &[t as f32]);
+            assert!(nll >= 0.0, "t = {t}: {nll}");
+            total += (-f64::from(nll)).exp();
+        }
+        assert!((total - 1.0).abs() < 1e-4, "Σ P = {total}");
+    }
+
+    #[test]
+    fn poisson_minimum_is_at_the_log_of_the_target() {
+        let nll = PoissonNll::new();
+        for t in [0.5f32, 1.0, 4.0, 20.0] {
+            let z = t.ln();
+            let mut g = [9.0f32];
+            nll.gradient(&[z], &[t], &mut g);
+            assert!(g[0].abs() <= 1e-5 * (1.0 + t), "t = {t}: {g:?}");
+            for dz in [-0.3f32, 0.3] {
+                assert!(
+                    nll.value(&[z + dz], &[t]) > nll.value(&[z], &[t]),
+                    "t = {t}, dz = {dz}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn poisson_overflow_of_the_rate_gives_infinite_value_and_gradient() {
+        let nll = PoissonNll::new();
+        let mut g = [0.0f32];
+        // ln(f32::MAX) ≈ 88,7228: darunter endlich, darüber +∞.
+        nll.gradient(&[88.0], &[3.0], &mut g);
+        assert!(nll.value(&[88.0], &[3.0]).is_finite() && g[0].is_finite());
+        for z in [89.0f32, 100.0, 1e30, f32::INFINITY] {
+            for t in [0.0f32, 3.0] {
+                nll.gradient(&[z], &[t], &mut g);
+                assert_eq!(
+                    (nll.value(&[z], &[t]), g[0]),
+                    (f32::INFINITY, f32::INFINITY),
+                    "z = {z}, t = {t}"
+                );
+            }
+        }
+        // Auch mit der Konstante bleibt der Wert +∞ (nicht NaN).
+        assert_eq!(
+            PoissonNll::new().with_full(true).value(&[100.0], &[3.0]),
+            f32::INFINITY
+        );
+    }
+
+    #[test]
+    fn poisson_very_negative_log_rates_are_harmless() {
+        let nll = PoissonNll::new();
+        let mut g = [0.0f32];
+        nll.gradient(&[-1000.0], &[2.0], &mut g);
+        assert_eq!((nll.value(&[-1000.0], &[2.0]), g[0]), (2000.0, -2.0));
+        // Ziel 0: Verlust und Gradient sind 0, auch bei z = -∞ (kein 0 · ∞).
+        for z in [-1000.0f32, f32::NEG_INFINITY] {
+            nll.gradient(&[z], &[0.0], &mut g);
+            assert_eq!((nll.value(&[z], &[0.0]), g[0]), (0.0, 0.0), "z = {z}");
+        }
+        // Ziel > 0 bei Rate 0 ist unendlich unwahrscheinlich.
+        assert_eq!(nll.value(&[f32::NEG_INFINITY], &[1.0]), f32::INFINITY);
+    }
+
+    #[test]
+    fn poisson_averages_over_the_outputs() {
+        let nll = PoissonNll::new();
+        let (z, t) = ([0.0f32, 1.0, -1.0], [1.0f32, 3.0, 0.0]);
+        let each: f32 = (0..3).map(|i| nll.value(&z[i..=i], &t[i..=i])).sum();
+        assert!(close(nll.value(&z, &t), each / 3.0, 1e-6));
+        let mut g = [0.0f32; 3];
+        nll.gradient(&z, &t, &mut g);
+        for i in 0..3 {
+            assert!(close(g[i], (z[i].exp() - t[i]) / 3.0, 1e-6), "i = {i}");
+        }
+    }
+
+    #[test]
+    fn poisson_negative_targets_and_nan() {
+        // Ohne die Konstante wird ein negatives Ziel nicht geprüft; mit ihr ist der Wert NaN.
+        assert!(PoissonNll::new().value(&[0.0], &[-1.0]).is_finite());
+        assert!(PoissonNll::new()
+            .with_full(true)
+            .value(&[0.0], &[-1.0])
+            .is_nan());
+        for full in [false, true] {
+            let nll = PoissonNll::new().with_full(full);
+            assert!(nll.value(&[f32::NAN], &[1.0]).is_nan());
+            assert!(nll.value(&[0.0], &[f32::NAN]).is_nan());
+            let mut g = [0.0f32];
+            nll.gradient(&[f32::NAN], &[1.0], &mut g);
+            assert!(g[0].is_nan());
+        }
+    }
+
+    #[test]
+    fn poisson_defaults_and_const_constructors() {
+        const PLAIN: PoissonNll = PoissonNll::new();
+        const FULL: PoissonNll = PoissonNll::new().with_full(true);
+        assert!(!PLAIN.full() && FULL.full());
+        assert_eq!(PoissonNll::default(), PLAIN);
+        assert_eq!(FULL.with_full(false), PLAIN);
+    }
+
+    // -- QuantileLoss --
+
+    #[test]
+    fn quantile_known_values_and_subgradient() {
+        // Python: max(τ d, (τ - 1) d) mit d = t - p.
+        let cases = [
+            (0.0f32, 1.0f32, 0.9f32, 0.9f32, -0.9f32),
+            (1.0, 0.0, 0.9, 0.1, 0.1),
+            (0.3, 0.8, 0.25, 0.125, -0.25),
+            (0.8, 0.3, 0.25, 0.375, 0.75),
+            (2.0, -1.0, 0.1, 2.7, 0.9),
+        ];
+        for (p, t, tau, value, gradient) in cases {
+            let loss = QuantileLoss::new(tau);
+            assert!(
+                close(loss.value(&[p], &[t]), value, 1e-6),
+                "p = {p}, t = {t}"
+            );
+            let mut g = [9.0f32];
+            loss.gradient(&[p], &[t], &mut g);
+            assert!(close(g[0], gradient, 1e-6), "p = {p}, t = {t}: {g:?}");
+        }
+    }
+
+    #[test]
+    fn quantile_one_half_is_half_the_mean_absolute_error() {
+        let median = QuantileLoss::new(0.5);
+        let (p, t) = ([0.2f32, 0.9, -0.4, 3.0], [0.0f32, 1.0, 0.5, 3.0]); // letzter: Knick
+        assert!(close(
+            median.value(&p, &t),
+            0.5 * Mae::new().value(&p, &t),
+            1e-7
+        ));
+        let (mut a, mut b) = ([0.0f32; 4], [0.0f32; 4]);
+        median.gradient(&p, &t, &mut a);
+        Mae::new().gradient(&p, &t, &mut b);
+        // Mae.gradient ist sign(p - t)/n, Quantil mit τ = ½ die Hälfte davon; am Knick beide 0.
+        for i in 0..4 {
+            assert_eq!(a[i], 0.5 * b[i], "i = {i}");
+        }
+        assert_eq!(QuantileLoss::default(), median);
+    }
+
+    #[test]
+    fn quantile_gradient_is_zero_at_the_kink_and_weighs_the_sides() {
+        let loss = QuantileLoss::new(0.8);
+        let mut g = [9.0f32; 3];
+        loss.gradient(&[1.0, 0.0, 2.0], &[1.0, 5.0, -3.0], &mut g);
+        assert!(g[0] == 0.0, "{g:?}");
+        assert!(
+            close(g[1], -0.8 / 3.0, 1e-6) && close(g[2], 0.2 / 3.0, 1e-6),
+            "{g:?}"
+        );
+    }
+
+    #[test]
+    fn quantile_handles_extreme_values_and_nan() {
+        let loss = QuantileLoss::new(0.3);
+        let mut g = [0.0f32];
+        for (p, t) in [(f32::MAX, -f32::MAX), (-f32::MAX, f32::MAX), (1e30, 0.0)] {
+            loss.gradient(&[p], &[t], &mut g);
+            let v = loss.value(&[p], &[t]);
+            assert!(v >= 0.0 && g[0].is_finite(), "p = {p}, t = {t}: {v} {g:?}");
+        }
+        // t - p läuft für (±MAX, ∓MAX) auf ±∞: der Wert ist dann ∞, nicht NaN.
+        assert_eq!(loss.value(&[-f32::MAX], &[f32::MAX]), f32::INFINITY);
+        assert!(loss.value(&[f32::NAN], &[0.0]).is_nan());
+        assert!(loss.value(&[0.0], &[f32::NAN]).is_nan());
+        loss.gradient(&[f32::NAN], &[0.0], &mut g);
+        assert!(g[0].is_nan(), "ein NaN-Gradient darf nicht zu 0 werden");
+    }
+
+    #[test]
+    fn quantile_validates_tau() {
+        for bad in [
+            0.0f32,
+            1.0,
+            -0.1,
+            1.5,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ] {
+            let panic = std::panic::catch_unwind(|| QuantileLoss::new(bad)).unwrap_err();
+            assert_eq!(
+                panic.downcast_ref::<&str>(),
+                Some(&"tau muss in (0, 1) liegen"),
+                "tau = {bad}"
+            );
+        }
+        // Die Ränder nahe 0 und 1 sind gültig.
+        for ok in [f32::MIN_POSITIVE, 1e-6, 0.999_999_9] {
+            assert_eq!(QuantileLoss::new(ok).tau(), ok);
+        }
+    }
+
+    // -- FocalSoftmaxCrossEntropy --
+
+    #[test]
+    fn focal_softmax_without_focusing_is_bit_identical_to_softmax_ce() {
+        let focal = FocalSoftmaxCrossEntropy::<4>::new(0.0);
+        let ce = SoftmaxCrossEntropy::new();
+        for logits in [
+            [0.5f32, -1.0, 2.0, 0.1],
+            [1000.0, 0.0, -1000.0, 3.0],
+            [0.0; 4],
+            [-7.5, 8.25, 8.25, 1e-3],
+        ] {
+            for target in [
+                [0.0f32, 0.0, 1.0, 0.0],
+                [0.25, 0.25, 0.25, 0.25],
+                [0.7, 0.0, 0.3, 0.0],
+                [0.0; 4],
+            ] {
+                assert_eq!(focal.value(&logits, &target), ce.value(&logits, &target));
+                let (mut a, mut b) = ([0.0; 4], [0.0; 4]);
+                focal.gradient(&logits, &target, &mut a);
+                ce.gradient(&logits, &target, &mut b);
+                assert_eq!(a, b, "{logits:?} {target:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn focal_softmax_without_focusing_but_with_alpha_is_the_weighted_ce() {
+        let alpha = [0.3f32, 4.0, 1.0, 2.0];
+        let focal = FocalSoftmaxCrossEntropy::new(0.0).with_alpha(alpha);
+        let weighted = WeightedSoftmaxCrossEntropy::new(alpha);
+        for logits in [[0.5f32, -1.0, 2.0, 0.1], [1000.0, 0.0, -1000.0, 3.0]] {
+            for target in [[0.0f32, 1.0, 0.0, 0.0], [0.2, 0.5, 0.2, 0.1]] {
+                assert_eq!(
+                    focal.value(&logits, &target),
+                    weighted.value(&logits, &target)
+                );
+                let (mut a, mut b) = ([0.0; 4], [0.0; 4]);
+                focal.gradient(&logits, &target, &mut a);
+                weighted.gradient(&logits, &target, &mut b);
+                assert_eq!(a, b);
+            }
+        }
+    }
+
+    #[test]
+    fn focal_softmax_agrees_with_the_binary_focal_loss_for_two_classes() {
+        for gamma in [0.0f32, 0.5, 1.0, 2.0, 3.5] {
+            for a in [0.25f32, 0.5, 0.9] {
+                let multi = FocalSoftmaxCrossEntropy::new(gamma).with_alpha([1.0 - a, a]);
+                let binary = FocalLossWithLogits::new(gamma).with_alpha(a);
+                for z in [-30.0f32, -3.0, -0.5, 0.0, 0.4, 2.0, 30.0] {
+                    for (target, t) in [([0.0f32, 1.0], 1.0f32), ([1.0, 0.0], 0.0)] {
+                        let (mut gm, mut gb) = ([0.0f32; 2], [0.0f32; 1]);
+                        multi.gradient(&[0.0, z], &target, &mut gm);
+                        binary.gradient(&[z], &[t], &mut gb);
+                        let (vm, vb) = (multi.value(&[0.0, z], &target), binary.value(&[z], &[t]));
+                        assert!(
+                            (vm - vb).abs() <= 1e-5 * (1.0 + vb),
+                            "γ = {gamma}, α = {a}, z = {z}, t = {t}: {vm} vs {vb}"
+                        );
+                        assert!(
+                            (gm[1] - gb[0]).abs() < 1e-6 && (gm[0] + gb[0]).abs() < 1e-6,
+                            "γ = {gamma}, α = {a}, z = {z}, t = {t}: {gm:?} vs {gb:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn focal_softmax_gradient_sums_to_zero_and_has_the_right_signs() {
+        let focal = FocalSoftmaxCrossEntropy::<4>::new(2.0).with_alpha([1.0, 2.0, 0.5, 3.0]);
+        let mut g = [0.0f32; 4];
+        for z in [
+            [0.5f32, -1.0, 2.0, 0.1],
+            [3.0, 3.0, 3.0, 3.0],
+            [-4.0, 8.0, 0.0, 1.0],
+        ] {
+            for y in 0..4 {
+                let mut t = [0.0f32; 4];
+                t[y] = 1.0;
+                focal.gradient(&z, &t, &mut g);
+                assert!(g.iter().sum::<f32>().abs() < 1e-5, "{z:?} y = {y}: {g:?}");
+                assert!(g[y] <= 0.0, "die Zielklasse wird nach oben gezogen: {g:?}");
+                assert!(
+                    g.iter().enumerate().all(|(c, &v)| c == y || v >= 0.0),
+                    "die anderen Klassen nach unten: {g:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn focal_softmax_damps_easy_samples_more_than_cross_entropy() {
+        let focal = FocalSoftmaxCrossEntropy::<3>::new(2.0);
+        let ce = SoftmaxCrossEntropy::new();
+        let t = [1.0f32, 0.0, 0.0];
+        let (mut gf, mut gc) = ([0.0f32; 3], [0.0f32; 3]);
+        let norm = |g: &[f32; 3]| g.iter().map(|x| x.abs()).sum::<f32>();
+        // Leicht (p ≈ 0,98): Der Gradient fällt um mehr als den Faktor 100.
+        let easy = [4.0f32, 0.0, 0.0];
+        focal.gradient(&easy, &t, &mut gf);
+        ce.gradient(&easy, &t, &mut gc);
+        assert!(norm(&gf) < 0.01 * norm(&gc), "{gf:?} vs {gc:?}");
+        // Schwer (p ≈ 0,06): fast unverändert groß.
+        let hard = [-4.0f32, 0.0, 0.0];
+        focal.gradient(&hard, &t, &mut gf);
+        ce.gradient(&hard, &t, &mut gc);
+        assert!(norm(&gf) > 0.8 * norm(&gc), "{gf:?} vs {gc:?}");
+    }
+
+    #[test]
+    fn focal_softmax_is_finite_for_extreme_logits_and_small_gamma() {
+        // γ < 1 ist der Fall, in dem q^(γ-1) bei q = 0 divergiert (0 · ∞ = NaN, wenn naiv gerechnet).
+        for gamma in [0.0f32, 0.3, 0.9, 1.0, 2.0, 5.0] {
+            let focal = FocalSoftmaxCrossEntropy::new(gamma).with_alpha([0.25, 1.0, 4.0]);
+            for z in [
+                [1000.0f32, 0.0, -1000.0],
+                [-1000.0, 1000.0, 0.0],
+                [0.0, -1e30, 1e30],
+                [1e30, 1e30, 1e30],
+                [0.0; 3],
+            ] {
+                for t in [
+                    [1.0f32, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                    [0.2, 0.3, 0.5],
+                ] {
+                    let v = focal.value(&z, &t);
+                    let mut g = [0.0f32; 3];
+                    focal.gradient(&z, &t, &mut g);
+                    assert!(
+                        v.is_finite() && v >= 0.0 && g.iter().all(|x| x.is_finite()),
+                        "γ = {gamma}, z = {z:?}, t = {t:?}: {v} {g:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn focal_softmax_near_one_is_tiny_and_finite() {
+        // Referenz (Python, math): z = [10, 0, 0], t = [1, 0, 0], γ = 2:
+        // q = 1 - p = 2·e^-10 / (1 + 2·e^-10), Wert = q² · (-ln p) ≈ 7.4844e-13.
+        // Mit q = 1 - p in f32 käme durch Auslöschung 0 oder ein Vielfaches heraus.
+        let focal = FocalSoftmaxCrossEntropy::<3>::new(2.0);
+        let v = focal.value(&[10.0, 0.0, 0.0], &[1.0, 0.0, 0.0]);
+        assert!((v - 7.4844e-13).abs() <= 7.4844e-13 * 0.01, "v = {v}");
+        let (z, t) = ([20.0f32, 0.0, 0.0], [1.0f32, 0.0, 0.0]);
+        let mut g = [0.0f32; 3];
+        focal.gradient(&z, &t, &mut g);
+        let v = focal.value(&z, &t);
+        assert!(v.is_finite() && (0.0..=1e-20).contains(&v), "v = {v}");
+        assert!(g.iter().all(|x| x.is_finite() && x.abs() <= 1e-20), "{g:?}");
+    }
+
+    #[test]
+    fn focal_softmax_ln_p_to_minus_infinity() {
+        // Zielklasse praktisch unmöglich: ln p = -1000. Wert α · 1 · 1000, Gradient exakt -α·1 / +α·p.
+        let focal = FocalSoftmaxCrossEntropy::<2>::new(2.0).with_alpha([1.0, 0.5]);
+        let (z, t) = ([1000.0f32, 0.0], [0.0f32, 1.0]);
+        assert!(close(focal.value(&z, &t), 500.0, 1e-6));
+        let mut g = [0.0f32; 2];
+        focal.gradient(&z, &t, &mut g);
+        assert_eq!(g, [0.5, -0.5]);
+        // Logit -∞ auf der Zielklasse: Wert +∞, Gradient endlich.
+        let z = [0.0f32, f32::NEG_INFINITY];
+        assert_eq!(focal.value(&z, &t), f32::INFINITY);
+        focal.gradient(&z, &t, &mut g);
+        assert_eq!(g, [0.5, -0.5]);
+        // Maskierte Klasse mit Ziel 0 stört nicht.
+        let masked = FocalSoftmaxCrossEntropy::<3>::new(2.0);
+        let mut g3 = [0.0f32; 3];
+        masked.gradient(&[0.5, f32::NEG_INFINITY, 1.0], &[0.0, 0.0, 1.0], &mut g3);
+        assert!(g3.iter().all(|x| x.is_finite()) && g3[1] == 0.0, "{g3:?}");
+        assert!(masked
+            .value(&[0.5, f32::NEG_INFINITY, 1.0], &[0.0, 0.0, 1.0])
+            .is_finite());
+    }
+
+    #[test]
+    fn focal_softmax_single_class_and_nan() {
+        let one = FocalSoftmaxCrossEntropy::<1>::new(2.0);
+        let mut g = [9.0f32];
+        one.gradient(&[3.0], &[1.0], &mut g);
+        assert_eq!((one.value(&[3.0], &[1.0]), g), (0.0, [0.0]));
+
+        let focal = FocalSoftmaxCrossEntropy::<2>::new(2.0);
+        assert!(focal.value(&[f32::NAN, 0.0], &[1.0, 0.0]).is_nan());
+        let mut g = [0.0f32; 2];
+        focal.gradient(&[f32::NAN, 0.0], &[1.0, 0.0], &mut g);
+        assert!(g.iter().all(|x| x.is_nan()), "{g:?}");
+        // Auch bei γ = 0 (wo powf(NaN, 0) = 1 wäre) bleibt der Gradient NaN.
+        FocalSoftmaxCrossEntropy::<2>::new(0.0).gradient(&[f32::NAN, 0.0], &[1.0, 0.0], &mut g);
+        assert!(g.iter().all(|x| x.is_nan()), "{g:?}");
+    }
+
+    #[test]
+    fn focal_softmax_defaults_getters_and_validation() {
+        let d = FocalSoftmaxCrossEntropy::<3>::default();
+        assert_eq!((d.gamma(), d.alpha()), (2.0, None));
+        let f = FocalSoftmaxCrossEntropy::new(1.5).with_alpha([0.1, 0.2, 0.7]);
+        assert_eq!((f.gamma(), f.alpha()), (1.5, Some(&[0.1, 0.2, 0.7])));
+    }
+
+    #[test]
+    #[should_panic(expected = "gamma muss endlich und >= 0 sein")]
+    fn focal_softmax_rejects_negative_gamma() {
+        let _ = FocalSoftmaxCrossEntropy::<3>::new(-0.1);
+    }
+
+    #[test]
+    #[should_panic(expected = "gamma muss endlich und >= 0 sein")]
+    fn focal_softmax_rejects_nan_gamma() {
+        let _ = FocalSoftmaxCrossEntropy::<3>::new(f32::NAN);
+    }
+
+    #[test]
+    #[should_panic(expected = "alpha[1] muss endlich und >= 0 sein")]
+    fn focal_softmax_rejects_a_negative_alpha() {
+        let _ = FocalSoftmaxCrossEntropy::new(2.0).with_alpha([1.0, -0.1, 1.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "alpha braucht mindestens ein Element > 0")]
+    fn focal_softmax_rejects_all_zero_alpha() {
+        let _ = FocalSoftmaxCrossEntropy::new(2.0).with_alpha([0.0, 0.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Klassenzahl K")]
+    fn focal_softmax_checks_the_output_length_against_k() {
+        let _ = FocalSoftmaxCrossEntropy::<3>::new(2.0).value(&[0.0; 2], &[0.0; 2]);
+    }
+
+    #[test]
+    fn new_losses_match_finite_differences_loosely() {
+        // Grobe Probe mit dem Hilfsmittel des Moduls; die enge Prüfung (Richardson-Extrapolation,
+        // viele Punkte) steht in tests/loss_ext_gradcheck.rs.
+        check(
+            WeightedSoftmaxCrossEntropy::new([1.0, 4.0, 0.5, 2.0]),
+            &[0.5, -1.0, 2.0, 0.1],
+            &[0.2, 0.5, 0.2, 0.1],
+        );
+        check(
+            KlDivergence::new().with_temperature(2.0),
+            &[0.5, -1.0, 2.0, 0.1],
+            &[0.2, 0.5, 0.2, 0.1],
+        );
+        check(PoissonNll::new(), &[0.5, -1.0, 1.2], &[2.0, 0.0, 3.0]);
+        check(QuantileLoss::new(0.8), &[0.5, -1.0, 1.2], &[2.0, 0.0, 0.3]);
+        check(
+            FocalSoftmaxCrossEntropy::new(2.0).with_alpha([1.0, 2.0, 0.5, 3.0]),
+            &[0.5, -1.0, 2.0, 0.1],
+            &[0.2, 0.5, 0.2, 0.1],
         );
     }
 }

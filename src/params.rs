@@ -6,7 +6,7 @@
 //!
 //! * die Parameter-Tensoren in fester **Export-Reihenfolge** (Layer in
 //!   Vorwärtsrichtung; je Dense-Layer erst die Gewichte, zeilenmajor
-//!   `OUT × IN`, dann der Bias),
+//!   `OUT × IN`, dann der Bias; je Layer-Normalisierung erst `gamma`, dann `beta`),
 //! * eine **Signatur** je parametertragendem Layer (Typ, Dimensionen,
 //!   Aktivierung), aus der ein [`fingerprint`](Params::fingerprint) der
 //!   Architektur entsteht,
@@ -16,6 +16,13 @@
 //! Layer ohne Parameter (Dropout) tauchen weder im Export noch im Fingerprint
 //! auf: Ein mit Dropout trainiertes Netz lässt sich daher in dasselbe Netz ohne
 //! Dropout laden.
+//!
+//! Eine Ausnahme bilden **Strukturmarker**: Eine Skip-Verbindung
+//! ([`Residual`](crate::residual::Residual)) trägt keine Parameter, ändert aber, *was* das Netz
+//! rechnet (`x + f(x)` statt `f(x)`). Sie klammert die Signaturen ihres inneren Layers deshalb
+//! mit zwei Markern ([`LayerKind::ResidualBegin`] und [`LayerKind::ResidualEnd`]) in den
+//! Fingerprint ein. Marker zählen nicht als Layer ([`Params::layer_count`]) und haben keine
+//! Parameter; bestehende Netze ohne Skip-Verbindung behalten Fingerprint und Modell-Bytes.
 
 use crate::model::{self, Crc32, ModelError};
 
@@ -83,14 +90,79 @@ impl core::fmt::Display for ParamError {
     }
 }
 
-/// Art eines parametertragenden Layers (Teil der Architektur-Signatur).
+/// Art eines Bausteins in der Architektur-Signatur.
 ///
-/// Die Zahlenwerte sind Teil des Dateiformats und dürfen sich nicht ändern.
+/// Die Zahlenwerte sind Teil des Dateiformats und dürfen sich nicht ändern: Sie gehen als erstes
+/// Byte jeder Signatur in den [`fingerprint`](Params::fingerprint) ein ([`LayerSig::feed`]).
+/// Neue Bausteine bekommen neue Nummern, vergebene Nummern werden nie wiederverwendet.
+///
+/// | Wert  | Variante                               | Bedeutung                             |
+/// |-------|----------------------------------------|---------------------------------------|
+/// | `1`   | [`Dense`](Self::Dense)                 | Voll vernetzter Layer                 |
+/// | `2`   | [`LayerNorm`](Self::LayerNorm)         | Layer-Normalisierung                  |
+/// | `128` | [`ResidualBegin`](Self::ResidualBegin) | Marker: Beginn einer Skip-Verbindung  |
+/// | `129` | [`ResidualEnd`](Self::ResidualEnd)     | Marker: Ende einer Skip-Verbindung    |
+///
+/// Die Werte `1..=127` sind parametertragenden Layern vorbehalten, ab `128` folgen
+/// **Strukturmarker** ([`is_marker`](Self::is_marker)): Sie tragen keine Parameter, zählen nicht
+/// in [`Params::layer_count`] und halten im Fingerprint fest, wie die Layer verschaltet sind.
+///
+/// Der Typ ist `#[non_exhaustive]`: Mit jedem neuen Baustein kommt eine Variante hinzu, ohne dass
+/// externer Code, der eine Wildcard-Arm schreibt, bricht.
+///
+/// ```
+/// use neuron::LayerKind;
+///
+/// // Die Kennungen sind das Byte im Fingerprint.
+/// assert_eq!(LayerKind::Dense.id(), 1);
+/// assert_eq!(LayerKind::LayerNorm.id(), 2);
+/// assert_eq!(LayerKind::ResidualBegin.id(), 128);
+/// assert_eq!(LayerKind::ResidualEnd.id(), 129);
+///
+/// // Nur die Marker sind keine Layer.
+/// assert!(!LayerKind::Dense.is_marker() && !LayerKind::LayerNorm.is_marker());
+/// assert!(LayerKind::ResidualBegin.is_marker() && LayerKind::ResidualEnd.is_marker());
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum LayerKind {
     /// Voll vernetzter Layer `y = f(W x + b)`.
     Dense = 1,
+    /// Layer-Normalisierung über die Merkmale eines Samples
+    /// ([`LayerNorm`](crate::norm::LayerNorm)). Im Feld `activation` der Signatur steht die
+    /// Bitdarstellung von `eps`.
+    LayerNorm = 2,
+    /// Strukturmarker: hier beginnt eine Skip-Verbindung `y = x + f(x)`
+    /// ([`Residual`](crate::residual::Residual)); es folgen die Signaturen von `f`.
+    ResidualBegin = 128,
+    /// Strukturmarker: hier endet die Skip-Verbindung, die [`ResidualBegin`](Self::ResidualBegin)
+    /// geöffnet hat.
+    ResidualEnd = 129,
+}
+
+impl LayerKind {
+    /// Die stabile Kennung dieser Art: das Byte, das in den Fingerprint eingeht.
+    ///
+    /// ```
+    /// use neuron::LayerKind;
+    /// assert_eq!(LayerKind::Dense.id(), 1);
+    /// ```
+    pub const fn id(self) -> u8 {
+        self as u8
+    }
+
+    /// `true` für Strukturmarker (kein Layer, keine Parameter, zählt nicht in
+    /// [`Params::layer_count`]), `false` für parametertragende Layer.
+    ///
+    /// ```
+    /// use neuron::LayerKind;
+    /// assert!(!LayerKind::Dense.is_marker());
+    /// assert!(LayerKind::ResidualEnd.is_marker());
+    /// ```
+    pub const fn is_marker(self) -> bool {
+        matches!(self, LayerKind::ResidualBegin | LayerKind::ResidualEnd)
+    }
 }
 
 /// Signatur eines parametertragenden Layers: genau das, was zwei Netze gemeinsam
@@ -99,8 +171,11 @@ pub enum LayerKind {
 /// [`Params::visit_signatures`] liefert sie in Vorwärtsrichtung, [`feed`](Self::feed) speist sie
 /// in kanonischer Byte-Form in eine Prüfsumme ein – und genau daraus entsteht der
 /// [`fingerprint`](Params::fingerprint). Eigene Layer mit Parametern melden hier ihre Form.
-/// Unterscheiden lassen sie sich im Fingerprint über Dimensionen und Aktivierungs-Kennung;
-/// [`LayerKind`] kennt bisher nur `Dense`.
+/// Unterscheiden lassen sie sich im Fingerprint über Art, Dimensionen und Aktivierungs-Kennung.
+/// Das Feld `activation` ist die Kennung der Aktivierung; Bausteine ohne Aktivierung nutzen es
+/// für eine andere stabile Konstante ihrer Konfiguration: [`LayerNorm`](crate::norm::LayerNorm)
+/// trägt dort die Bitdarstellung von `eps` ([`f32::to_bits`]), die Strukturmarker einer
+/// Skip-Verbindung eine `0`.
 ///
 /// ```
 /// use neuron::model::{crc32, Crc32};
@@ -151,7 +226,7 @@ pub struct LayerSig {
 impl LayerSig {
     /// Speist die Signatur in kanonischer Byte-Form (little endian) in `crc` ein.
     pub fn feed(&self, crc: &mut Crc32) {
-        crc.update(&[self.kind as u8]);
+        crc.update(&[self.kind.id()]);
         crc.update(&self.in_dim.to_le_bytes());
         crc.update(&self.out_dim.to_le_bytes());
         crc.update(&self.activation.to_le_bytes());
@@ -171,7 +246,9 @@ impl LayerSig {
 ///
 /// Die Parameter eines Netzes bilden eine feste Folge: Layer in Vorwärtsrichtung, je
 /// Dense-Layer **erst die Gewichte** (zeilenmajor, `OUT × IN`: eine Zeile je Neuron),
-/// **dann den Bias**. Layer ohne Parameter wie Dropout kommen darin nicht vor. Dieselbe
+/// **dann den Bias**, je Layer-Normalisierung **erst `gamma`, dann `beta`**. Layer ohne Parameter
+/// wie Dropout und Skip-Verbindungen (sie reichen die Parameter ihres inneren Layers durch)
+/// kommen darin nicht als eigene Einträge vor. Dieselbe
 /// Folge verwenden [`copy_params_to_slice`](Self::copy_params_to_slice),
 /// [`copy_params_from_slice`](Self::copy_params_from_slice) und das Modellformat.
 ///
@@ -275,16 +352,20 @@ pub trait Params {
     fn visit_params_mut<F: FnMut(&mut [f32])>(&mut self, f: &mut F);
 
     /// Ruft `f` mit der Signatur jedes parametertragenden Layers auf (in
-    /// Vorwärtsrichtung).
+    /// Vorwärtsrichtung). Strukturmarker ([`LayerKind::is_marker`]) kommen als eigene Signaturen
+    /// hinzu: Eine Skip-Verbindung klammert die Signaturen ihres inneren Layers damit ein.
     ///
     /// Beispiel: siehe [`LayerSig`].
     fn visit_signatures<F: FnMut(LayerSig)>(&self, f: &mut F);
 
     /// Anzahl der parametertragenden Layer.
     ///
-    /// Das ist die Zahl der Aufrufe von [`visit_signatures`](Self::visit_signatures) – Dropout
-    /// zählt nicht mit. Das Modellformat legt sie im Header ab
-    /// ([`ModelHeader::layer_count`](crate::model::ModelHeader::layer_count)).
+    /// Das ist die Zahl der Signaturen aus [`visit_signatures`](Self::visit_signatures), ohne die
+    /// Strukturmarker ([`LayerKind::is_marker`]) – Dropout zählt nicht mit, eine
+    /// Skip-Verbindung ([`Residual`](crate::residual::Residual)) auch nicht, wohl aber die Layer
+    /// in ihr. Das Modellformat legt die Zahl im Header ab
+    /// ([`ModelHeader::layer_count`](crate::model::ModelHeader::layer_count)); die Beschreibung
+    /// dort („Anzahl parametertragender Layer“) gilt damit unverändert.
     ///
     /// ```
     /// use neuron::prelude::*;
@@ -297,7 +378,11 @@ pub trait Params {
     /// ```
     fn layer_count(&self) -> usize {
         let mut n = 0;
-        self.visit_signatures(&mut |_| n += 1);
+        self.visit_signatures(&mut |sig: LayerSig| {
+            if !sig.kind.is_marker() {
+                n += 1;
+            }
+        });
         n
     }
 
@@ -313,7 +398,9 @@ pub trait Params {
     /// Netz und seine Inferenz-Variante ([`IntoInference`](crate::infer::IntoInference)) und
     /// unabhängig von Dropout, das keine Parameter hat. Er ändert sich bei anderen
     /// Dimensionen, anderer Aktivierung (auch bei anderem Parameter der Aktivierung), anderer
-    /// Layer-Zahl und anderer Reihenfolge. Das Modellformat legt ihn im Header ab und
+    /// Layer-Zahl und anderer Reihenfolge – und dadurch, dass eine Skip-Verbindung
+    /// ([`Residual`](crate::residual::Residual)) um Layer gelegt ist (Strukturmarker, siehe
+    /// [`LayerKind`]). Das Modellformat legt ihn im Header ab und
     /// vergleicht ihn beim Laden mit dem Zielnetz.
     ///
     /// ```
