@@ -45,10 +45,7 @@
 - SkipInit
 - T-Fixup
 - DeepNet Init (DeepNorm)
-- Mitchell Init
 - Megatron Init
-- Small Init
-- Wang Init
 - muP (Maximal Update Parametrization)
 
 ## Orthogonal und strukturiert
@@ -98,8 +95,6 @@
 - Whitening Init
 - K-Means Init
 - Gradient-Norm Init (GradInit)
-- ZerO Init
-- Mimetic Init
 - SAL (Signal Propagation) Init
 - Dynamical Isometry Init
 - Edge-of-Chaos Init
@@ -111,8 +106,6 @@
 - Transfer Init
 - Net2Net Init
 - Network Morphism Init
-- Weight Selection Init
-- Weight Inheritance Init
 - Lottery-Ticket Init
 - Rewinding Init
 
@@ -247,11 +240,48 @@
 - Uniform (−0.05, 0.05)
 - Nguyen-Widrow
 - Sparse Initialization
-- Marginal Init
-- Mean-Field Init
-- Gaussian Prior Init
 - Bayesian Prior Init
 - Variational Posterior Init
 - Weight Perturbation Init
+
+## Graph Neural Networks (GNNs)
+- Degree-Scaled Init
+- Graph Laplacian Eigenvector Init
+- Spectral Graph Wavelet Init
+- Relational Basis / Block-Diagonal Init (RGCN)
+
+## Kolmogorov-Arnold Networks (KANs) & Modern MoE
+- KAN Spline-Grid Init
+- KAN Residual Base Init
+- MoE Router / Gate Uniform-Noise Init
+- Router Orthogonal Init
+
+## Implicit Representations & PINNs (Physics-Informed)
+- WIRE Init (Complex Gabor Wavelet)
+- PINN Fourier Multi-Scale Init
+- Equivariant Clebsch-Gordan Init
+- Steerable Filter Init
+
+## Fortgeschrittene State-Space & Long-Context Initialisierungen
+- HiPPO-LegS / HiPPO-Lag Matrices
+- Mamba2 / SSD Discretization Init
+- Complex EMA Decay Init (Mega)
+
+## Weitere Adapter & Low-Rank Verfahren
+- VeRA Init (Frozen Random Matrix + Vector Scaling)
+- LoRA-XS (SVD-Truncated Base Init)
+- Null-Space Projection Init
+
+## Ungeprüft / unklare Namen (Existenz und Schreibweise noch zu klären)
+- Wang Init
+- Mitchell Init
+- Marginal Init
+- Mean-Field Init
+- Weight Selection Init
+- Weight Inheritance Init
+- Mimetic Init
+- ZerO Init
+- Small Init
 - Noisy Init
+- Gaussian Prior Init
 - Symmetry-Breaking Init
