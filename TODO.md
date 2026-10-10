@@ -1,248 +1,74 @@
-# TODO – Ideen und offene Punkte
+# TODO – Konkrete, anstehende Aufgaben
 
-Stand: Lückenanalyse zu Initialisierern, Aktivierungen und Layertypen ergänzt und um weitere fehlende Varianten erweitert (Abschnitte „Initialisierer“,
-„Aktivierungen“, „Layer“); davor nach den Runden „Priorität 1–3" (BCE-Logits, `ParamKind`, Modellformat,
-Inferenz-Typen, Hard-Aktivierungen, Lion, CI), „Verluste, Optimizer, Trainings-Hilfen,
-Inferenz-Entscheidungen" und „Qualität der Basis / 0.2.0" (nur noch die Logit-Variante der
-binären Kreuzentropie, einheitliche Loss-Konstruktoren, gepinnte Toolchain und Actions,
-`CHANGELOG.md`, Doctests an Crate und Traits; Breaking Changes sind in der Entwicklungsphase
-ausdrücklich erlaubt, Migration: `CHANGELOG.md`) und „Erweiterungen“ (weitere Aktivierungen, Verluste,
-Optimizer, Lernraten-Pläne, Kalibrierung und Metriken, `Residual`, `LayerNorm`, `chain!`). Reihenfolge innerhalb einer Gruppe
-= empfohlene Reihenfolge. `[ ]` offen, `[x]` erledigt.
+Nur offene, direkt umsetzbare Punkte. Reihenfolge innerhalb einer Gruppe = empfohlene Reihenfolge.
+Erledigtes steht in `COMPLETED.md`, große/vage Ziele in `ROADMAP.md`. `[ ]` = offen.
 
-## Erledigt
+## 1. Sofort / Qualität der Basis
 
-- [x] `BinaryCrossEntropyWithLogits` (Gradient `σ(z) − t`), `math::sigmoid`
-- [x] `InferenceDense`, `InferLayer`, `IntoInference` (≈ 50 % weniger Speicher), einzelner Layer als `static` im Flash
-- [x] Modellformat mit Header, Architektur-Fingerprint und CRC32 (`Params::save_model` / `load_model`)
-- [x] `ParamKind` (Weight Decay nur auf Gewichte), `RmsProp` ohne unnötigen Momentum-Puffer
-- [x] `Relu6`, `HardSigmoid`, `HardSwish`, `HardTanh`, `Softsign`; `Lion`
-- [x] CI-Workflow (fmt, clippy, tests, Bare-Metal-Build, MSRV, Doku); der Test-Job führt zusätzlich die Beispiele aus
-      (`cargo test` baut sie nur)
-- [x] Verluste: `LogCosh`, `Hinge`, `SquaredHinge`, `WeightedBinaryCrossEntropyWithLogits` (`pos_weight`),
-      `FocalLossWithLogits`, `LabelSmoothingCrossEntropy`
-- [x] Optimizer: `NAdam`, `RAdam`, `Lookahead<O>` (Wrapper um jeden Optimizer); Adam/AdamW per Golden-Test bitgleich
-- [x] Training ohne Heap: `Trainer::train_epoch` (Mischen + Mini-Batches), `evaluate_batch`, `Rng::below`, `rng::shuffle`,
-      `Standardizer`/`RunningStats`, `one_hot`, `EarlyStopping`, `ParamEma`, `ConfusionMatrix`, `r2_score`
-- [x] Inferenz: `InferExt` (`classify`, `classify_confident`, `probabilities`, `top_k`, `accuracy`), `math::softmax_confidence`,
-      `math::top_k`; Beispiel `examples/classifier.rs`
-- [x] `BinaryCrossEntropy` (auf Wahrscheinlichkeiten, sättigt) **entfernt** statt deprecated (0.2.0, Breaking): es gibt nur noch
-      `BinaryCrossEntropyWithLogits`; ein test-lokaler Nachbau in `tests/training_extensions.rs` belegt das Einfrieren
-- [x] Einheitliche Loss-Konstruktoren (0.2.0, Breaking): jeder Verlust mit `X::new(..)` und `Default`; parameterlose als
-      `#[non_exhaustive]`-Einheits-Structs (`Mse::new()`), parametrische mit privaten Feldern, Gettern und validierten
-      `new`/`with_*` (`Huber::new(0.5)`, `FocalLossWithLogits::new(2.0).with_alpha(0.25)`)
-- [x] Toolchain gepinnt: `rust-toolchain.toml` (1.99.0), in der CI dieselbe Version samt Konsistenz-Job gegen die Datei;
-      die Mindestversion der Bibliothek (1.80) prüft ein eigener Job
-- [x] GitHub Actions auf Commit-SHAs gepinnt (Tag als Kommentar), Dependabot für `github-actions`
-- [x] `CHANGELOG.md` (Format „Keep a Changelog", Release-Prozess) und Version 0.2.0
-- [x] MSRV-Zusage ausdrücklich auf die Bibliothek beschränkt (README, Abschnitt „Grenzen“; die CI prüft
-      `cargo +1.80.0 build --lib`). Tests, Doctests und Beispiele bauen und laufen lokal ebenfalls auf 1.80
-      (`cargo +1.80.0 test`, mit und ohne `alloc`), die CI erzwingt das aber nicht
-- [x] Doctests: in `src/lib.rs` Schnellstart-Training, Epochen mit Early Stopping, Inferenz (inkl. `static` im Flash),
-      Modell speichern → laden (inkl. Fehlerfälle); an den erweiterbaren Traits `Loss`, `Optimizer`, `Activation`,
-      `Initializer`, `LrSchedule` (je ein eigener Typ), `Layer`/`Chain`, `Params`/`ParamError` und am Modellformat,
-      an `Dense`/`InferenceDense`, `Sequential`, `InferLayer`/`InferExt` und am `Trainer`
-- [x] Aktivierungen: `Selu` (+ `LecunNormal`/`LecunUniform`), `GeluExact`, `LogSigmoid`, `SwishBeta`, `Sine`, `Snake`;
-      schnelle Näherungen `FastTanh`/`FastSigmoid` für MCUs ohne schnelle Hardware-Mathematik
-- [x] Verluste: `WeightedSoftmaxCrossEntropy<K>` (Klassengewichte), `KlDivergence`, `PoissonNll`, `QuantileLoss`,
-      `FocalSoftmaxCrossEntropy<K>`
-- [x] Optimizer: `AmsGrad`, `Adamax`, `Adadelta`; L1-Regularisierung (`with_l1`) für `Sgd`/`Momentum`;
-      `Optimizer::reset` und `Trainer::reset_optimizer_state` (u. a. `Lookahead` nach `load_model`)
-- [x] Training: `LinearDecay`, `PolynomialDecay`, `CosineWarmRestarts`, `OneCycle`, `InverseSqrtDecay`,
-      `ReduceLrOnPlateau`, `LrRangeTest` (Lernraten-Finder), `ParamEma::with_warmup`, `KFold`, `train_val_split`
-- [x] Inferenz/Metriken: Temperatur-Kalibrierung (`fit_temperature`, `classify_with_confidence_at`),
-      `evaluate_confusion`, `evaluate_calibration`, `accuracy_top_k`, `infer_batch`; MAE/MSE/RMSE/`max_error`/
-      `explained_variance_score`, `log_loss`, `roc_auc`, `CalibrationBins` (ECE)
-- [x] Layer: `Residual<L>`, `LayerNorm<N>` (samt Inferenz-Gegenstücken) und das Makro `chain!`
-
-## Sofort / Qualität der Basis
-
-- [ ] **CI zum ersten Mal auf GitHub laufen lassen** und Fehler beheben. Der Workflow wurde bisher nur
-      lokal nachgespielt (alle `run`-Schritte mit Matrix-Expansion); ob die Action-Referenzen (jetzt
-      Commit-SHAs) auflösen und `.github/dependabot.yml` greift, ist ungeprüft.
-- [ ] **Bare-Metal-Test ausführen, nicht nur bauen:** kleines `no_std`-Binary für Cortex-M, das in CI
-      unter `qemu-system-arm` (Semihosting) eine Inferenz rechnet und das Ergebnis prüft.
-- [ ] **Flash-Größe verfolgen:** `cargo size` für ein Beispielnetz in CI, damit Größen-Regressionen
-      auffallen. Dabei messen, wie viel `assert_eq!`-Formatierung kostet (bisher nur vermutet) und ob
-      `try_*`-Varianten mit `Result` sinnvoll sind.
-- [ ] Benchmarks (Zyklen je Forward/Backward) für `Dense` und `InferenceDense`.
+- [ ] **CI zum ersten Mal auf GitHub laufen lassen** und Fehler beheben. Der Workflow wurde bisher nur lokal nachgespielt;
+      ob die Action-Referenzen (Commit-SHAs) auflösen und `.github/dependabot.yml` greift, ist ungeprüft.
+- [ ] **Bare-Metal-Test ausführen, nicht nur bauen:** kleines `no_std`-Binary für Cortex-M, das in CI unter
+      `qemu-system-arm` (Semihosting) eine Inferenz rechnet und das Ergebnis prüft.
+- [ ] **Flash-Größe verfolgen:** `cargo size` für ein Beispielnetz in CI; dabei messen, wie viel `assert_eq!`-Formatierung
+      kostet und ob `try_*`-Varianten mit `Result` sinnvoll sind.
+- [ ] Benchmarks (Zyklen je Forward/Backward) für `Dense`, `InferenceDense` und die Activation-Extensions;
+      Zyklenmessung der `Fast*`-Aktivierungen auf Zielhardware oder unter `qemu-system-arm`.
 - [ ] Fuzz-Ziel für `load_model` / `inspect` (eigenes Crate, damit das Hauptcrate abhängigkeitsfrei bleibt).
+- [ ] Doku: `gelu_adamw`-Beispiel erweitern; weitere Doctests an einzelnen Implementierungen (Aktivierungen, Initialisierer,
+      Optimizer außer `Lookahead`, Lernraten-Pläne, Verluste außer `BinaryCrossEntropyWithLogits`) sowie `Dropout`,
+      `Buffer`/`Storage`, `ParamKind`, `LayerKind`; `include_bytes!`-Einbettung als ausgeführten Doctest statt `text`-Block.
 
-## Modellformat und Embedded
+## 2. Trait-Änderungen bündeln (Breaking, gemeinsam einführen)
 
-- [ ] **Mehrlagige Netze als `static` im Flash:** zustandsloses `infer_into(&self, input, scratch, out)`
-      am `InferLayer`-Trait (Zwischenpuffer vom Aufrufer), damit auch `InferChain` unveränderlich sein
-      kann. Heute passt nur ein einzelner `InferDense` in ein `static`.
+- [ ] Zustandsloses `infer_into(&self, input, scratch, out)` am `InferLayer`-Trait → mehrlagige Netze (`InferChain`) und `InferExt` als `static` im Flash.
+- [ ] `visit_grads_mut` am `Layer`-Trait → Gradient-Clipping nach Wert (`Trainer::set_grad_clip_value`).
+- [ ] Parametergruppen (Lernrate/Decay je Layer) und eigene `ParamKind`-Art für Normierungsparameter.
+- [ ] `Activation::signature` für eigene Aktivierungen erzwingen oder ableiten (`0` = „unspezifiziert").
+- [ ] `ActivationKind` als `#[non_exhaustive]` und geprüfte Konstruktoren für Parameter-Varianten (`ActivationKind::sine(omega)`).
+- [ ] `CosineAnnealing` numerisch stabil (ändert Rechenergebnisse → mit Versionssprung bündeln).
+- [ ] `infer`-Variante, die nur vom Netz borgt (Temporaries als Eingabe).
 
-- [ ] **Version 2 mit `dtype`-Feld** (Flags sind bereits reserviert): `i8`/`Q15` neben `f32`.
-- [ ] **Quantisierung für die Inferenz:** int8-Gewichte mit Skalierung je Zeile/Tensor,
-      Ganzzahl-Akkumulator; `QuantizedDense` als weiterer `InferLayer`. Größter Hebel für knappen Flash/RAM.
-      Entwurfshindernis: `InferLayer` verlangt `Params` (nur `f32`-Tensoren), `i8`-Gewichte passen weder dort noch
-      ins Modellformat (Version 2 mit `dtype`-Feld); beides gehört zusammen entworfen.
-- [ ] **Modell zur Compilezeit einlesen:** `const fn`-Parser, der ein `include_bytes!`-Modell in eine
-      `static` `InferDense` verwandelt (null RAM für die Gewichte, keine Ladezeit).
-- [ ] `LayerKind` erweitert sich mit jedem neuen parametertragenden Layer (LayerNorm, Conv, …) –
-      Kennungen sind Teil des Formats und dürfen sich nicht ändern.
-- [ ] `Activation::signature` für eigene Aktivierungen erzwingen oder besser ableiten (derzeit `0` =
-      „unspezifiziert"; `core::any::type_name` ist über Compilerversionen nicht stabil).
-- [ ] `InferSequential` und Modell-Konvertierung ohne `alloc`-Umweg für gemischte Topologien prüfen.
-- [ ] Optionaler stärkerer Fingerprint (64 Bit) und/oder Signatur, falls Manipulationsschutz gewünscht ist
-      (CRC32 schützt nur vor Zufallsfehlern).
+## 3. Aktivierungen (je mit Gradcheck, `ActivationKind`-Variante, Fingerprint-Signatur)
 
-## Aktivierungen
+- [ ] `Celu`, `Softshrink`/`Hardshrink`/`Tanhshrink`, `SquaredRelu`, `Gaussian`, `BentIdentity`, `Isru`/`Isrlu`, `Sinc`, `Erf`, `Threshold`.
+- [ ] `QuickGelu`, `LeCunTanh`, `Atan`, `Lisht`, `Squareplus`, `Smish`/`Logish`, `Elish`/`HardElish`, `Cos`, `Exp`/`Softexp`, `BinaryStep` (Straight-Through).
+- [ ] Schnelle Näherungen `FastSwish`, `FastGelu`, `FastMish`.
 
-- [ ] **Weitere elementweise Aktivierungen** (passen in den `Activation`-Trait, je mit Gradcheck): `Celu`
-      (stetig differenzierbares ELU), `Softshrink`/`Hardshrink`/`Tanhshrink`, `SquaredRelu` (`relu(x)²`),
-      `Gaussian` (`exp(−x²)`), `BentIdentity`, `Isru`/`Isrlu`, `Sinc`, `Erf`, `Threshold`; `RReLU` braucht
-      Zufall im Forward und ist damit ein Sonderfall
-- [ ] **Noch nicht aufgeführte elementweise Aktivierungen** (je mit Gradcheck, `ActivationKind`-Variante und Fingerprint-Signatur):
-      `QuickGelu` (`x·σ(1,702x)`, billige GELU-Näherung), `LeCunTanh` (`1,7159·tanh(2x/3)`, passt zu LeCun-Init),
-      `Atan` (`arctan`), `Lisht` (`x·tanh x`), `Squareplus` (`(x+√(x²+b))/2`, billiges Softplus ohne `exp`),
-      `Smish`/`Logish`, `Elish`/`HardElish`, `Selu`-Verwandte `Pelu`/`Srelu` (stückweise, lernbar), `Cos`,
-      `Exp`/`Softexp`; `BinaryStep` mit Straight-Through-Gradient (Quantisierungsnähe)
-- [ ] **Lernbare Aktivierungen** (`PReLU`, `β` bei Swish): erfordert Parameter am `Activation`-Trait
-      (`Params`-Anbindung, eigener Gradient). Größerer Umbau.
-- [ ] **Vektor-Aktivierungen als `Layer`** (nicht elementweise): `Softmax`, `LogSoftmax`
-      (Rückwärtsrechnung ohne Zusatzspeicher: `g_in = s ⊙ (g − g·s)`), `GLU`/`SwiGLU`, `Maxout`
-- [ ] **Weitere Vektor-/Gate-Aktivierungen:** `Softmin`, `Sparsemax` (exakte Nullen, Sortierpuffer nötig), `GeGLU`/`ReGLU`
-      neben `GLU`/`SwiGLU`, `Gumbel-Softmax` (Zufall im Forward), `L2Normalize` (Einheitsvektor, Rückwärtsrechnung
-      `(g − ŷ(g·ŷ))/‖x‖`); `Softmax` mit Temperatur als Parameter
-- [ ] SIREN-Initialisierung als eigener `Initializer` (erste Schicht `U(-1/fan_in, 1/fan_in)`, weitere
-      `U(±√(6/fan_in)/ω)`): ein `Initializer` erkennt die erste Schicht bisher nicht
-- [ ] Alpha-Dropout für `Selu` (gewöhnliches `Dropout` stört die Selbstnormalisierung)
-- [ ] `ActivationKind` als `#[non_exhaustive]` markieren und geprüfte Konstruktoren für die Parameter-Varianten
-      (`ActivationKind::sine(omega)`); weitere Näherungen (`FastSwish`, `FastGelu`, `FastMish`); Zyklenmessung
-      der `Fast*`-Aktivierungen auf Zielhardware oder unter `qemu-system-arm`
+## 4. Initialisierer
 
-## Initialisierer
+- [ ] `Uniform(lo, hi)`, `Normal(mean, std)`, `Zeros`/`Ones`.
+- [ ] `TruncatedNormal`; He/Xavier mit einstellbarem Gain.
+- [ ] Bias-Vorbelegung (`bias_init`, z. B. Prior-Bias für `FocalLossWithLogits`).
+- [ ] `VarianceScaling { scale, mode, distribution }` (`fan_in`/`fan_out`/`fan_avg`).
+- [ ] `Initializer::for_activation` (He/Xavier/Lecun/SIREN je `ActivationKind`); SIREN-Init (erste Schicht gesondert).
+- [ ] `Identity`-Init für `Residual`-Zweige.
 
-Vorhanden: `Constant`, `XavierUniform/Normal`, `HeUniform/Normal`, `LecunUniform/Normal`.
+## 5. Verluste
 
-- [ ] **`Uniform(lo, hi)` / `Normal(mean, std)`** mit frei wählbaren Parametern (Basis für Sonderfälle)
-- [ ] **`TruncatedNormal`** (Ausreißer bei ±2σ abgeschnitten; Standard in Transformern) und `He`/`Xavier` mit
-      einstellbarem Gain (`LeakyRelu`-Steigung, `gain` für `Tanh`: 5/3)
-- [ ] **`Orthogonal`** (Gram-Schmidt auf zufälliger Matrix, ohne Heap für kleine feste Größen schwierig – braucht
-      Arbeitsspeicher von `rows × cols`; evtl. nur mit `alloc`) und `Identity` (für `Residual`-Zweige)
-- [ ] Vorbelegung des Bias: `fill` füllt nur Gewichte; ein `bias_init` (z. B. Prior-Bias `−ln((1−π)/π)` für
-      `FocalLossWithLogits`, Vergessens-Bias 1 bei LSTM) fehlt
-- [ ] **Allgemeiner `VarianceScaling { scale, mode, distribution }`** (Keras/TF-Stil): `mode` ∈ `fan_in`/`fan_out`/`fan_avg`,
-      `distribution` ∈ gleichverteilt/normal/abgeschnitten normal. Alle He-/Xavier-/Lecun-Typen wären Spezialfälle;
-      heute fehlen vor allem die `fan_out`-Variante (PyTorch `mode='fan_out'`, für Faltungen) und `fan_avg` bei He
-- [ ] **Skalierte Residual-Init** (GPT-2: Gewichte der Ausgangsprojektion mit `1/√(2·L)` skalieren), `ReZero`/`LayerScale`-Start
-      mit `0` bzw. kleinem `ε` (hängt an einem lernbaren Skalar-Layer, siehe „Layer"), Fixup-Init für `Residual` ohne Norm
-- [ ] `Sparse(density, std)` (nur ein Anteil der Gewichte ≠ 0, Echo-State-/RNN-Stil), `Zeros`/`Ones` als benannte
-      Kurzformen von `Constant`, Delta-Orthogonal/`Dirac` für Faltungen (erst mit `Conv`)
-- [ ] Init-Variante je `ActivationKind` (`Initializer::for_activation`): wählt He für ReLU-Familie, Xavier für `Tanh`/`Sigmoid`,
-      Lecun für `Selu`, SIREN für `Sine` – heute wählt der Aufrufer von Hand
-- [ ] Datenabhängige Init (`LSUV`) – nur falls Bedarf; SIREN-Init siehe „Aktivierungen"
+- [ ] `QuantileLoss` mit eigenem `τ` je Ausgang.
+- [ ] `WeightedSoftmaxCrossEntropy::balanced(counts)` samt Batch-Normierung (braucht `Loss::sample_weight`; Trait-Umbau, siehe Gruppe 2).
+- [ ] Fokalverlust mit Label Smoothing.
 
-## Verluste
-- [ ] `QuantileLoss` mit eigenem `τ` je Ausgang (mehrere Quantile in einem Netz)
-- [ ] Klassengewichte: `WeightedSoftmaxCrossEntropy::balanced(counts)` und die PyTorch-Normierung pro Batch
-      (Teilen durch `Σ w_{y_i}`) – braucht `Loss::sample_weight(target)` und eine Trainer-Änderung (Trait-Umbau)
-- [ ] Kombinierter Destillationsverlust `α·CE + (1-α)·T²·KL` (braucht zwei Ziele je Sample am `Loss`-Trait);
-      negative Binomialverteilung, Gamma/Tweedie, Poisson mit Exposure-Offset; Fokalverlust mit Label Smoothing
+## 6. Optimizer & Training
 
-## Optimizer und Training
+- [ ] Überlaufschutz für `g²` in `Adam`, `AmsGrad`, `Adadelta` ab ca. 1,8e19.
+- [ ] L1 für Adam-Familie, `Lion`, `RmsProp`, `Adagrad`, `Adadelta` (Wrapper `ProxL1<O>`).
+- [ ] `Trainer::reset_optimizer_state` ohne Allokation bei Heap-Netzen (Methoden an `Optimizer` und `Layer`).
+- [ ] `Trainer::train_epoch` über Indexmenge (für `KFold::train_indices`); `LrRangeTest`-Hilfsaufruf (Sichern/Messlauf/Wiederherstellen).
+- [ ] `ConfusionMatrix` mit Laufzeit-`K` (`alloc`), Genauigkeit je Klasse als Iterator.
+- [ ] Alpha-Dropout für `Selu`.
 
-- [ ] **`Adafactor`** (speicherarm): braucht die Matrixform des Tensors (Zeilen-/Spaltenstatistik), der
-      `Optimizer::update`-Aufruf liefert aber nur einen flachen Puffer. Erst möglich, wenn `ParamKind`
-      oder `update` die Form (`rows`, `cols`) mitbekommt.
-- [ ] **Clipping nach Wert** (`Trainer::set_grad_clip_value`): braucht einen schreibenden Gradienten-Besucher am
-      `Layer`-Trait (`visit_grads_mut`) – eine neue Pflichtmethode, die jede externe `Layer`-Implementierung bricht.
-      Zusammen mit anderen Trait-Änderungen einführen (oder mit Standard-Implementierung `unimplemented`).
-- [ ] **Parametergruppen** (verschiedene Lernraten/Decay je Layer) – `ParamKind` hat bisher nur
-      `Weight`/`Bias`; LayerNorm-Parameter bräuchten eine eigene Art.
-- [ ] `Standardizer` im Modellformat mitspeichern (Version 2 mit Flags): Skalierungskonstanten gehören zum Modell,
-      derzeit muss der Aufrufer sie getrennt ablegen
-- [ ] `ConfusionMatrix` mit Laufzeit-`K` (Feature `alloc`), Genauigkeit je Klasse als Iterator, ROC-Kurve als Punktfolge (`roc_auc` liefert nur den AUC-Wert, in O(n²))
-- [ ] L1 für die Adam-Familie (entkoppelte Schwelle `lr·λ` oder vorkonditioniert `lr·λ/(√v̂+ε)`) und für `Lion`,
-      `RmsProp`, `Adagrad`, `Adadelta` (etwa als Wrapper `ProxL1<O>`)
-- [ ] `Trainer::reset_optimizer_state` ohne Allokation bei Heap-Netzen (Zustand nullen statt neu anlegen; braucht
-      Methoden an `Optimizer` und `Layer`)
-- [ ] Überlaufschutz für `g²` in `Adam`, `AmsGrad` und `Adadelta` ab etwa 1,8e19 (Skalierung vor dem Quadrieren)
-- [ ] `CosineAnnealing` verliert nahe dem Planende in `f32` Stellen (die neuen Pläne nutzen die stabile Form);
-      Korrektur ändert Rechenergebnisse, also mit einem Versionssprung bündeln
-- [ ] `Trainer::train_epoch` über eine Indexmenge (für `KFold::train_indices`); `LrRangeTest`: Hilfsaufruf, der
-      Sichern, Messlauf und Wiederherstellen kapselt; `KFold` stratifiziert/wiederholt/gruppiert, Zeitreihen-Split
+## 7. Inferenz & Kalibrierung
 
-## Inferenz-Entscheidungen (Folgearbeit)
+- [ ] Temperatur-Skalierung für einzelnen Logit-Ausgang (`σ(z/T)`).
+- [ ] Brier-Score, adaptive Bins; ROC-Kurve als Punktfolge und AUC in O(n log n) (Sortierpuffer).
+- [ ] `InferSequential`/Modell-Konvertierung ohne `alloc`-Umweg für gemischte Topologien prüfen.
 
-- [ ] `InferExt` für `static` im Flash: braucht das zustandslose `infer_into` am Trait (siehe „Modellformat und Embedded")
-- [ ] Temperatur-Skalierung für einen einzelnen Logit-Ausgang (`σ(z/T)`; dort liefert `fit_temperature` 1.0),
-      weitere Kalibrierung (Brier-Score, adaptive Bins, Platt-/Vektor-Skalierung), ROC-Kurve als Punktfolge und
-      AUC in O(n log n) (braucht einen Sortierpuffer)
+## 8. Layer (nahe Ziele)
 
-## Layer
-
-- [ ] `BatchNorm` (der `Mode`-Schalter existiert; Laufstatistiken als Zustand)
-- [ ] `Conv1D`, Pooling, `Embedding`; rekurrente Layer (GRU/LSTM) brauchen Zustand über die Zeit
-- [ ] **Strukturelle Layer ohne/mit wenigen Parametern:** `Flatten`/`Reshape` (nur Typ-Umdeutung), `Scale`/`Bias`
-      (lernbarer Skalar bzw. Vektor), `Dense` ohne Bias (falls noch nicht möglich), `Concat`/Skip-Verbindungen
-      mit Verzweigung (`Parallel<A, B>`), `Highway`/Gated-Layer
-- [ ] **Faltung und Pooling im Detail:** `Conv1D` (zuerst, Sensor-/Audiodaten), `DepthwiseConv1D`, `Conv2D`,
-      `MaxPool`/`AvgPool`, `GlobalAvgPool`, `Upsample`; jeweils mit Inferenz-Gegenstück und Modellformat-`LayerKind`
-- [ ] **Sequenzlayer:** `Embedding`, einfaches `Rnn`/`Gru`/`Lstm` (Zustand über die Zeit, BPTT-Puffer), positionelle
-      Kodierung und Selbstaufmerksamkeit (`Attention`) – nur wenn Transformer-Modelle ein Ziel sind
-- [ ] **Regularisierungs-Layer:** `AlphaDropout` (zu `Selu`), `GaussianNoise`, `DropConnect`, `SpatialDropout`;
-      `Dropout` hat bisher kein Inferenz-Gegenstück nötig, aber `InferLayer`-Äquivalent (Identität) prüfen
-- [ ] **Activation-/Hilfs-Layer:** `ActivationLayer<A>` (eigenständige Aktivierung ohne `Dense`, nötig für `Softmax`, Aktivierung
-      vor `Residual`/Norm in Pre-Norm-Blöcken), `Identity`, `Clamp`/`Clip` (z. B. Ausgabe begrenzen), `Slice`/`Select`
-      (Teilvektor), `Pad`, `Permute`; `Dense` ohne Bias und mit festem (nicht trainierbarem) `Frozen<L>`-Wrapper
-      (Transfer Learning, nur die letzte Schicht trainieren)
-- [ ] **Weitere Normierungen:** `BatchNorm` samt **Folding in `InferenceDense`** (Statistik in Gewichte/Bias einrechnen, kostet zur
-      Inferenz nichts), `InstanceNorm`, `WeightNorm`/`SpectralNorm` (Gewichtsreparametrisierung), `LayerScale`/`ReZero`
-      (lernbarer Skalar je Kanal bzw. gesamt, startet bei 0/ε)
-- [ ] **Bilineare und gewichtsteilende Layer:** `Bilinear` (`x₁ᵀWx₂`), `LowRankDense`/LoRA-Adapter (`W + BA`, Rang `r`
-      – wenig Parameter, gut für Fine-Tuning auf MCUs), `TiedDense` (Gewichte teilen, Autoencoder), `MaskedDense`
-      (feste Sparsity-Maske), `Embedding`-Bag
-- [ ] **Faltungsvarianten über `Conv1D`/`Conv2D` hinaus:** `DilatedConv`/kausale Faltung (TCN, Zeitreihen), `ConvTranspose`,
-      `SeparableConv`, `1×1`-Faltung als `Dense` über Kanäle, `Squeeze-and-Excitation`; Pooling mit `LpPool`/`MinPool`
-- [ ] **Eingangskodierungen:** Fourier-Features/`PositionalEncoding` (sin/cos mit festen Frequenzen), `RBF`-Layer
-      (Zentren + Breiten), `Quantize`/`FakeQuant` (quantisierungsbewusstes Training, Voraussetzung für `QuantizedDense`)
-- [ ] **Stochastic Depth / `DropPath`** für `Residual` (ganzen Zweig mit Wahrscheinlichkeit auslassen) und `Cutout`/`Mixup`
-      als Daten-Augmentierung im Trainer (nicht als Layer)
-- [ ] `DynLayer`/`ActivationKind` und Modellformat-`LayerKind` für alle neuen Layer erweitern (Tabellenabgleich mit den Abschnitten
-      „Modellformat und Embedded" und „Layer"); `InferLayer`-Gegenstück für jeden neuen Typ
-- [ ] Heap-Varianten für `Residual`/`LayerNorm` in `Sequential` (verschachtelte Teilfolge; `HeapLayerNorm`),
-      `RmsNorm`, `GroupNorm`, `Residual` mit Projektion; eigene `ParamKind`-Art für Normierungsparameter
-- [ ] `LayerNorm` robust gegen Überlauf bei Eingaben über etwa 1e18; Typ-Aliase für verschachtelte `Chain`-Typen
-
-## Ergonomie und Dokumentation
-
-- [ ] Weitere Doctests an einzelnen öffentlichen Typen: Die Traits und zentralen Typen haben Beispiele (siehe
-      „Erledigt“); ein eigenes fehlt noch an den einzelnen Implementierungen (Aktivierungen, Initialisierer, Optimizer
-      außer `Lookahead`, Lernraten-Pläne, Verluste außer `BinaryCrossEntropyWithLogits`) und an `Dropout`,
-      `Buffer`/`Storage`, `ParamKind` und `LayerKind`. Der Weg „Modell mit `include_bytes!` ins Flash einbetten →
-      laden“ steht in `src/lib.rs` nur als `text`-Block (braucht eine Datei und `std` auf dem Host), nicht als
-      ausgeführter Doctest.
-- [ ] `infer` bindet das Ergebnis an Netz *und* Eingabe (nötig für zero-copy `Passthrough`);
-      eine Variante, die nur vom Netz borgt, würde Temporaries als Eingabe erleichtern.
-- [ ] Batch-Forward (Matrix × Matrix) für höheren Durchsatz auf Geräten mit Cache
-
-# Offene Aufgaben & Roadmap
-
-## Hohe Priorität (Nächstes Release)
-- [ ] Refactoring: API der Loss-Funktionen vereinheitlichen
-- [ ] Performance-Benchmarks für Activation-Extensions hinzufügen
-- [ ] Dokumentationsbeispiele für `gelu_adamw` erweitern
-
-## Geplante Features
-- [ ] Conv2D / Pooling Layer Implementierung
-- [ ] Quantisierung auf Fixed-Point / Int8 für Embedded Target
-- [ ] Export-Format für trainierte Modellgewichte festlegen
-
-## Ideen / Backlog
-- [ ] Multi-Threading Unterstützung für Batch-Processing evaluieren
-- [ ] Visualisierungs-Export (z. B. Graphviz / DOT-Export für Modellstrukturen)
-
-## Bekannte Einschränkungen (bewusst, siehe README)
-
-- `HardSigmoid` taugt nicht als versteckte Schicht (im Bereich `(−3, 3)` linear).
-- Das Modellformat speichert nur `f32`; Optimizer-Zustand und Gradienten werden nicht gespeichert.
-- Der Fingerprint unterscheidet eigene Aktivierungen nur über deren `signature()`.
-- `Sequential` braucht zum Training mindestens einen Layer.
-- Es gibt bewusst keine Kreuzentropie auf Wahrscheinlichkeiten (sie sättigt in `f32`): `BinaryCrossEntropyWithLogits`
-  braucht einen `Linear`-Ausgang, Sigmoid kommt erst bei der Inferenz.
-- Die Mindestversion Rust 1.80 gilt nur für die Bibliothek. Tests, Doctests und Beispiele bauen und laufen lokal
-  auch auf 1.80, die CI prüft sie aber nur mit der gepinnten Toolchain 1.99.0.
+- [ ] `ActivationLayer<A>` (eigenständig, Voraussetzung für `Softmax`/`LogSoftmax`), `Identity`, `Flatten`/`Reshape`, `Clamp`.
+- [ ] `Scale`/`Bias` (lernbarer Skalar/Vektor), `Frozen<L>`-Wrapper.
+- [ ] `BatchNorm` mit Laufstatistiken und Folding in `InferenceDense`; `RmsNorm`.
+- [ ] `LayerNorm` robust gegen Überlauf (Eingaben > ~1e18); Typ-Aliase für verschachtelte `Chain`-Typen.
+- [ ] Heap-Varianten von `Residual`/`LayerNorm` in `Sequential`.
+- [ ] `DynLayer` und `LayerKind` (stabile Kennungen!) für alle neuen Layer, jeweils mit `InferLayer`-Gegenstück.
