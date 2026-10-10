@@ -220,6 +220,22 @@ Vorhanden: `Constant`, `XavierUniform/Normal`, `HeUniform/Normal`, `LecunUniform
       eine Variante, die nur vom Netz borgt, würde Temporaries als Eingabe erleichtern.
 - [ ] Batch-Forward (Matrix × Matrix) für höheren Durchsatz auf Geräten mit Cache
 
+# Offene Aufgaben & Roadmap
+
+## Hohe Priorität (Nächstes Release)
+- [ ] Refactoring: API der Loss-Funktionen vereinheitlichen
+- [ ] Performance-Benchmarks für Activation-Extensions hinzufügen
+- [ ] Dokumentationsbeispiele für `gelu_adamw` erweitern
+
+## Geplante Features
+- [ ] Conv2D / Pooling Layer Implementierung
+- [ ] Quantisierung auf Fixed-Point / Int8 für Embedded Target
+- [ ] Export-Format für trainierte Modellgewichte festlegen
+
+## Ideen / Backlog
+- [ ] Multi-Threading Unterstützung für Batch-Processing evaluieren
+- [ ] Visualisierungs-Export (z. B. Graphviz / DOT-Export für Modellstrukturen)
+
 ## Bekannte Einschränkungen (bewusst, siehe README)
 
 - `HardSigmoid` taugt nicht als versteckte Schicht (im Bereich `(−3, 3)` linear).
