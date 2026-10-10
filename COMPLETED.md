@@ -76,6 +76,7 @@
 ## 6. Optimizer & Lernraten-Schedules
 
 * **Gradienten-Optimierer (`Optimizer`)**:
+  * `Optimizer::reset` und `Trainer::reset_optimizer_state` (u. a. für `Lookahead` nach `load_model`); L1-Regularisierung (`with_l1`) für `Sgd`/`Momentum`.
   * `Sgd`, `Momentum`, `Adam`, `AdamW` (entkoppeltes Weight Decay, bitgleich mit Golden-Tests verifiziert).
   * `NAdam`, `RAdam`, `AmsGrad`, `Adamax`, `Adadelta`, `Adagrad`.
   * `RmsProp`, `RmsPropMomentum`.
@@ -98,7 +99,8 @@
   * `ParamEma`: Gleitendes Mittel der Modellgewichte (Exponential Moving Average).
 * **Metriken**:
   * `ConfusionMatrix`, `accuracy`, `r2_score`, `mean_absolute_error`, `log_loss`, `roc_auc`, `CalibrationBins`.
-  * `KFold`: K-Fold Kreuzvalidierung.
+  * `mean_squared_error`/RMSE, `max_error`, `explained_variance_score`, `accuracy_top_k`, `evaluate_confusion`, `evaluate_calibration`.
+  * `KFold`: K-Fold Kreuzvalidierung und `train_val_split`.
   * `LrRangeTest`: Automatischer Lernraten-Finder.
 
 ---
@@ -109,7 +111,8 @@
   * `classify`, `classify_confident` (mit Schwellenwert-Ablehnung).
   * `probabilities` & `math::softmax_confidence` (In-place Softmax ohne Hilfspuffer).
   * `top_k`-Klassenausgabe.
-  * `fit_temperature` (Temperatur-Skalierung zur Modellkalibrierung).
+  * `fit_temperature` (Temperatur-Skalierung zur Modellkalibrierung) und `classify_with_confidence_at`.
+  * `infer_batch`: Inferenz über mehrere Eingaben.
 
 ---
 
@@ -123,3 +126,24 @@
   * Testen der MSRV (Rust 1.80.0).
   * Ausführen aller Beispiele (`xor`, `dynamic_xor`, `gelu_adamw`, `classifier`) im CI-Lauf.
   * Automatische GitHub Actions SHA-Pinning-Prüfung.
+
+---
+
+## 10. Dokumentation & Release
+
+* `CHANGELOG.md` (Keep a Changelog, Release-Prozess), aktuelle Version 0.2.0 (Breaking Changes in der Entwicklungsphase erlaubt).
+* Doctests an Crate-Root (Schnellstart, Early Stopping, Inferenz inkl. `static` im Flash, Speichern/Laden) sowie an den Traits `Loss`, `Optimizer`, `Activation`, `Initializer`, `LrSchedule`, `Layer`/`Chain`, `Params`, `Dense`/`InferenceDense`, `Sequential`, `InferLayer`/`InferExt`, `Trainer`.
+* Beispiele: `xor`, `dynamic_xor`, `gelu_adamw`, `classifier`.
+* MSRV-Zusage (Rust 1.80) gilt nur für die Bibliothek; CI prüft `cargo +1.80.0 build --lib`.
+* Dependabot für GitHub Actions; Actions auf Commit-SHAs gepinnt.
+
+---
+
+## 11. Bewusste Designgrenzen (siehe README)
+
+* `HardSigmoid` taugt nicht als versteckte Schicht (im Bereich `(−3, 3)` linear).
+* Das Modellformat speichert nur `f32`; Optimizer-Zustand und Gradienten werden nicht gespeichert.
+* Der Fingerprint unterscheidet eigene Aktivierungen nur über deren `signature()`.
+* `Sequential` braucht zum Training mindestens einen Layer.
+* Keine Kreuzentropie auf Wahrscheinlichkeiten (sättigt in `f32`): `BinaryCrossEntropyWithLogits` braucht einen `Linear`-Ausgang; Sigmoid erst bei der Inferenz.
+* `BinaryCrossEntropy` (Wahrscheinlichkeiten) wurde in 0.2.0 entfernt; alle Loss-Konstruktoren sind vereinheitlicht (`X::new(..)`, `Default`).
