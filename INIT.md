@@ -46,7 +46,6 @@
 - T-Fixup
 - DeepNet Init (DeepNorm)
 - Megatron Init
-- Small Init
 - muP (Maximal Update Parametrization)
 
 ## Orthogonal und strukturiert
@@ -96,8 +95,6 @@
 - Whitening Init
 - K-Means Init
 - Gradient-Norm Init (GradInit)
-- ZerO Init
-- Mimetic Init
 - SAL (Signal Propagation) Init
 - Dynamical Isometry Init
 - Edge-of-Chaos Init
@@ -243,12 +240,9 @@
 - Uniform (−0.05, 0.05)
 - Nguyen-Widrow
 - Sparse Initialization
-- Gaussian Prior Init
 - Bayesian Prior Init
 - Variational Posterior Init
 - Weight Perturbation Init
-- Noisy Init
-- Symmetry-Breaking Init
 
 ## Graph Neural Networks (GNNs)
 - Degree-Scaled Init
@@ -277,3 +271,17 @@
 - VeRA Init (Frozen Random Matrix + Vector Scaling)
 - LoRA-XS (SVD-Truncated Base Init)
 - Null-Space Projection Init
+
+## Ungeprüft / unklare Namen (Existenz und Schreibweise noch zu klären)
+- Wang Init
+- Mitchell Init
+- Marginal Init
+- Mean-Field Init
+- Weight Selection Init
+- Weight Inheritance Init
+- Mimetic Init
+- ZerO Init
+- Small Init
+- Noisy Init
+- Gaussian Prior Init
+- Symmetry-Breaking Init
