@@ -1,6 +1,7 @@
 # TODO – Ideen und offene Punkte
 
-Stand: nach den Runden „Priorität 1–3" (BCE-Logits, `ParamKind`, Modellformat,
+Stand: Lückenanalyse zu Initialisierern, Aktivierungen und Layertypen ergänzt (Abschnitte „Initialisierer“,
+„Aktivierungen“, „Layer“); davor nach den Runden „Priorität 1–3" (BCE-Logits, `ParamKind`, Modellformat,
 Inferenz-Typen, Hard-Aktivierungen, Lion, CI), „Verluste, Optimizer, Trainings-Hilfen,
 Inferenz-Entscheidungen" und „Qualität der Basis / 0.2.0" (nur noch die Logit-Variante der
 binären Kreuzentropie, einheitliche Loss-Konstruktoren, gepinnte Toolchain und Actions,
@@ -90,6 +91,10 @@ Optimizer, Lernraten-Pläne, Kalibrierung und Metriken, `Residual`, `LayerNorm`,
 
 ## Aktivierungen
 
+- [ ] **Weitere elementweise Aktivierungen** (passen in den `Activation`-Trait, je mit Gradcheck): `Celu`
+      (stetig differenzierbares ELU), `Softshrink`/`Hardshrink`/`Tanhshrink`, `SquaredRelu` (`relu(x)²`),
+      `Gaussian` (`exp(−x²)`), `BentIdentity`, `Isru`/`Isrlu`, `Sinc`, `Erf`, `Threshold`; `RReLU` braucht
+      Zufall im Forward und ist damit ein Sonderfall
 - [ ] **Lernbare Aktivierungen** (`PReLU`, `β` bei Swish): erfordert Parameter am `Activation`-Trait
       (`Params`-Anbindung, eigener Gradient). Größerer Umbau.
 - [ ] **Vektor-Aktivierungen als `Layer`** (nicht elementweise): `Softmax`, `LogSoftmax`
@@ -100,6 +105,19 @@ Optimizer, Lernraten-Pläne, Kalibrierung und Metriken, `Residual`, `LayerNorm`,
 - [ ] `ActivationKind` als `#[non_exhaustive]` markieren und geprüfte Konstruktoren für die Parameter-Varianten
       (`ActivationKind::sine(omega)`); weitere Näherungen (`FastSwish`, `FastGelu`, `FastMish`); Zyklenmessung
       der `Fast*`-Aktivierungen auf Zielhardware oder unter `qemu-system-arm`
+
+## Initialisierer
+
+Vorhanden: `Constant`, `XavierUniform/Normal`, `HeUniform/Normal`, `LecunUniform/Normal`.
+
+- [ ] **`Uniform(lo, hi)` / `Normal(mean, std)`** mit frei wählbaren Parametern (Basis für Sonderfälle)
+- [ ] **`TruncatedNormal`** (Ausreißer bei ±2σ abgeschnitten; Standard in Transformern) und `He`/`Xavier` mit
+      einstellbarem Gain (`LeakyRelu`-Steigung, `gain` für `Tanh`: 5/3)
+- [ ] **`Orthogonal`** (Gram-Schmidt auf zufälliger Matrix, ohne Heap für kleine feste Größen schwierig – braucht
+      Arbeitsspeicher von `rows × cols`; evtl. nur mit `alloc`) und `Identity` (für `Residual`-Zweige)
+- [ ] Vorbelegung des Bias: `fill` füllt nur Gewichte; ein `bias_init` (z. B. Prior-Bias `−ln((1−π)/π)` für
+      `FocalLossWithLogits`, Vergessens-Bias 1 bei LSTM) fehlt
+- [ ] Datenabhängige Init (`LSUV`) – nur falls Bedarf; SIREN-Init siehe „Aktivierungen"
 
 ## Verluste
 - [ ] `QuantileLoss` mit eigenem `τ` je Ausgang (mehrere Quantile in einem Netz)
@@ -142,6 +160,15 @@ Optimizer, Lernraten-Pläne, Kalibrierung und Metriken, `Residual`, `LayerNorm`,
 
 - [ ] `BatchNorm` (der `Mode`-Schalter existiert; Laufstatistiken als Zustand)
 - [ ] `Conv1D`, Pooling, `Embedding`; rekurrente Layer (GRU/LSTM) brauchen Zustand über die Zeit
+- [ ] **Strukturelle Layer ohne/mit wenigen Parametern:** `Flatten`/`Reshape` (nur Typ-Umdeutung), `Scale`/`Bias`
+      (lernbarer Skalar bzw. Vektor), `Dense` ohne Bias (falls noch nicht möglich), `Concat`/Skip-Verbindungen
+      mit Verzweigung (`Parallel<A, B>`), `Highway`/Gated-Layer
+- [ ] **Faltung und Pooling im Detail:** `Conv1D` (zuerst, Sensor-/Audiodaten), `DepthwiseConv1D`, `Conv2D`,
+      `MaxPool`/`AvgPool`, `GlobalAvgPool`, `Upsample`; jeweils mit Inferenz-Gegenstück und Modellformat-`LayerKind`
+- [ ] **Sequenzlayer:** `Embedding`, einfaches `Rnn`/`Gru`/`Lstm` (Zustand über die Zeit, BPTT-Puffer), positionelle
+      Kodierung und Selbstaufmerksamkeit (`Attention`) – nur wenn Transformer-Modelle ein Ziel sind
+- [ ] **Regularisierungs-Layer:** `AlphaDropout` (zu `Selu`), `GaussianNoise`, `DropConnect`, `SpatialDropout`;
+      `Dropout` hat bisher kein Inferenz-Gegenstück nötig, aber `InferLayer`-Äquivalent (Identität) prüfen
 - [ ] Heap-Varianten für `Residual`/`LayerNorm` in `Sequential` (verschachtelte Teilfolge; `HeapLayerNorm`),
       `RmsNorm`, `GroupNorm`, `Residual` mit Projektion; eigene `ParamKind`-Art für Normierungsparameter
 - [ ] `LayerNorm` robust gegen Überlauf bei Eingaben über etwa 1e18; Typ-Aliase für verschachtelte `Chain`-Typen
