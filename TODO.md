@@ -1,6 +1,6 @@
 # TODO – Ideen und offene Punkte
 
-Stand: Lückenanalyse zu Initialisierern, Aktivierungen und Layertypen ergänzt (Abschnitte „Initialisierer“,
+Stand: Lückenanalyse zu Initialisierern, Aktivierungen und Layertypen ergänzt und um weitere fehlende Varianten erweitert (Abschnitte „Initialisierer“,
 „Aktivierungen“, „Layer“); davor nach den Runden „Priorität 1–3" (BCE-Logits, `ParamKind`, Modellformat,
 Inferenz-Typen, Hard-Aktivierungen, Lion, CI), „Verluste, Optimizer, Trainings-Hilfen,
 Inferenz-Entscheidungen" und „Qualität der Basis / 0.2.0" (nur noch die Logit-Variante der
@@ -95,10 +95,18 @@ Optimizer, Lernraten-Pläne, Kalibrierung und Metriken, `Residual`, `LayerNorm`,
       (stetig differenzierbares ELU), `Softshrink`/`Hardshrink`/`Tanhshrink`, `SquaredRelu` (`relu(x)²`),
       `Gaussian` (`exp(−x²)`), `BentIdentity`, `Isru`/`Isrlu`, `Sinc`, `Erf`, `Threshold`; `RReLU` braucht
       Zufall im Forward und ist damit ein Sonderfall
+- [ ] **Noch nicht aufgeführte elementweise Aktivierungen** (je mit Gradcheck, `ActivationKind`-Variante und Fingerprint-Signatur):
+      `QuickGelu` (`x·σ(1,702x)`, billige GELU-Näherung), `LeCunTanh` (`1,7159·tanh(2x/3)`, passt zu LeCun-Init),
+      `Atan` (`arctan`), `Lisht` (`x·tanh x`), `Squareplus` (`(x+√(x²+b))/2`, billiges Softplus ohne `exp`),
+      `Smish`/`Logish`, `Elish`/`HardElish`, `Selu`-Verwandte `Pelu`/`Srelu` (stückweise, lernbar), `Cos`,
+      `Exp`/`Softexp`; `BinaryStep` mit Straight-Through-Gradient (Quantisierungsnähe)
 - [ ] **Lernbare Aktivierungen** (`PReLU`, `β` bei Swish): erfordert Parameter am `Activation`-Trait
       (`Params`-Anbindung, eigener Gradient). Größerer Umbau.
 - [ ] **Vektor-Aktivierungen als `Layer`** (nicht elementweise): `Softmax`, `LogSoftmax`
       (Rückwärtsrechnung ohne Zusatzspeicher: `g_in = s ⊙ (g − g·s)`), `GLU`/`SwiGLU`, `Maxout`
+- [ ] **Weitere Vektor-/Gate-Aktivierungen:** `Softmin`, `Sparsemax` (exakte Nullen, Sortierpuffer nötig), `GeGLU`/`ReGLU`
+      neben `GLU`/`SwiGLU`, `Gumbel-Softmax` (Zufall im Forward), `L2Normalize` (Einheitsvektor, Rückwärtsrechnung
+      `(g − ŷ(g·ŷ))/‖x‖`); `Softmax` mit Temperatur als Parameter
 - [ ] SIREN-Initialisierung als eigener `Initializer` (erste Schicht `U(-1/fan_in, 1/fan_in)`, weitere
       `U(±√(6/fan_in)/ω)`): ein `Initializer` erkennt die erste Schicht bisher nicht
 - [ ] Alpha-Dropout für `Selu` (gewöhnliches `Dropout` stört die Selbstnormalisierung)
@@ -117,6 +125,15 @@ Vorhanden: `Constant`, `XavierUniform/Normal`, `HeUniform/Normal`, `LecunUniform
       Arbeitsspeicher von `rows × cols`; evtl. nur mit `alloc`) und `Identity` (für `Residual`-Zweige)
 - [ ] Vorbelegung des Bias: `fill` füllt nur Gewichte; ein `bias_init` (z. B. Prior-Bias `−ln((1−π)/π)` für
       `FocalLossWithLogits`, Vergessens-Bias 1 bei LSTM) fehlt
+- [ ] **Allgemeiner `VarianceScaling { scale, mode, distribution }`** (Keras/TF-Stil): `mode` ∈ `fan_in`/`fan_out`/`fan_avg`,
+      `distribution` ∈ gleichverteilt/normal/abgeschnitten normal. Alle He-/Xavier-/Lecun-Typen wären Spezialfälle;
+      heute fehlen vor allem die `fan_out`-Variante (PyTorch `mode='fan_out'`, für Faltungen) und `fan_avg` bei He
+- [ ] **Skalierte Residual-Init** (GPT-2: Gewichte der Ausgangsprojektion mit `1/√(2·L)` skalieren), `ReZero`/`LayerScale`-Start
+      mit `0` bzw. kleinem `ε` (hängt an einem lernbaren Skalar-Layer, siehe „Layer"), Fixup-Init für `Residual` ohne Norm
+- [ ] `Sparse(density, std)` (nur ein Anteil der Gewichte ≠ 0, Echo-State-/RNN-Stil), `Zeros`/`Ones` als benannte
+      Kurzformen von `Constant`, Delta-Orthogonal/`Dirac` für Faltungen (erst mit `Conv`)
+- [ ] Init-Variante je `ActivationKind` (`Initializer::for_activation`): wählt He für ReLU-Familie, Xavier für `Tanh`/`Sigmoid`,
+      Lecun für `Selu`, SIREN für `Sine` – heute wählt der Aufrufer von Hand
 - [ ] Datenabhängige Init (`LSUV`) – nur falls Bedarf; SIREN-Init siehe „Aktivierungen"
 
 ## Verluste
@@ -169,6 +186,24 @@ Vorhanden: `Constant`, `XavierUniform/Normal`, `HeUniform/Normal`, `LecunUniform
       Kodierung und Selbstaufmerksamkeit (`Attention`) – nur wenn Transformer-Modelle ein Ziel sind
 - [ ] **Regularisierungs-Layer:** `AlphaDropout` (zu `Selu`), `GaussianNoise`, `DropConnect`, `SpatialDropout`;
       `Dropout` hat bisher kein Inferenz-Gegenstück nötig, aber `InferLayer`-Äquivalent (Identität) prüfen
+- [ ] **Activation-/Hilfs-Layer:** `ActivationLayer<A>` (eigenständige Aktivierung ohne `Dense`, nötig für `Softmax`, Aktivierung
+      vor `Residual`/Norm in Pre-Norm-Blöcken), `Identity`, `Clamp`/`Clip` (z. B. Ausgabe begrenzen), `Slice`/`Select`
+      (Teilvektor), `Pad`, `Permute`; `Dense` ohne Bias und mit festem (nicht trainierbarem) `Frozen<L>`-Wrapper
+      (Transfer Learning, nur die letzte Schicht trainieren)
+- [ ] **Weitere Normierungen:** `BatchNorm` samt **Folding in `InferenceDense`** (Statistik in Gewichte/Bias einrechnen, kostet zur
+      Inferenz nichts), `InstanceNorm`, `WeightNorm`/`SpectralNorm` (Gewichtsreparametrisierung), `LayerScale`/`ReZero`
+      (lernbarer Skalar je Kanal bzw. gesamt, startet bei 0/ε)
+- [ ] **Bilineare und gewichtsteilende Layer:** `Bilinear` (`x₁ᵀWx₂`), `LowRankDense`/LoRA-Adapter (`W + BA`, Rang `r`
+      – wenig Parameter, gut für Fine-Tuning auf MCUs), `TiedDense` (Gewichte teilen, Autoencoder), `MaskedDense`
+      (feste Sparsity-Maske), `Embedding`-Bag
+- [ ] **Faltungsvarianten über `Conv1D`/`Conv2D` hinaus:** `DilatedConv`/kausale Faltung (TCN, Zeitreihen), `ConvTranspose`,
+      `SeparableConv`, `1×1`-Faltung als `Dense` über Kanäle, `Squeeze-and-Excitation`; Pooling mit `LpPool`/`MinPool`
+- [ ] **Eingangskodierungen:** Fourier-Features/`PositionalEncoding` (sin/cos mit festen Frequenzen), `RBF`-Layer
+      (Zentren + Breiten), `Quantize`/`FakeQuant` (quantisierungsbewusstes Training, Voraussetzung für `QuantizedDense`)
+- [ ] **Stochastic Depth / `DropPath`** für `Residual` (ganzen Zweig mit Wahrscheinlichkeit auslassen) und `Cutout`/`Mixup`
+      als Daten-Augmentierung im Trainer (nicht als Layer)
+- [ ] `DynLayer`/`ActivationKind` und Modellformat-`LayerKind` für alle neuen Layer erweitern (Tabellenabgleich mit den Abschnitten
+      „Modellformat und Embedded" und „Layer"); `InferLayer`-Gegenstück für jeden neuen Typ
 - [ ] Heap-Varianten für `Residual`/`LayerNorm` in `Sequential` (verschachtelte Teilfolge; `HeapLayerNorm`),
       `RmsNorm`, `GroupNorm`, `Residual` mit Projektion; eigene `ParamKind`-Art für Normierungsparameter
 - [ ] `LayerNorm` robust gegen Überlauf bei Eingaben über etwa 1e18; Typ-Aliase für verschachtelte `Chain`-Typen
